@@ -861,10 +861,12 @@ app.get('/api/products', async (req, res) => {
       title:    p.title,
       handle:   p.handle,
       price:    p.variants?.[0]?.price ?? '0.00',
-      image:    p.images?.[0]?.src ?? null,
+      image:    p.images?.[0]?.src ?? p.variants?.[0]?.featured_image?.src ?? null,
       type:     p.product_type || inferType(p.title),
       points:   inferPoints(p.variants?.[0]?.price),
-      variants: p.variants?.map(v => ({ id: v.id, title: v.title, price: v.price, available: v.available })),
+      inStock:  true, // public API doesn't expose inventory; assume in stock
+      available: true,
+      variants: p.variants?.map(v => ({ id: v.id, title: v.title, price: v.price, available: v.available ?? true })),
     }));
 
     res.json({ products });
