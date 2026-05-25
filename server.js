@@ -805,6 +805,36 @@ async function handleShopifyWebhook(req, res) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /api/stations — proxy NOAA water level stations list (cached 24hrs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _stationsCache = null;
+let _stationsCachedAt = 0;
+
+app.get('/api/stations', async (req, res) => {
+  const CACHE_MS = 24 * 3600 * 1000;
+  if (_stationsCache && Date.now() - _stationsCachedAt < CACHE_MS) {
+    return res.json({ stations: _stationsCache });
+  }
+  try {
+    const response = await fetch(
+      'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels&units=english',
+      { headers: { 'User-Agent': 'BoneTideCo/1.0 (bonetideco.com)' } }
+    );
+    const data = await response.json();
+    if (!data.stations) throw new Error('No stations returned');
+    _stationsCache = data.stations.map(s => ({
+      id: s.id, name: s.name, state: s.state, lat: s.lat, lon: s.lng,
+    }));
+    _stationsCachedAt = Date.now();
+    res.json({ stations: _stationsCache });
+  } catch (err) {
+    console.error('Stations error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/products — fetch Shopify products via Admin REST API
 // ─────────────────────────────────────────────────────────────────────────────
 
