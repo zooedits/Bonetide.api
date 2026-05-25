@@ -726,6 +726,55 @@ async function handleShopifyWebhook(req, res) {
   }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/products — fetch Shopify products via Admin REST API
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/products', async (req, res) => {
+  try {
+    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2026-04/products.json?limit=50&status=active`;
+    const response = await fetch(url, {
+      headers: {
+        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    const data = await response.json();
+    if (!data.products) throw new Error('No products returned from Shopify');
+
+    const products = data.products.map(p => {
+      const price    = parseFloat(p.variants?.[0]?.price ?? '0');
+      const points   = Math.round((price * 125) / 500) * 500;
+      const variants = p.variants.map(v => ({
+        id:             v.id.toString(),
+        title:          v.title,
+        availableForSale: v.inventory_quantity > 0,
+      }));
+      const totalInventory = p.variants.reduce((sum, v) => sum + (v.inventory_quantity ?? 0), 0);
+
+      return {
+        id:       `gid://shopify/Product/${p.id}`,
+        title:    p.title,
+        handle:   p.handle,
+        type:     p.product_type?.toLowerCase() ?? 'other',
+        tags:     p.tags ? p.tags.split(', ') : [],
+        price:    price.toFixed(2),
+        points,
+        variants,
+        inStock:  totalInventory > 0,
+        lowStock: totalInventory > 0 && totalInventory <= 5,
+      };
+    });
+
+    res.json({ products });
+  } catch (err) {
+    console.error('Products error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Start server
 // ─────────────────────────────────────────────────────────────────────────────
