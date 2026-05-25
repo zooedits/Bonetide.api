@@ -733,7 +733,7 @@ async function handleShopifyWebhook(req, res) {
 
 app.get('/api/products', async (req, res) => {
   try {
-    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2026-04/products.json?limit=50&status=active`;
+    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/products.json?limit=50&status=active`;
     const response = await fetch(url, {
       headers: {
         'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
