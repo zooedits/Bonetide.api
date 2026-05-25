@@ -187,10 +187,15 @@ Respond ONLY with a valid JSON object, no markdown, no explanation:
   "inRegion": boolean — is this species common in the ${region} region,
   "habitat": "inshore" or "nearshore",
   "catchRelease": boolean — is this typically catch and release only,
-  "notes": "string — one sentence of useful fishing notes, max 20 words"
+  "notes": "string — one sentence of useful fishing notes, max 20 words",
+  "bestBait": ["string", "string", "string"] — top 3 baits or lures for this species,
+  "bestMonths": ["Jan", "Feb"] — best months to target this species (use 3-letter abbreviations),
+  "avgSizeIn": number — typical length in inches,
+  "maxSizeIn": number — trophy/max length in inches,
+  "funFact": "string — one interesting or surprising fact about this species, max 25 words"
 }
 
-If you cannot identify the fish with reasonable confidence, return confidence below 0.5.`;
+If you cannot identify the fish with reasonable confidence, return confidence below 0.5 and leave bestBait, bestMonths, avgSizeIn, maxSizeIn, funFact as null.`;
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
