@@ -100,52 +100,6 @@ app.get('/health', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/setup-db — one-time table creation (remove after running once)
-// ─────────────────────────────────────────────────────────────────────────────
-
-app.get('/api/setup-db', async (req, res) => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY, google_id TEXT UNIQUE, device_id TEXT UNIQUE,
-        email TEXT, name TEXT, avatar TEXT,
-        points_balance INTEGER NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS catches (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
-        species TEXT NOT NULL, length_in NUMERIC, released BOOLEAN DEFAULT true,
-        bait TEXT, note TEXT, lat NUMERIC, lon NUMERIC,
-        tide_height_ft NUMERIC, tide_direction TEXT, wind_kts NUMERIC,
-        wind_direction TEXT, baro_in_hg NUMERIC, moon_pct NUMERIC,
-        good_bite_score INTEGER, pts_awarded INTEGER DEFAULT 0,
-        caught_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS points_transactions (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
-        delta INTEGER NOT NULL, reason TEXT, reference_id TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS points_holds (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
-        points_held INTEGER NOT NULL, shopify_product_id TEXT,
-        product_title TEXT, discount_code TEXT, discount_code_id TEXT,
-        status TEXT DEFAULT 'pending', expires_at TIMESTAMPTZ,
-        confirmed_at TIMESTAMPTZ, shopify_order_id TEXT
-      );
-      CREATE TABLE IF NOT EXISTS milestones (
-        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
-        key TEXT NOT NULL, awarded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE(user_id, key)
-      );
-    `);
-    res.json({ ok: true, message: 'All tables created!' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/google — Exchange Google ID token for a Bone Tide JWT
 // Body: { idToken: string }
 // Returns: { token, user: { id, email, name, avatar } }
