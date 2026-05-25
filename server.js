@@ -845,65 +845,52 @@ app.get('/api/stations', async (req, res) => {
 
 app.get('/api/products', async (req, res) => {
   try {
-    const domain = process.env.SHOPIFY_STORE_DOMAIN;
-    const token  = process.env.SHOPIFY_ADMIN_TOKEN;
-    const authHeader = token?.startsWith('atkn_')
-      ? `Bearer ${token}`
-      : token;
-
-    if (!domain || !token) {
-      console.error('[products] Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN');
-      return res.status(500).json({ error: 'Shopify not configured' });
-    }
-
-    const url = `https://${domain}/admin/api/2024-01/products.json?limit=50&status=active`;
-    console.log('[products] Fetching:', url);
-
-    const response = await fetch(url, {
-      headers: {
-        'X-Shopify-Access-Token': token,
-        'Authorization': authHeader,
-        'Content-Type': 'application/json',
-      },
+    // Fetch from public Shopify storefront — no auth token needed
+    const response = await fetch('https://bonetideco.com/products.json?limit=250', {
+      headers: { 'User-Agent': 'BoneTideCo/1.0' },
+      signal: AbortSignal.timeout(10000),
     });
 
     const data = await response.json();
-    console.log('[products] Shopify status:', response.status, 'products:', data.products?.length ?? 'none');
+    console.log('[products] Fetched:', data.products?.length ?? 0, 'products');
 
-    if (!data.products) {
-      throw new Error(`Shopify error: ${JSON.stringify(data).slice(0, 300)}`);
-    }
+    if (!data.products) throw new Error('No products in response');
 
-    const products = data.products.map(p => {
-      const price    = parseFloat(p.variants?.[0]?.price ?? '0');
-      const points   = Math.round((price * 125) / 500) * 500;
-      const variants = p.variants.map(v => ({
-        id:             v.id.toString(),
-        title:          v.title,
-        availableForSale: v.inventory_quantity > 0,
-      }));
-      const totalInventory = p.variants.reduce((sum, v) => sum + (v.inventory_quantity ?? 0), 0);
-
-      return {
-        id:       `gid://shopify/Product/${p.id}`,
-        title:    p.title,
-        handle:   p.handle,
-        type:     p.product_type?.toLowerCase() ?? 'other',
-        tags:     p.tags ? p.tags.split(', ') : [],
-        price:    price.toFixed(2),
-        points,
-        variants,
-        inStock:  totalInventory > 0,
-        lowStock: totalInventory > 0 && totalInventory <= 5,
-      };
-    });
+    const products = data.products.map(p => ({
+      id:       p.id,
+      title:    p.title,
+      handle:   p.handle,
+      price:    p.variants?.[0]?.price ?? '0.00',
+      image:    p.images?.[0]?.src ?? null,
+      type:     p.product_type || inferType(p.title),
+      points:   inferPoints(p.variants?.[0]?.price),
+      variants: p.variants?.map(v => ({ id: v.id, title: v.title, price: v.price, available: v.available })),
+    }));
 
     res.json({ products });
   } catch (err) {
-    console.error('Products error:', err);
+    console.error('[products] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
+
+function inferType(title = '') {
+  const t = title.toLowerCase();
+  if (t.includes('hoodie')) return 'hoodies';
+  if (t.includes('tank'))   return 'tanks';
+  if (t.includes('long') || t.includes('performance')) return 'performance';
+  return 'tees';
+}
+
+function inferPoints(price = '0') {
+  const p = parseFloat(price);
+  if (p >= 50) return 5000;
+  if (p >= 35) return 3500;
+  if (p >= 25) return 2500;
+  return 3000;
+}
+
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Start server
