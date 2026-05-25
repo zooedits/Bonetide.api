@@ -847,6 +847,9 @@ app.get('/api/products', async (req, res) => {
   try {
     const domain = process.env.SHOPIFY_STORE_DOMAIN;
     const token  = process.env.SHOPIFY_ADMIN_TOKEN;
+    const authHeader = token?.startsWith('atkn_')
+      ? `Bearer ${token}`
+      : token;
 
     if (!domain || !token) {
       console.error('[products] Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN');
@@ -859,6 +862,7 @@ app.get('/api/products', async (req, res) => {
     const response = await fetch(url, {
       headers: {
         'X-Shopify-Access-Token': token,
+        'Authorization': authHeader,
         'Content-Type': 'application/json',
       },
     });
