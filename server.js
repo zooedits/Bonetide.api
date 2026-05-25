@@ -12,6 +12,35 @@ import cors       from 'cors';
 import crypto     from 'crypto';
 import pg         from 'pg';
 import fetch      from 'node-fetch';
+import { OAuth2Client } from 'google-auth-library';
+import jwt           from 'jsonwebtoken';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Google Auth setup
+// ─────────────────────────────────────────────────────────────────────────────
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const JWT_SECRET       = process.env.JWT_SECRET;
+const googleClient     = new OAuth2Client(GOOGLE_CLIENT_ID);
+
+function issueJwt(user) {
+  return jwt.sign(
+    { id: user.id, email: user.email },
+    JWT_SECRET,
+    { expiresIn: '90d' }
+  );
+}
+
+function requireAuth(req, res, next) {
+  const header = req.headers['authorization'] ?? '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
 
 const app = express();
 const { Pool } = pg;
@@ -68,6 +97,100 @@ async function getOrCreateUser(deviceId) {
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'Bone Tide Co. API' });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/setup-db — one-time table creation (remove after running once)
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/setup-db', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY, google_id TEXT UNIQUE, device_id TEXT UNIQUE,
+        email TEXT, name TEXT, avatar TEXT,
+        points_balance INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS catches (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+        species TEXT NOT NULL, length_in NUMERIC, released BOOLEAN DEFAULT true,
+        bait TEXT, note TEXT, lat NUMERIC, lon NUMERIC,
+        tide_height_ft NUMERIC, tide_direction TEXT, wind_kts NUMERIC,
+        wind_direction TEXT, baro_in_hg NUMERIC, moon_pct NUMERIC,
+        good_bite_score INTEGER, pts_awarded INTEGER DEFAULT 0,
+        caught_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS points_transactions (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+        delta INTEGER NOT NULL, reason TEXT, reference_id TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS points_holds (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+        points_held INTEGER NOT NULL, shopify_product_id TEXT,
+        product_title TEXT, discount_code TEXT, discount_code_id TEXT,
+        status TEXT DEFAULT 'pending', expires_at TIMESTAMPTZ,
+        confirmed_at TIMESTAMPTZ, shopify_order_id TEXT
+      );
+      CREATE TABLE IF NOT EXISTS milestones (
+        id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+        key TEXT NOT NULL, awarded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(user_id, key)
+      );
+    `);
+    res.json({ ok: true, message: 'All tables created!' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/auth/google — Exchange Google ID token for a Bone Tide JWT
+// Body: { idToken: string }
+// Returns: { token, user: { id, email, name, avatar } }
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { idToken } = req.body ?? {};
+    if (!idToken) return res.status(400).json({ error: 'idToken required' });
+
+    const ticket  = await googleClient.verifyIdToken({
+      idToken,
+      audience: GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+
+    if (!payload.email_verified) {
+      return res.status(403).json({ error: 'Google account email not verified' });
+    }
+
+    const user = {
+      id:     payload.sub,
+      email:  payload.email,
+      name:   payload.name  ?? '',
+      avatar: payload.picture ?? null,
+    };
+
+    // Upsert user in DB so they exist for catches/rewards lookups
+    await pool.query(
+      `INSERT INTO users (google_id, email, name, avatar, points_balance, created_at)
+       VALUES ($1, $2, $3, $4, 0, NOW())
+       ON CONFLICT (google_id) DO UPDATE
+         SET email = EXCLUDED.email,
+             name  = EXCLUDED.name,
+             avatar = EXCLUDED.avatar`,
+      [user.id, user.email, user.name, user.avatar]
+    );
+
+    const token = issueJwt(user);
+    return res.json({ token, user });
+
+  } catch (err) {
+    console.error('[auth] Google verification failed:', err.message);
+    return res.status(401).json({ error: 'Google token verification failed' });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -733,7 +856,7 @@ async function handleShopifyWebhook(req, res) {
 
 app.get('/api/products', async (req, res) => {
   try {
-    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/products.json?limit=50`;
+    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2026-04/products.json?limit=50&status=active`;
     const response = await fetch(url, {
       headers: {
         'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
@@ -742,9 +865,7 @@ app.get('/api/products', async (req, res) => {
     });
 
     const data = await response.json();
-    console.log('Shopify status:', response.status);
-    console.log('Shopify data preview:', JSON.stringify(data).slice(0, 500));
-    if (!data.products) throw new Error(`Shopify error: ${JSON.stringify(data).slice(0, 300)}`);
+    if (!data.products) throw new Error('No products returned from Shopify');
 
     const products = data.products.map(p => {
       const price    = parseFloat(p.variants?.[0]?.price ?? '0');
