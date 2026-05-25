@@ -733,7 +733,7 @@ async function handleShopifyWebhook(req, res) {
 
 app.get('/api/products', async (req, res) => {
   try {
-    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/products.json?limit=50&status=active`;
+    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/products.json?limit=50`;
     const response = await fetch(url, {
       headers: {
         'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
@@ -742,7 +742,9 @@ app.get('/api/products', async (req, res) => {
     });
 
     const data = await response.json();
-    if (!data.products) throw new Error('No products returned from Shopify');
+    console.log('Shopify status:', response.status);
+    console.log('Shopify data preview:', JSON.stringify(data).slice(0, 500));
+    if (!data.products) throw new Error(`Shopify error: ${JSON.stringify(data).slice(0, 300)}`);
 
     const products = data.products.map(p => {
       const price    = parseFloat(p.variants?.[0]?.price ?? '0');
