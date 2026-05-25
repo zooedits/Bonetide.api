@@ -845,16 +845,30 @@ app.get('/api/stations', async (req, res) => {
 
 app.get('/api/products', async (req, res) => {
   try {
-    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2026-04/products.json?limit=50&status=active`;
+    const domain = process.env.SHOPIFY_STORE_DOMAIN;
+    const token  = process.env.SHOPIFY_ADMIN_TOKEN;
+
+    if (!domain || !token) {
+      console.error('[products] Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN');
+      return res.status(500).json({ error: 'Shopify not configured' });
+    }
+
+    const url = `https://${domain}/admin/api/2024-01/products.json?limit=50&status=active`;
+    console.log('[products] Fetching:', url);
+
     const response = await fetch(url, {
       headers: {
-        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+        'X-Shopify-Access-Token': token,
         'Content-Type': 'application/json',
       },
     });
 
     const data = await response.json();
-    if (!data.products) throw new Error('No products returned from Shopify');
+    console.log('[products] Shopify status:', response.status, 'products:', data.products?.length ?? 'none');
+
+    if (!data.products) {
+      throw new Error(`Shopify error: ${JSON.stringify(data).slice(0, 300)}`);
+    }
 
     const products = data.products.map(p => {
       const price    = parseFloat(p.variants?.[0]?.price ?? '0');
