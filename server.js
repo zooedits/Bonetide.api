@@ -99,10 +99,6 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'Bone Tide Co. API' });
 });
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'Bone Tide Co. API' });
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/google — Exchange Google ID token for a Bone Tide JWT
 // Body: { idToken: string }
@@ -814,7 +810,7 @@ async function handleShopifyWebhook(req, res) {
 
 app.get('/api/products', async (req, res) => {
   try {
-    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/products.json?limit=50&status=active`;
+    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2026-04/products.json?limit=50&status=active`;
     const response = await fetch(url, {
       headers: {
         'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
@@ -823,6 +819,7 @@ app.get('/api/products', async (req, res) => {
     });
 
     const data = await response.json();
+    console.log('Shopify response:', JSON.stringify(data).slice(0, 500));
     if (!data.products) throw new Error('No products returned from Shopify');
 
     const products = data.products.map(p => {
@@ -846,7 +843,6 @@ app.get('/api/products', async (req, res) => {
         variants,
         inStock:  totalInventory > 0,
         lowStock: totalInventory > 0 && totalInventory <= 5,
-        image:    p.images?.[0]?.src ?? null,
       };
     });
 
