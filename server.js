@@ -853,6 +853,71 @@ app.get('/api/products', async (req, res) => {
 });
 
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/auth/apple — verify Apple identity token, issue JWT
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/api/auth/apple', async (req, res) => {
+  try {
+    const { identityToken, fullName, email } = req.body;
+    if (!identityToken) return res.status(400).json({ error: 'identityToken required' });
+
+    // Decode the JWT from Apple (header.payload.signature)
+    const payload = JSON.parse(Buffer.from(identityToken.split('.')[1], 'base64').toString());
+    const appleId = payload.sub;
+    if (!appleId) return res.status(400).json({ error: 'Invalid Apple token' });
+
+    const userEmail = email ?? payload.email ?? null;
+    const userName  = fullName?.givenName
+      ? `${fullName.givenName} ${fullName.familyName ?? ''}`.trim()
+      : null;
+
+    // Upsert user — Apple only sends email/name on FIRST sign in
+    const existing = await pool.query(
+      'SELECT id, name, email, points_balance FROM users WHERE google_id = $1',
+      [appleId]
+    );
+
+    let user;
+    if (existing.rows.length) {
+      user = existing.rows[0];
+      // Update name/email if Apple provided them this time
+      if (userName || userEmail) {
+        await pool.query(
+          `UPDATE users SET
+             name   = COALESCE($1, name),
+             email  = COALESCE($2, email)
+           WHERE id = $3`,
+          [userName, userEmail, user.id]
+        );
+      }
+    } else {
+      const created = await pool.query(
+        `INSERT INTO users (google_id, email, name, points_balance, created_at)
+         VALUES ($1, $2, $3, 0, NOW())
+         RETURNING id, name, email, points_balance`,
+        [appleId, userEmail, userName]
+      );
+      user = created.rows[0];
+    }
+
+    const token = issueJwt({ id: user.id, email: user.email ?? userEmail ?? '' });
+    res.json({
+      token,
+      user: {
+        id:     user.id,
+        email:  user.email ?? userEmail ?? '',
+        name:   user.name ?? userName ?? '',
+        avatar: null,
+      },
+    });
+  } catch (err) {
+    console.error('[auth] Apple sign-in failed:', err.message);
+    res.status(401).json({ error: 'Apple sign-in failed' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // OTP auth — email only (Resend). Phone requires Twilio (future).
 // ─────────────────────────────────────────────────────────────────────────────
