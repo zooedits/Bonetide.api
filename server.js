@@ -99,6 +99,10 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'Bone Tide Co. API' });
 });
 
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', service: 'Bone Tide Co. API' });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/google — Exchange Google ID token for a Bone Tide JWT
 // Body: { idToken: string }
@@ -179,12 +183,6 @@ app.post('/api/identify', async (req, res) => {
 Identify the fish in this photo.
 Primary species to look for: ${speciesList.join(', ')}.
 
-Also analyze the photo for size estimation:
-- Look for scale references: measuring tape, ruler, hand, rod, tackle box, cooler, known objects
-- If a measuring tape or ruler is clearly visible and readable, extract the measurement
-- If only hands/arms are visible, estimate based on hand span (~7-8 inches average adult hand)
-- If no scale reference exists, return estimatedSizeIn as null
-
 Respond ONLY with a valid JSON object, no markdown, no explanation:
 {
   "commonName": "string — common name of the fish",
@@ -193,18 +191,10 @@ Respond ONLY with a valid JSON object, no markdown, no explanation:
   "inRegion": boolean — is this species common in the ${region} region,
   "habitat": "inshore" or "nearshore",
   "catchRelease": boolean — is this typically catch and release only,
-  "notes": "string — one sentence of useful fishing notes, max 20 words",
-  "bestBait": ["string", "string", "string"] — top 3 baits or lures for this species,
-  "bestMonths": ["Jan", "Feb"] — best months to target this species (use 3-letter abbreviations),
-  "avgSizeIn": number — typical length in inches for this species,
-  "maxSizeIn": number — trophy/max length in inches for this species,
-  "funFact": "string — one interesting or surprising fact about this species, max 25 words",
-  "estimatedSizeIn": number or null — estimated length of THIS fish in the photo in inches,
-  "measurementVerified": boolean — true only if a measuring tape or ruler is clearly visible,
-  "sizeConfidence": "high" or "medium" or "low" or null — confidence in the size estimate
+  "notes": "string — one sentence of useful fishing notes, max 20 words"
 }
 
-If you cannot identify the fish with reasonable confidence, return confidence below 0.5 and leave optional fields as null.`;
+If you cannot identify the fish with reasonable confidence, return confidence below 0.5.`;
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -262,28 +252,15 @@ If you cannot identify the fish with reasonable confidence, return confidence be
 //         baroInHg, moonPct, goodBiteScore, sessionToken }
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DAILY_CAP_CATCHES  = 10;   // max verified catches that earn points per day
-const DAILY_CAP_SPOTS    = 3;    // max spot pins that earn points per day
-const DAILY_CAP_PTS      = 2000; // hard ceiling on points per day
-
-// Points per catch — species decay within same day
-// 1st of species: 100, 2nd: 80, 3rd: 60, 4th: 40, 5th+: 20
-// Personal best bonus: +200
-// Released bonus: +5
-function calcCatchPoints(speciesCountToday, isPersonalBest, released) {
-  const decayTable = [100, 80, 60, 40, 20];
-  const base = decayTable[Math.min(speciesCountToday, decayTable.length - 1)];
-  const pbBonus = isPersonalBest ? 200 : 0;
-  const releaseBonus = released ? 5 : 0;
-  return base + pbBonus + releaseBonus;
-}
+const DAILY_CAP     = 30;
+const PTS_PER_CATCH = 10;
 
 app.post('/api/catches', async (req, res) => {
   const {
     deviceId, species, lengthIn, released, bait, note,
     lat, lon, tideHeightFt, tideDirection,
     windKts, windDirection, baroInHg, moonPct,
-    goodBiteScore, sessionToken, estimatedSizeIn, measurementVerified,
+    goodBiteScore, sessionToken,
   } = req.body;
 
   if (!deviceId || !species) {
@@ -292,49 +269,24 @@ app.post('/api/catches', async (req, res) => {
 
   try {
     const user = await getOrCreateUser(deviceId);
-    const today = new Date().toISOString().slice(0, 10);
 
-    // Daily catch count for cap + decay
-    const { rows: todayCatches } = await pool.query(
-      `SELECT species, length_in FROM catches
-       WHERE user_id = $1 AND DATE(caught_at) = $2 AND pts_awarded > 0`,
-      [user.id, today]
-    );
-    const totalCatchesToday = todayCatches.length;
-    const speciesCountToday = todayCatches.filter(c =>
-      c.species?.toLowerCase() === species.toLowerCase()
-    ).length;
-
-    // Personal best check
-    const sizeToCompare = estimatedSizeIn || lengthIn;
-    let isPersonalBest = false;
-    if (sizeToCompare) {
-      const { rows: pbRows } = await pool.query(
-        `SELECT MAX(COALESCE(length_in, 0)) AS pb
-         FROM catches WHERE user_id = $1 AND LOWER(species) = LOWER($2)`,
-        [user.id, species]
-      );
-      const prevBest = parseFloat(pbRows[0]?.pb ?? 0);
-      isPersonalBest = sizeToCompare > prevBest;
-    }
-
-    // Daily points already earned
-    const { rows: ptRows } = await pool.query(
+    // Check daily points cap
+    const today = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+    const { rows: todayRows } = await pool.query(
       `SELECT COALESCE(SUM(pts_awarded), 0) AS total
-       FROM catches WHERE user_id = $1 AND DATE(caught_at) = $2`,
+       FROM catches
+       WHERE user_id = $1
+         AND DATE(caught_at) = $2`,
       [user.id, today]
     );
-    const todayPts = parseInt(ptRows[0].total);
-    const ptsLeft  = Math.max(0, DAILY_CAP_PTS - todayPts);
+    const todayPts   = parseInt(todayRows[0].total);
+    const ptsLeft    = Math.max(0, DAILY_CAP - todayPts);
 
-    // Calculate points
-    let ptsAwarded = 0;
-    let ptsReason  = 'catch';
-    if (sessionToken && ptsLeft > 0 && totalCatchesToday < DAILY_CAP_CATCHES) {
-      const raw = calcCatchPoints(speciesCountToday, isPersonalBest, released ?? false);
-      ptsAwarded = Math.min(raw, ptsLeft);
-      if (isPersonalBest) ptsReason = 'catch_personal_best';
-    }
+    // Award points only if photo session token present and cap not hit
+    // sessionToken = proof the photo came from the in-app camera
+    const ptsAwarded = sessionToken && ptsLeft > 0
+      ? Math.min(PTS_PER_CATCH, ptsLeft)
+      : 0;
 
     // Insert catch
     const { rows: [newCatch] } = await pool.query(
@@ -345,13 +297,13 @@ app.post('/api/catches', async (req, res) => {
           good_bite_score, pts_awarded, caught_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
        RETURNING *`,
-      [user.id, species, sizeToCompare || lengthIn, released ?? true, bait, note,
+      [user.id, species, lengthIn, released ?? true, bait, note,
        lat, lon, tideHeightFt, tideDirection,
        windKts, windDirection, baroInHg, moonPct,
        goodBiteScore, ptsAwarded]
     );
 
-    // Credit points
+    // Credit points to balance
     if (ptsAwarded > 0) {
       await pool.query(
         `UPDATE users SET points_balance = points_balance + $1 WHERE id = $2`,
@@ -359,8 +311,8 @@ app.post('/api/catches', async (req, res) => {
       );
       await pool.query(
         `INSERT INTO points_transactions (user_id, delta, reason, reference_id, created_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
-        [user.id, ptsAwarded, ptsReason, newCatch.id.toString()]
+         VALUES ($1, $2, 'catch', $3, NOW())`,
+        [user.id, ptsAwarded, newCatch.id.toString()]
       );
     }
 
@@ -383,12 +335,8 @@ app.post('/api/catches', async (req, res) => {
         caughtAt:       newCatch.caught_at,
       },
       ptsAwarded,
-      isPersonalBest,
-      speciesCountToday: speciesCountToday + 1,
-      catchesToday:      totalCatchesToday + 1,
-      catchesCap:        DAILY_CAP_CATCHES,
-      dailyTotal:        todayPts + ptsAwarded,
-      dailyCap:          DAILY_CAP_PTS,
+      dailyTotal:  todayPts + ptsAwarded,
+      dailyCap:    DAILY_CAP,
     });
 
   } catch (err) {
@@ -861,262 +809,53 @@ async function handleShopifyWebhook(req, res) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/auth/facebook — verify Facebook access token, issue JWT
-// ─────────────────────────────────────────────────────────────────────────────
-
-app.post('/api/auth/facebook', async (req, res) => {
-  const { accessToken } = req.body;
-  if (!accessToken) return res.status(400).json({ error: 'accessToken required' });
-  try {
-    const fbRes  = await fetch(`https://graph.facebook.com/me?fields=id,name,email,picture&access_token=${accessToken}`);
-    const fbUser = await fbRes.json();
-    if (fbUser.error) throw new Error(fbUser.error.message);
-
-    const { rows } = await pool.query(
-      `INSERT INTO users (google_id, email, name, avatar, points_balance, created_at)
-       VALUES ($1, $2, $3, $4, 0, NOW())
-       ON CONFLICT (google_id) DO UPDATE SET name = EXCLUDED.name, avatar = EXCLUDED.avatar
-       RETURNING *`,
-      [`fb_${fbUser.id}`, fbUser.email ?? null, fbUser.name, fbUser.picture?.data?.url ?? null]
-    );
-    const user = rows[0];
-    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '90d' });
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar, pointsBalance: user.points_balance } });
-  } catch (err) {
-    console.error('Facebook auth error:', err.message);
-    res.status(401).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OTP auth — email or phone verification codes
-// Uses in-memory store for now; replace with Redis/DB for production
-// ─────────────────────────────────────────────────────────────────────────────
-
-const otpStore = new Map(); // key: email/phone → { code, expires, attempts }
-
-function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-// POST /api/auth/otp/send
-app.post('/api/auth/otp/send', async (req, res) => {
-  const { email, phone } = req.body;
-  const contact = email || phone;
-  if (!contact) return res.status(400).json({ error: 'email or phone required' });
-
-  const code    = generateOtp();
-  const expires = Date.now() + 10 * 60 * 1000; // 10 minutes
-  otpStore.set(contact, { code, expires, attempts: 0 });
-
-  // Send via email (Resend) or SMS (Twilio) — log for now until keys are added
-  console.log(`[OTP] Code for ${contact}: ${code}`);
-
-  if (email && process.env.RESEND_API_KEY) {
-    await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
-      body: JSON.stringify({
-        from: 'Bone Tide <noreply@bonetideco.com>',
-        to:   [email],
-        subject: 'Your Bone Tide verification code',
-        text: `Your Bone Tide sign-in code is: ${code}\n\nExpires in 10 minutes.`,
-      }),
-    }).catch(e => console.error('Resend error:', e.message));
-  }
-
-  if (phone && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-    const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`;
-    await fetch(twilioUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')}`,
-      },
-      body: new URLSearchParams({ To: phone, From: process.env.TWILIO_PHONE_NUMBER, Body: `Your Bone Tide code: ${code}` }),
-    }).catch(e => console.error('Twilio error:', e.message));
-  }
-
-  res.json({ sent: true });
-});
-
-// POST /api/auth/otp/verify
-app.post('/api/auth/otp/verify', async (req, res) => {
-  const { email, phone, code, name } = req.body;
-  const contact = email || phone;
-  if (!contact || !code) return res.status(400).json({ error: 'contact and code required' });
-
-  const record = otpStore.get(contact);
-  if (!record) return res.status(400).json({ error: 'No code sent — request a new one' });
-  if (Date.now() > record.expires) { otpStore.delete(contact); return res.status(400).json({ error: 'Code expired' }); }
-
-  record.attempts++;
-  if (record.attempts > 5) { otpStore.delete(contact); return res.status(400).json({ error: 'Too many attempts' }); }
-  if (record.code !== code) return res.status(400).json({ error: 'Incorrect code' });
-
-  otpStore.delete(contact);
-
-  // Find or create user
-  const googleId = email ? `email_${email}` : `phone_${phone}`;
-  const { rows } = await pool.query(
-    `SELECT * FROM users WHERE google_id = $1`,
-    [googleId]
-  );
-
-  let user = rows[0];
-  const needsName = !user && !name;
-
-  if (needsName) return res.json({ needsName: true });
-
-  if (!user) {
-    const { rows: newRows } = await pool.query(
-      `INSERT INTO users (google_id, email, name, points_balance, created_at)
-       VALUES ($1, $2, $3, 0, NOW()) RETURNING *`,
-      [googleId, email ?? null, name ?? contact]
-    );
-    user = newRows[0];
-  }
-
-  const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '90d' });
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar, pointsBalance: user.points_balance } });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/stations — proxy NOAA water level stations list (cached 24hrs)
-// ─────────────────────────────────────────────────────────────────────────────
-
-let _stationsCache = null;
-let _stationsCachedAt = 0;
-
-app.get('/api/stations', async (req, res) => {
-  const CACHE_MS = 24 * 3600 * 1000;
-  if (_stationsCache && Date.now() - _stationsCachedAt < CACHE_MS) {
-    return res.json({ stations: _stationsCache });
-  }
-  try {
-    const response = await fetch(
-      'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels&units=english',
-      { headers: { 'User-Agent': 'BoneTideCo/1.0 (bonetideco.com)' } }
-    );
-    const data = await response.json();
-    if (!data.stations) throw new Error('No stations returned');
-    _stationsCache = data.stations.map(s => ({
-      id: s.id, name: s.name, state: s.state, lat: s.lat, lon: s.lng,
-    }));
-    _stationsCachedAt = Date.now();
-    res.json({ stations: _stationsCache });
-  } catch (err) {
-    console.error('Stations error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/spots/award — award points for pinning a fishing spot
-// Body: { deviceId }
-// ─────────────────────────────────────────────────────────────────────────────
-
-app.post('/api/spots/award', async (req, res) => {
-  const { deviceId } = req.body;
-  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-  try {
-    const user = await getOrCreateUser(deviceId);
-    const today = new Date().toISOString().slice(0, 10);
-
-    // Count spot pins today
-    const { rows: spotRows } = await pool.query(
-      `SELECT COUNT(*) AS total FROM points_transactions
-       WHERE user_id = $1 AND reason = 'spot_pin' AND DATE(created_at) = $2`,
-      [user.id, today]
-    );
-    const spotsToday = parseInt(spotRows[0].total);
-
-    if (spotsToday >= DAILY_CAP_SPOTS) {
-      return res.json({ ptsAwarded: 0, spotsToday, spotsCap: DAILY_CAP_SPOTS, capReached: true });
-    }
-
-    // Daily pts check
-    const { rows: ptRows } = await pool.query(
-      `SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches
-       WHERE user_id = $1 AND DATE(caught_at) = $2`,
-      [user.id, today]
-    );
-    const todayPts = parseInt(ptRows[0].total);
-    const ptsLeft  = Math.max(0, DAILY_CAP_PTS - todayPts);
-    const ptsAwarded = Math.min(10, ptsLeft);
-
-    if (ptsAwarded > 0) {
-      await pool.query(
-        `UPDATE users SET points_balance = points_balance + $1 WHERE id = $2`,
-        [ptsAwarded, user.id]
-      );
-      await pool.query(
-        `INSERT INTO points_transactions (user_id, delta, reason, created_at)
-         VALUES ($1, $2, 'spot_pin', NOW())`,
-        [user.id, ptsAwarded]
-      );
-    }
-
-    res.json({ ptsAwarded, spotsToday: spotsToday + 1, spotsCap: DAILY_CAP_SPOTS, capReached: false });
-  } catch (err) {
-    console.error('Spot award error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/products — fetch Shopify products via Admin REST API
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.get('/api/products', async (req, res) => {
   try {
-    // Fetch from public Shopify storefront — no auth token needed
-    const response = await fetch('https://bonetideco.com/products.json?limit=250', {
-      headers: { 'User-Agent': 'BoneTideCo/1.0' },
-      signal: AbortSignal.timeout(10000),
+    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2026-04/products.json?limit=50&status=active`;
+    const response = await fetch(url, {
+      headers: {
+        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+        'Content-Type': 'application/json',
+      },
     });
 
     const data = await response.json();
-    console.log('[products] Fetched:', data.products?.length ?? 0, 'products');
+    if (!data.products) throw new Error('No products returned from Shopify');
 
-    if (!data.products) throw new Error('No products in response');
+    const products = data.products.map(p => {
+      const price    = parseFloat(p.variants?.[0]?.price ?? '0');
+      const points   = Math.round((price * 125) / 500) * 500;
+      const variants = p.variants.map(v => ({
+        id:             v.id.toString(),
+        title:          v.title,
+        availableForSale: v.inventory_quantity > 0,
+      }));
+      const totalInventory = p.variants.reduce((sum, v) => sum + (v.inventory_quantity ?? 0), 0);
 
-    const products = data.products.map(p => ({
-      id:       p.id,
-      title:    p.title,
-      handle:   p.handle,
-      price:    p.variants?.[0]?.price ?? '0.00',
-      image:    p.images?.[0]?.src ?? p.variants?.[0]?.featured_image?.src ?? null,
-      type:     p.product_type || inferType(p.title),
-      points:   inferPoints(p.variants?.[0]?.price),
-      inStock:  true, // public API doesn't expose inventory; assume in stock
-      available: true,
-      variants: p.variants?.map(v => ({ id: v.id, title: v.title, price: v.price, available: v.available ?? true })),
-    }));
+      return {
+        id:       `gid://shopify/Product/${p.id}`,
+        title:    p.title,
+        handle:   p.handle,
+        type:     p.product_type?.toLowerCase() ?? 'other',
+        tags:     p.tags ? p.tags.split(', ') : [],
+        price:    price.toFixed(2),
+        points,
+        variants,
+        inStock:  totalInventory > 0,
+        lowStock: totalInventory > 0 && totalInventory <= 5,
+        image:    p.images?.[0]?.src ?? null,
+      };
+    });
 
     res.json({ products });
   } catch (err) {
-    console.error('[products] Error:', err.message);
+    console.error('Products error:', err);
     res.status(500).json({ error: err.message });
   }
 });
-
-function inferType(title = '') {
-  const t = title.toLowerCase();
-  if (t.includes('hoodie')) return 'hoodies';
-  if (t.includes('tank'))   return 'tanks';
-  if (t.includes('long') || t.includes('performance')) return 'performance';
-  return 'tees';
-}
-
-function inferPoints(price = '0') {
-  const p = parseFloat(price);
-  // 125 points per dollar — original rate
-  return Math.round((p * 125) / 500) * 500;
-}
-
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Start server
