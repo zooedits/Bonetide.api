@@ -819,7 +819,6 @@ app.get('/api/products', async (req, res) => {
     });
 
     const data = await response.json();
-    console.log('Shopify response:', JSON.stringify(data).slice(0, 500));
     if (!data.products) throw new Error('No products returned from Shopify');
 
     const products = data.products.map(p => {
@@ -851,6 +850,111 @@ app.get('/api/products', async (req, res) => {
     console.error('Products error:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OTP auth — email only (Resend). Phone requires Twilio (future).
+// ─────────────────────────────────────────────────────────────────────────────
+
+const otpStore = new Map(); // email -> { code, expiresAt }
+
+function generateOtp() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// POST /api/auth/otp/send
+app.post('/api/auth/otp/send', async (req, res) => {
+  const { email, phone } = req.body;
+
+  if (phone) {
+    return res.status(400).json({ error: 'Phone login coming soon. Please use email.' });
+  }
+  if (!email) {
+    return res.status(400).json({ error: 'email required' });
+  }
+
+  const code      = generateOtp();
+  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+  otpStore.set(email.toLowerCase(), { code, expiresAt });
+
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from:    'Bone Tide Co. <noreply@bonetideco.com>',
+        to:      [email],
+        subject: 'Your Bone Tide verification code',
+        html:    `<div style="font-family:sans-serif;max-width:400px;margin:0 auto">
+                    <h2 style="color:#C35233">Bone Tide Co.</h2>
+                    <p>Your verification code is:</p>
+                    <h1 style="letter-spacing:8px;color:#0A1128;background:#F5F5F0;padding:20px;text-align:center;border-radius:8px">${code}</h1>
+                    <p style="color:#888;font-size:12px">Expires in 10 minutes. If you didn't request this, ignore it.</p>
+                  </div>`,
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.message ?? 'Failed to send email');
+    res.json({ sent: true });
+  } catch (err) {
+    console.error('OTP send error:', err.message);
+    res.status(500).json({ error: 'Failed to send verification code' });
+  }
+});
+
+// POST /api/auth/otp/verify
+app.post('/api/auth/otp/verify', async (req, res) => {
+  const { email, code, name } = req.body;
+  if (!email || !code) return res.status(400).json({ error: 'email and code required' });
+
+  const entry = otpStore.get(email.toLowerCase());
+  if (!entry)                      return res.status(400).json({ error: 'No code sent to this email' });
+  if (Date.now() > entry.expiresAt) return res.status(400).json({ error: 'Code expired' });
+  if (entry.code !== code.trim())   return res.status(400).json({ error: 'Invalid code' });
+
+  otpStore.delete(email.toLowerCase());
+
+  // Upsert user
+  const existing = await pool.query(
+    'SELECT id, name, points_balance FROM users WHERE email=$1 AND google_id IS NULL',
+    [email.toLowerCase()]
+  );
+
+  let user;
+  if (existing.rows.length) {
+    user = existing.rows[0];
+    if (!user.name && !name) {
+      return res.json({ needsName: true });
+    }
+    if (name) {
+      await pool.query('UPDATE users SET name=$1 WHERE id=$2', [name, user.id]);
+      user.name = name;
+    }
+  } else {
+    if (!name) return res.json({ needsName: true });
+    const created = await pool.query(
+      `INSERT INTO users (email, name, points_balance, created_at)
+       VALUES ($1, $2, 0, NOW()) RETURNING id, name, points_balance`,
+      [email.toLowerCase(), name]
+    );
+    user = created.rows[0];
+    user.email = email.toLowerCase();
+  }
+
+  const token = issueJwt({ id: user.id, email: email.toLowerCase() });
+  res.json({
+    token,
+    user: {
+      id:     user.id,
+      email:  email.toLowerCase(),
+      name:   user.name ?? '',
+      avatar: null,
+    },
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
