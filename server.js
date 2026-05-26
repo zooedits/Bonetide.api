@@ -179,6 +179,12 @@ app.post('/api/identify', async (req, res) => {
 Identify the fish in this photo.
 Primary species to look for: ${speciesList.join(', ')}.
 
+Also analyze the photo for size estimation:
+- Look for scale references: measuring tape, ruler, hand, rod, tackle box, cooler, known objects
+- If a measuring tape or ruler is clearly visible and readable, extract the measurement
+- If only hands/arms are visible, estimate based on hand span (~7-8 inches average adult hand)
+- If no scale reference exists, return estimatedSizeIn as null
+
 Respond ONLY with a valid JSON object, no markdown, no explanation:
 {
   "commonName": "string — common name of the fish",
@@ -190,12 +196,15 @@ Respond ONLY with a valid JSON object, no markdown, no explanation:
   "notes": "string — one sentence of useful fishing notes, max 20 words",
   "bestBait": ["string", "string", "string"] — top 3 baits or lures for this species,
   "bestMonths": ["Jan", "Feb"] — best months to target this species (use 3-letter abbreviations),
-  "avgSizeIn": number — typical length in inches,
-  "maxSizeIn": number — trophy/max length in inches,
-  "funFact": "string — one interesting or surprising fact about this species, max 25 words"
+  "avgSizeIn": number — typical length in inches for this species,
+  "maxSizeIn": number — trophy/max length in inches for this species,
+  "funFact": "string — one interesting or surprising fact about this species, max 25 words",
+  "estimatedSizeIn": number or null — estimated length of THIS fish in the photo in inches,
+  "measurementVerified": boolean — true only if a measuring tape or ruler is clearly visible,
+  "sizeConfidence": "high" or "medium" or "low" or null — confidence in the size estimate
 }
 
-If you cannot identify the fish with reasonable confidence, return confidence below 0.5 and leave bestBait, bestMonths, avgSizeIn, maxSizeIn, funFact as null.`;
+If you cannot identify the fish with reasonable confidence, return confidence below 0.5 and leave optional fields as null.`;
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -253,15 +262,28 @@ If you cannot identify the fish with reasonable confidence, return confidence be
 //         baroInHg, moonPct, goodBiteScore, sessionToken }
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DAILY_CAP     = 30;
-const PTS_PER_CATCH = 10;
+const DAILY_CAP_CATCHES  = 10;   // max verified catches that earn points per day
+const DAILY_CAP_SPOTS    = 3;    // max spot pins that earn points per day
+const DAILY_CAP_PTS      = 2000; // hard ceiling on points per day
+
+// Points per catch — species decay within same day
+// 1st of species: 100, 2nd: 80, 3rd: 60, 4th: 40, 5th+: 20
+// Personal best bonus: +200
+// Released bonus: +5
+function calcCatchPoints(speciesCountToday, isPersonalBest, released) {
+  const decayTable = [100, 80, 60, 40, 20];
+  const base = decayTable[Math.min(speciesCountToday, decayTable.length - 1)];
+  const pbBonus = isPersonalBest ? 200 : 0;
+  const releaseBonus = released ? 5 : 0;
+  return base + pbBonus + releaseBonus;
+}
 
 app.post('/api/catches', async (req, res) => {
   const {
     deviceId, species, lengthIn, released, bait, note,
     lat, lon, tideHeightFt, tideDirection,
     windKts, windDirection, baroInHg, moonPct,
-    goodBiteScore, sessionToken,
+    goodBiteScore, sessionToken, estimatedSizeIn, measurementVerified,
   } = req.body;
 
   if (!deviceId || !species) {
@@ -270,24 +292,49 @@ app.post('/api/catches', async (req, res) => {
 
   try {
     const user = await getOrCreateUser(deviceId);
+    const today = new Date().toISOString().slice(0, 10);
 
-    // Check daily points cap
-    const today = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
-    const { rows: todayRows } = await pool.query(
-      `SELECT COALESCE(SUM(pts_awarded), 0) AS total
-       FROM catches
-       WHERE user_id = $1
-         AND DATE(caught_at) = $2`,
+    // Daily catch count for cap + decay
+    const { rows: todayCatches } = await pool.query(
+      `SELECT species, length_in FROM catches
+       WHERE user_id = $1 AND DATE(caught_at) = $2 AND pts_awarded > 0`,
       [user.id, today]
     );
-    const todayPts   = parseInt(todayRows[0].total);
-    const ptsLeft    = Math.max(0, DAILY_CAP - todayPts);
+    const totalCatchesToday = todayCatches.length;
+    const speciesCountToday = todayCatches.filter(c =>
+      c.species?.toLowerCase() === species.toLowerCase()
+    ).length;
 
-    // Award points only if photo session token present and cap not hit
-    // sessionToken = proof the photo came from the in-app camera
-    const ptsAwarded = sessionToken && ptsLeft > 0
-      ? Math.min(PTS_PER_CATCH, ptsLeft)
-      : 0;
+    // Personal best check
+    const sizeToCompare = estimatedSizeIn || lengthIn;
+    let isPersonalBest = false;
+    if (sizeToCompare) {
+      const { rows: pbRows } = await pool.query(
+        `SELECT MAX(COALESCE(length_in, 0)) AS pb
+         FROM catches WHERE user_id = $1 AND LOWER(species) = LOWER($2)`,
+        [user.id, species]
+      );
+      const prevBest = parseFloat(pbRows[0]?.pb ?? 0);
+      isPersonalBest = sizeToCompare > prevBest;
+    }
+
+    // Daily points already earned
+    const { rows: ptRows } = await pool.query(
+      `SELECT COALESCE(SUM(pts_awarded), 0) AS total
+       FROM catches WHERE user_id = $1 AND DATE(caught_at) = $2`,
+      [user.id, today]
+    );
+    const todayPts = parseInt(ptRows[0].total);
+    const ptsLeft  = Math.max(0, DAILY_CAP_PTS - todayPts);
+
+    // Calculate points
+    let ptsAwarded = 0;
+    let ptsReason  = 'catch';
+    if (sessionToken && ptsLeft > 0 && totalCatchesToday < DAILY_CAP_CATCHES) {
+      const raw = calcCatchPoints(speciesCountToday, isPersonalBest, released ?? false);
+      ptsAwarded = Math.min(raw, ptsLeft);
+      if (isPersonalBest) ptsReason = 'catch_personal_best';
+    }
 
     // Insert catch
     const { rows: [newCatch] } = await pool.query(
@@ -298,13 +345,13 @@ app.post('/api/catches', async (req, res) => {
           good_bite_score, pts_awarded, caught_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
        RETURNING *`,
-      [user.id, species, lengthIn, released ?? true, bait, note,
+      [user.id, species, sizeToCompare || lengthIn, released ?? true, bait, note,
        lat, lon, tideHeightFt, tideDirection,
        windKts, windDirection, baroInHg, moonPct,
        goodBiteScore, ptsAwarded]
     );
 
-    // Credit points to balance
+    // Credit points
     if (ptsAwarded > 0) {
       await pool.query(
         `UPDATE users SET points_balance = points_balance + $1 WHERE id = $2`,
@@ -312,8 +359,8 @@ app.post('/api/catches', async (req, res) => {
       );
       await pool.query(
         `INSERT INTO points_transactions (user_id, delta, reason, reference_id, created_at)
-         VALUES ($1, $2, 'catch', $3, NOW())`,
-        [user.id, ptsAwarded, newCatch.id.toString()]
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [user.id, ptsAwarded, ptsReason, newCatch.id.toString()]
       );
     }
 
@@ -336,8 +383,12 @@ app.post('/api/catches', async (req, res) => {
         caughtAt:       newCatch.caught_at,
       },
       ptsAwarded,
-      dailyTotal:  todayPts + ptsAwarded,
-      dailyCap:    DAILY_CAP,
+      isPersonalBest,
+      speciesCountToday: speciesCountToday + 1,
+      catchesToday:      totalCatchesToday + 1,
+      catchesCap:        DAILY_CAP_CATCHES,
+      dailyTotal:        todayPts + ptsAwarded,
+      dailyCap:          DAILY_CAP_PTS,
     });
 
   } catch (err) {
@@ -840,6 +891,60 @@ app.get('/api/stations', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /api/spots/award — award points for pinning a fishing spot
+// Body: { deviceId }
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/api/spots/award', async (req, res) => {
+  const { deviceId } = req.body;
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+  try {
+    const user = await getOrCreateUser(deviceId);
+    const today = new Date().toISOString().slice(0, 10);
+
+    // Count spot pins today
+    const { rows: spotRows } = await pool.query(
+      `SELECT COUNT(*) AS total FROM points_transactions
+       WHERE user_id = $1 AND reason = 'spot_pin' AND DATE(created_at) = $2`,
+      [user.id, today]
+    );
+    const spotsToday = parseInt(spotRows[0].total);
+
+    if (spotsToday >= DAILY_CAP_SPOTS) {
+      return res.json({ ptsAwarded: 0, spotsToday, spotsCap: DAILY_CAP_SPOTS, capReached: true });
+    }
+
+    // Daily pts check
+    const { rows: ptRows } = await pool.query(
+      `SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches
+       WHERE user_id = $1 AND DATE(caught_at) = $2`,
+      [user.id, today]
+    );
+    const todayPts = parseInt(ptRows[0].total);
+    const ptsLeft  = Math.max(0, DAILY_CAP_PTS - todayPts);
+    const ptsAwarded = Math.min(10, ptsLeft);
+
+    if (ptsAwarded > 0) {
+      await pool.query(
+        `UPDATE users SET points_balance = points_balance + $1 WHERE id = $2`,
+        [ptsAwarded, user.id]
+      );
+      await pool.query(
+        `INSERT INTO points_transactions (user_id, delta, reason, created_at)
+         VALUES ($1, $2, 'spot_pin', NOW())`,
+        [user.id, ptsAwarded]
+      );
+    }
+
+    res.json({ ptsAwarded, spotsToday: spotsToday + 1, spotsCap: DAILY_CAP_SPOTS, capReached: false });
+  } catch (err) {
+    console.error('Spot award error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/products — fetch Shopify products via Admin REST API
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -886,10 +991,8 @@ function inferType(title = '') {
 
 function inferPoints(price = '0') {
   const p = parseFloat(price);
-  if (p >= 50) return 5000;
-  if (p >= 35) return 3500;
-  if (p >= 25) return 2500;
-  return 3000;
+  // 125 points per dollar — original rate
+  return Math.round((p * 125) / 500) * 500;
 }
 
 
