@@ -861,6 +861,127 @@ async function handleShopifyWebhook(req, res) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /api/auth/facebook — verify Facebook access token, issue JWT
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/api/auth/facebook', async (req, res) => {
+  const { accessToken } = req.body;
+  if (!accessToken) return res.status(400).json({ error: 'accessToken required' });
+  try {
+    const fbRes  = await fetch(`https://graph.facebook.com/me?fields=id,name,email,picture&access_token=${accessToken}`);
+    const fbUser = await fbRes.json();
+    if (fbUser.error) throw new Error(fbUser.error.message);
+
+    const { rows } = await pool.query(
+      `INSERT INTO users (google_id, email, name, avatar, points_balance, created_at)
+       VALUES ($1, $2, $3, $4, 0, NOW())
+       ON CONFLICT (google_id) DO UPDATE SET name = EXCLUDED.name, avatar = EXCLUDED.avatar
+       RETURNING *`,
+      [`fb_${fbUser.id}`, fbUser.email ?? null, fbUser.name, fbUser.picture?.data?.url ?? null]
+    );
+    const user = rows[0];
+    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '90d' });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar, pointsBalance: user.points_balance } });
+  } catch (err) {
+    console.error('Facebook auth error:', err.message);
+    res.status(401).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OTP auth — email or phone verification codes
+// Uses in-memory store for now; replace with Redis/DB for production
+// ─────────────────────────────────────────────────────────────────────────────
+
+const otpStore = new Map(); // key: email/phone → { code, expires, attempts }
+
+function generateOtp() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// POST /api/auth/otp/send
+app.post('/api/auth/otp/send', async (req, res) => {
+  const { email, phone } = req.body;
+  const contact = email || phone;
+  if (!contact) return res.status(400).json({ error: 'email or phone required' });
+
+  const code    = generateOtp();
+  const expires = Date.now() + 10 * 60 * 1000; // 10 minutes
+  otpStore.set(contact, { code, expires, attempts: 0 });
+
+  // Send via email (Resend) or SMS (Twilio) — log for now until keys are added
+  console.log(`[OTP] Code for ${contact}: ${code}`);
+
+  if (email && process.env.RESEND_API_KEY) {
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: 'Bone Tide <noreply@bonetideco.com>',
+        to:   [email],
+        subject: 'Your Bone Tide verification code',
+        text: `Your Bone Tide sign-in code is: ${code}\n\nExpires in 10 minutes.`,
+      }),
+    }).catch(e => console.error('Resend error:', e.message));
+  }
+
+  if (phone && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`;
+    await fetch(twilioUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')}`,
+      },
+      body: new URLSearchParams({ To: phone, From: process.env.TWILIO_PHONE_NUMBER, Body: `Your Bone Tide code: ${code}` }),
+    }).catch(e => console.error('Twilio error:', e.message));
+  }
+
+  res.json({ sent: true });
+});
+
+// POST /api/auth/otp/verify
+app.post('/api/auth/otp/verify', async (req, res) => {
+  const { email, phone, code, name } = req.body;
+  const contact = email || phone;
+  if (!contact || !code) return res.status(400).json({ error: 'contact and code required' });
+
+  const record = otpStore.get(contact);
+  if (!record) return res.status(400).json({ error: 'No code sent — request a new one' });
+  if (Date.now() > record.expires) { otpStore.delete(contact); return res.status(400).json({ error: 'Code expired' }); }
+
+  record.attempts++;
+  if (record.attempts > 5) { otpStore.delete(contact); return res.status(400).json({ error: 'Too many attempts' }); }
+  if (record.code !== code) return res.status(400).json({ error: 'Incorrect code' });
+
+  otpStore.delete(contact);
+
+  // Find or create user
+  const googleId = email ? `email_${email}` : `phone_${phone}`;
+  const { rows } = await pool.query(
+    `SELECT * FROM users WHERE google_id = $1`,
+    [googleId]
+  );
+
+  let user = rows[0];
+  const needsName = !user && !name;
+
+  if (needsName) return res.json({ needsName: true });
+
+  if (!user) {
+    const { rows: newRows } = await pool.query(
+      `INSERT INTO users (google_id, email, name, points_balance, created_at)
+       VALUES ($1, $2, $3, 0, NOW()) RETURNING *`,
+      [googleId, email ?? null, name ?? contact]
+    );
+    user = newRows[0];
+  }
+
+  const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '90d' });
+  res.json({ token, user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar, pointsBalance: user.points_balance } });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/stations — proxy NOAA water level stations list (cached 24hrs)
 // ─────────────────────────────────────────────────────────────────────────────
 
