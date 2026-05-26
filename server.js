@@ -916,7 +916,7 @@ app.post('/api/auth/otp/verify', async (req, res) => {
   if (Date.now() > entry.expiresAt) return res.status(400).json({ error: 'Code expired' });
   if (entry.code !== code.trim())   return res.status(400).json({ error: 'Invalid code' });
 
-  otpStore.delete(email.toLowerCase());
+  // Don't delete code yet — we may need it again if name is required
 
   // Upsert user
   const existing = await pool.query(
@@ -944,6 +944,9 @@ app.post('/api/auth/otp/verify', async (req, res) => {
     user = created.rows[0];
     user.email = email.toLowerCase();
   }
+
+  // Now safe to delete the code
+  otpStore.delete(email.toLowerCase());
 
   const token = issueJwt({ id: user.id, email: email.toLowerCase() });
   res.json({
