@@ -506,10 +506,10 @@ app.get('/api/conditions', async (req, res) => {
       fetch(
         `https://api.open-meteo.com/v1/forecast`
         + `?latitude=${lat}&longitude=${lon}`
-        + `&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index`
-        + `&hourly=temperature_2m,wind_speed_10m,weather_code`
+        + `&current=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,surface_pressure,uv_index`
+        + `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,weather_code`
         + `&daily=sunrise,sunset`
-        + `&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`
+        + `&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto&forecast_hours=12`
       ),
     ]);
 
@@ -524,24 +524,50 @@ app.get('/api/conditions', async (req, res) => {
     const pressHpa  = cur?.surface_pressure ?? 1013;
     const pressInHg = (pressHpa * 0.02953).toFixed(2);
 
+    // Fetch NOAA water temperature
+    let waterTempF = null;
+    try {
+      const wtRes = await fetch(
+        `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?station=nearest&product=water_temperature&datum=MLLW&time_zone=lst_ldt&units=english&format=json&application=bonetideco&range=1&lat=${lat}&lon=${lon}`,
+        { signal: AbortSignal.timeout(4000) }
+      );
+      const wtData = await wtRes.json();
+      if (wtData.data?.[0]?.v) waterTempF = parseFloat(wtData.data[0].v).toFixed(1);
+    } catch {}
+
+    // Real gust data from Open-Meteo
+    const gustKts = cur?.wind_gusts_10m
+      ? Math.round(cur.wind_gusts_10m * 0.539957)
+      : Math.round(windKts * 1.3);
+
+    // Hourly forecast array for HomeScreen
+    const hourly = (forecast.hourly?.time ?? []).slice(0, 12).map((t, i) => ({
+      time:        t,
+      windKts:     Math.round((forecast.hourly.wind_speed_10m?.[i] ?? 0) * 0.539957),
+      windDir:     degreesToCardinal(forecast.hourly.wind_direction_10m?.[i] ?? 0),
+      tempF:       Math.round(forecast.hourly.temperature_2m?.[i] ?? 75),
+      weatherCode: forecast.hourly.weather_code?.[i] ?? 0,
+    }));
+
     const data = {
       wind: {
         speedKts:      Math.round(windKts),
         direction:     windDir,
         speedCategory: windCategory(windKts),
-        gustKts:       Math.round(windKts * 1.3), // estimate
+        gustKts,
       },
       pressure: {
         inHg:  parseFloat(pressInHg),
-        trend: 'stable', // would need historical comparison for real trend
+        trend: 'stable',
       },
-      waveHeight: mari?.wave_height      ?? 1.5,
-      wavePeriod: mari?.wave_period      ?? 6,
-      waveDir:    degreesToCardinal(mari?.wave_direction ?? 90) + ` ${mari?.wave_direction ?? 90}°`,
-      waterTemp:  72, // Open-Meteo marine doesn't include water temp free tier
-      visibility: 8,
-      uvIndex:    cur?.uv_index ?? 5,
-      airTempF:   Math.round(cur?.temperature_2m ?? 80),
+      waveHeight: mari?.wave_height ?? null,
+      wavePeriod: mari?.wave_period ?? null,
+      waveDir:    mari?.wave_direction != null ? degreesToCardinal(mari.wave_direction) + ` ${mari.wave_direction}°` : null,
+      waterTemp:  waterTempF,
+      visibility: null,
+      uvIndex:    cur?.uv_index ?? null,
+      airTempF:   Math.round(cur?.temperature_2m ?? 75),
+      hourly,
       sunrise:    forecast.daily?.sunrise?.[0]
         ? new Date(forecast.daily.sunrise[0]).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
         : '6:30 AM',
@@ -574,26 +600,52 @@ function windCategory(kts) {
 }
 
 function computeSolunar(lat, lon) {
-  // Simplified solunar calculation based on moon position
-  // For production use the 'solunar' npm package
-  const now        = new Date();
-  const hourOfDay  = now.getHours() + now.getMinutes() / 60;
-  const moonPct    = Math.round(50 + 50 * Math.sin((now.getDate() / 29.5) * Math.PI * 2));
+  const now       = new Date();
+  const hourOfDay = now.getHours() + now.getMinutes() / 60;
+  const dayOfYear = Math.floor((now - new Date(now.getFullYear(), 0, 0)) / 86400000);
 
-  // Simple heuristic: major windows near moonrise/moonset
-  const majorHours = [6.5, 18.5];
-  const nearMajor  = majorHours.some(h => Math.abs(hourOfDay - h) < 1.5);
-  const atMajor    = majorHours.some(h => Math.abs(hourOfDay - h) < 0.5);
+  // Moon phase — synodic period 29.53 days
+  // Reference new moon: Jan 6 2000 = day 6 of year 2000
+  const daysSinceRef = (now.getFullYear() - 2000) * 365.25 + dayOfYear - 6;
+  const moonAge      = ((daysSinceRef % 29.53) + 29.53) % 29.53;
+  const moonPct      = Math.round(50 - 50 * Math.cos((moonAge / 29.53) * 2 * Math.PI));
+
+  // Moonrise/moonset offsets based on moon age (simplified)
+  const moonriseHour = (6 + moonAge * (24 / 29.53)) % 24;
+  const moonsetHour  = (moonriseHour + 12.4) % 24;
+  const transitHour  = (moonriseHour + 6.2) % 24;
+
+  // Major windows = moon transit + opposite; minor = moonrise/set
+  const majorH = [transitHour, (transitHour + 12.4) % 24];
+  const minorH = [moonriseHour, moonsetHour];
+
+  const nearMajor = majorH.some(h => Math.abs(hourOfDay - h) < 1.5 || Math.abs(hourOfDay - h - 24) < 1.5);
+  const atMajor   = majorH.some(h => Math.abs(hourOfDay - h) < 0.5  || Math.abs(hourOfDay - h - 24) < 0.5);
+  const nearMinor = minorH.some(h => Math.abs(hourOfDay - h) < 1.0  || Math.abs(hourOfDay - h - 24) < 1.0);
+  const atMinor   = minorH.some(h => Math.abs(hourOfDay - h) < 0.5  || Math.abs(hourOfDay - h - 24) < 0.5);
+
+  let window = 'between';
+  if (atMajor)        window = 'major_peak';
+  else if (nearMajor) window = 'major_near';
+  else if (atMinor)   window = 'minor_peak';
+  else if (nearMinor) window = 'minor_near';
+
+  const moonPhase = moonAge < 1.5 || moonAge > 28 ? 'new'
+    : moonAge > 13.5 && moonAge < 16 ? 'full'
+    : (moonAge > 6.5 && moonAge < 8.5) || (moonAge > 21 && moonAge < 23) ? 'quarter'
+    : 'other';
+
+  // Major windows as % of day for chart rendering
+  const toXPct = h => ((h % 24) / 24);
 
   return {
-    window:       atMajor ? 'major_peak' : nearMajor ? 'major_near' : 'between',
-    moonPhase:    moonPct > 85 || moonPct < 15 ? (moonPct > 50 ? 'full' : 'new') : 'other',
+    window,
+    moonPhase,
     moonPct,
+    moonAge:      Math.round(moonAge),
     lightWindow:  hourOfDay < 7.5 ? 'dawn' : hourOfDay > 19.5 ? 'dusk' : 'other',
-    majorWindows: [
-      { label: 'MAJ', xPct: 0.28 },
-      { label: 'MAJ', xPct: 0.78 },
-    ],
+    majorWindows: majorH.map(h => ({ label: 'MAJ', xPct: toXPct(h) })),
+    minorWindows: minorH.map(h => ({ label: 'min', xPct: toXPct(h) })),
   };
 }
 
