@@ -252,8 +252,10 @@ If you cannot identify the fish with reasonable confidence, return confidence be
 //         baroInHg, moonPct, goodBiteScore, sessionToken }
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DAILY_CAP     = 30;
-const PTS_PER_CATCH = 10;
+const DAILY_CAP      = 1200; // max pts per day from catches
+const BASE_PTS       = 100;  // first catch of a species today
+const DECAY_STEP     = 20;   // each subsequent catch of same species loses 20pts
+const MIN_PTS        = 20;   // minimum pts per catch (floor)
 
 app.post('/api/catches', async (req, res) => {
   const {
@@ -269,23 +271,32 @@ app.post('/api/catches', async (req, res) => {
 
   try {
     const user = await getOrCreateUser(deviceId);
+    const today = new Date().toISOString().slice(0, 10);
 
-    // Check daily points cap
-    const today = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+    // How many times has this user caught THIS species today?
+    const { rows: speciesRows } = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM catches
+       WHERE user_id = $1 AND DATE(caught_at) = $2
+         AND LOWER(species) = LOWER($3)`,
+      [user.id, today, species]
+    );
+    const speciesCountToday = parseInt(speciesRows[0].cnt);
+
+    // Diminishing returns: 100, 80, 60, 40, 20, 20, 20...
+    const rawPts = Math.max(MIN_PTS, BASE_PTS - (speciesCountToday * DECAY_STEP));
+
+    // Check daily cap
     const { rows: todayRows } = await pool.query(
-      `SELECT COALESCE(SUM(pts_awarded), 0) AS total
-       FROM catches
-       WHERE user_id = $1
-         AND DATE(caught_at) = $2`,
+      `SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches
+       WHERE user_id = $1 AND DATE(caught_at) = $2`,
       [user.id, today]
     );
-    const todayPts   = parseInt(todayRows[0].total);
-    const ptsLeft    = Math.max(0, DAILY_CAP - todayPts);
+    const todayPts = parseInt(todayRows[0].total);
+    const ptsLeft  = Math.max(0, DAILY_CAP - todayPts);
 
-    // Award points only if photo session token present and cap not hit
-    // sessionToken = proof the photo came from the in-app camera
+    // Only award if photo token present (proof of in-app camera) and cap not hit
     const ptsAwarded = sessionToken && ptsLeft > 0
-      ? Math.min(PTS_PER_CATCH, ptsLeft)
+      ? Math.min(rawPts, ptsLeft)
       : 0;
 
     // Insert catch
