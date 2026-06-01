@@ -99,6 +99,10 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'Bone Tide Co. API' });
 });
 
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', service: 'Bone Tide Co. API' });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/google — Exchange Google ID token for a Bone Tide JWT
 // Body: { idToken: string }
@@ -187,9 +191,6 @@ Respond ONLY with a valid JSON object, no markdown, no explanation:
   "inRegion": boolean — is this species common in the ${region} region,
   "habitat": "inshore" or "nearshore",
   "catchRelease": boolean — is this typically catch and release only,
-  "estimatedLengthIn": number or null — estimated length in inches based on visual proportions, null if cannot estimate,
-  "estimatedWeightLbs": number or null — estimated weight in lbs based on species and size, null if cannot estimate,
-  "sizeConfidence": "low" or "medium" or "high" — confidence in size estimate,
   "notes": "string — one sentence of useful fishing notes, max 20 words"
 }
 
@@ -205,7 +206,7 @@ If you cannot identify the fish with reasonable confidence, return confidence be
       },
       body: JSON.stringify({
         model:      'claude-opus-4-6',
-        max_tokens: 450,
+        max_tokens: 300,
         messages: [{
           role:    'user',
           content: [
@@ -813,7 +814,7 @@ async function handleShopifyWebhook(req, res) {
 
 app.get('/api/products', async (req, res) => {
   try {
-    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2026-04/products.json?limit=50&status=active`;
+    const url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/products.json?limit=50&status=active`;
     const response = await fetch(url, {
       headers: {
         'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
@@ -845,6 +846,7 @@ app.get('/api/products', async (req, res) => {
         variants,
         inStock:  totalInventory > 0,
         lowStock: totalInventory > 0 && totalInventory <= 5,
+        image:    p.images?.[0]?.src ?? null,
       };
     });
 
