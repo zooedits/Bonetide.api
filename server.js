@@ -187,6 +187,9 @@ Respond ONLY with a valid JSON object, no markdown, no explanation:
   "inRegion": boolean — is this species common in the ${region} region,
   "habitat": "inshore" or "nearshore",
   "catchRelease": boolean — is this typically catch and release only,
+  "estimatedLengthIn": number or null — estimated length in inches based on visual proportions, null if cannot estimate,
+  "estimatedWeightLbs": number or null — estimated weight in lbs based on species and size, null if cannot estimate,
+  "sizeConfidence": "low" or "medium" or "high" — confidence in size estimate,
   "notes": "string — one sentence of useful fishing notes, max 20 words"
 }
 
@@ -202,7 +205,7 @@ If you cannot identify the fish with reasonable confidence, return confidence be
       },
       body: JSON.stringify({
         model:      'claude-opus-4-6',
-        max_tokens: 300,
+        max_tokens: 450,
         messages: [{
           role:    'user',
           content: [
@@ -850,179 +853,6 @@ app.get('/api/products', async (req, res) => {
     console.error('Products error:', err);
     res.status(500).json({ error: err.message });
   }
-});
-
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/auth/apple — verify Apple identity token, issue JWT
-// ─────────────────────────────────────────────────────────────────────────────
-
-app.post('/api/auth/apple', async (req, res) => {
-  try {
-    const { identityToken, fullName, email } = req.body;
-    if (!identityToken) return res.status(400).json({ error: 'identityToken required' });
-
-    // Decode the JWT from Apple (header.payload.signature)
-    const payload = JSON.parse(Buffer.from(identityToken.split('.')[1], 'base64').toString());
-    const appleId = payload.sub;
-    if (!appleId) return res.status(400).json({ error: 'Invalid Apple token' });
-
-    const userEmail = email ?? payload.email ?? null;
-    const userName  = fullName?.givenName
-      ? `${fullName.givenName} ${fullName.familyName ?? ''}`.trim()
-      : null;
-
-    // Upsert user — Apple only sends email/name on FIRST sign in
-    const existing = await pool.query(
-      'SELECT id, name, email, points_balance FROM users WHERE google_id = $1',
-      [appleId]
-    );
-
-    let user;
-    if (existing.rows.length) {
-      user = existing.rows[0];
-      // Update name/email if Apple provided them this time
-      if (userName || userEmail) {
-        await pool.query(
-          `UPDATE users SET
-             name   = COALESCE($1, name),
-             email  = COALESCE($2, email)
-           WHERE id = $3`,
-          [userName, userEmail, user.id]
-        );
-      }
-    } else {
-      const created = await pool.query(
-        `INSERT INTO users (google_id, email, name, points_balance, created_at)
-         VALUES ($1, $2, $3, 0, NOW())
-         RETURNING id, name, email, points_balance`,
-        [appleId, userEmail, userName]
-      );
-      user = created.rows[0];
-    }
-
-    const token = issueJwt({ id: user.id, email: user.email ?? userEmail ?? '' });
-    res.json({
-      token,
-      user: {
-        id:     user.id,
-        email:  user.email ?? userEmail ?? '',
-        name:   user.name ?? userName ?? '',
-        avatar: null,
-      },
-    });
-  } catch (err) {
-    console.error('[auth] Apple sign-in failed:', err.message);
-    res.status(401).json({ error: 'Apple sign-in failed' });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OTP auth — email only (Resend). Phone requires Twilio (future).
-// ─────────────────────────────────────────────────────────────────────────────
-
-const otpStore = new Map(); // email -> { code, expiresAt }
-
-function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-// POST /api/auth/otp/send
-app.post('/api/auth/otp/send', async (req, res) => {
-  const { email, phone } = req.body;
-
-  if (phone) {
-    return res.status(400).json({ error: 'Phone login coming soon. Please use email.' });
-  }
-  if (!email) {
-    return res.status(400).json({ error: 'email required' });
-  }
-
-  const code      = generateOtp();
-  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-  otpStore.set(email.toLowerCase(), { code, expiresAt });
-
-  try {
-    const r = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        from:    'Bone Tide Co. <noreply@bonetideco.com>',
-        to:      [email],
-        subject: 'Your Bone Tide verification code',
-        html:    `<div style="font-family:sans-serif;max-width:400px;margin:0 auto">
-                    <h2 style="color:#C35233">Bone Tide Co.</h2>
-                    <p>Your verification code is:</p>
-                    <h1 style="letter-spacing:8px;color:#0A1128;background:#F5F5F0;padding:20px;text-align:center;border-radius:8px">${code}</h1>
-                    <p style="color:#888;font-size:12px">Expires in 10 minutes. If you didn't request this, ignore it.</p>
-                  </div>`,
-      }),
-    });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.message ?? 'Failed to send email');
-    res.json({ sent: true });
-  } catch (err) {
-    console.error('OTP send error:', err.message);
-    res.status(500).json({ error: 'Failed to send verification code' });
-  }
-});
-
-// POST /api/auth/otp/verify
-app.post('/api/auth/otp/verify', async (req, res) => {
-  const { email, code, name } = req.body;
-  if (!email || !code) return res.status(400).json({ error: 'email and code required' });
-
-  const entry = otpStore.get(email.toLowerCase());
-  if (!entry)                      return res.status(400).json({ error: 'No code sent to this email' });
-  if (Date.now() > entry.expiresAt) return res.status(400).json({ error: 'Code expired' });
-  if (entry.code !== code.trim())   return res.status(400).json({ error: 'Invalid code' });
-
-  // Don't delete code yet — we may need it again if name is required
-
-  // Upsert user
-  const existing = await pool.query(
-    'SELECT id, name, points_balance FROM users WHERE email=$1 AND google_id IS NULL',
-    [email.toLowerCase()]
-  );
-
-  let user;
-  if (existing.rows.length) {
-    user = existing.rows[0];
-    if (!user.name && !name) {
-      return res.json({ needsName: true });
-    }
-    if (name) {
-      await pool.query('UPDATE users SET name=$1 WHERE id=$2', [name, user.id]);
-      user.name = name;
-    }
-  } else {
-    if (!name) return res.json({ needsName: true });
-    const created = await pool.query(
-      `INSERT INTO users (email, name, points_balance, created_at)
-       VALUES ($1, $2, 0, NOW()) RETURNING id, name, points_balance`,
-      [email.toLowerCase(), name]
-    );
-    user = created.rows[0];
-    user.email = email.toLowerCase();
-  }
-
-  // Now safe to delete the code
-  otpStore.delete(email.toLowerCase());
-
-  const token = issueJwt({ id: user.id, email: email.toLowerCase() });
-  res.json({
-    token,
-    user: {
-      id:     user.id,
-      email:  email.toLowerCase(),
-      name:   user.name ?? '',
-      avatar: null,
-    },
-  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
