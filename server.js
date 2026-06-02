@@ -499,9 +499,8 @@ app.get('/api/conditions', async (req, res) => {
       fetch(
         `https://marine-api.open-meteo.com/v1/marine`
         + `?latitude=${lat}&longitude=${lon}`
-        + `&hourly=wave_height,wave_period,wave_direction,ocean_current_velocity`
         + `&current=wave_height,wave_period,wave_direction`
-        + `&wind_speed_unit=kn&length_unit=imperial`
+        + `&length_unit=imperial&wind_speed_unit=kn&timezone=auto`
       ),
       fetch(
         `https://api.open-meteo.com/v1/forecast`
@@ -517,7 +516,7 @@ app.get('/api/conditions', async (req, res) => {
     const forecast = await forecastRes.json();
 
     const cur  = forecast.current;
-    const mari = marine.current;
+    const mari = marine.current ?? {};
 
     const windKts   = cur?.wind_speed_10m ?? 0;
     const windDir   = degreesToCardinal(cur?.wind_direction_10m ?? 0);
@@ -551,18 +550,18 @@ app.get('/api/conditions', async (req, res) => {
 
     const data = {
       wind: {
-        speedKts:      Math.round(windKts),
+        speedKts:      Math.round(parseFloat(windKts)),
         direction:     windDir,
-        speedCategory: windCategory(windKts),
-        gustKts,
+        speedCategory: windCategory(parseFloat(windKts)),
+        gustKts:       Math.round(parseFloat(gustKts)),
       },
       pressure: {
         inHg:  parseFloat(pressInHg),
         trend: 'stable',
       },
-      waveHeight: mari?.wave_height ?? null,
-      wavePeriod: mari?.wave_period ?? null,
-      waveDir:    mari?.wave_direction != null ? degreesToCardinal(mari.wave_direction) + ` ${mari.wave_direction}°` : null,
+      waveHeight: mari?.wave_height != null ? parseFloat(mari.wave_height).toFixed(1) : null,
+      wavePeriod: mari?.wave_period  != null ? parseFloat(mari.wave_period).toFixed(1)  : null,
+      waveDir:    mari?.wave_direction != null ? degreesToCardinal(parseFloat(mari.wave_direction)) + ` ${Math.round(mari.wave_direction)}°` : null,
       waterTemp:  waterTempF,
       visibility: null,
       uvIndex:    cur?.uv_index ?? null,
