@@ -176,8 +176,6 @@ app.post('/api/identify', async (req, res) => {
 
   const prompt = `You are a marine biologist assistant for Bone Tide Co., a fishing app serving ${region} anglers.
 
-FIRST: Check if this image is a photo of a screen, monitor, printed photo, or another photograph. Look for: screen glare, bezels, pixelation, moire patterns, curved screen edges, reflections on glass, or visible screen pixels. Set isPhotoOfPhoto to true if any of these are present.
-
 Identify the fish in this photo.
 Primary species to look for: ${speciesList.join(', ')}.
 
@@ -189,8 +187,7 @@ Respond ONLY with a valid JSON object, no markdown, no explanation:
   "inRegion": boolean — is this species common in the ${region} region,
   "habitat": "inshore" or "nearshore",
   "catchRelease": boolean — is this typically catch and release only,
-  "notes": "string — one sentence of useful fishing notes, max 20 words",
-  "isPhotoOfPhoto": boolean — true if this appears to be a photo of a screen, printed photo, or another device
+  "notes": "string — one sentence of useful fishing notes, max 20 words"
 }
 
 If you cannot identify the fish with reasonable confidence, return confidence below 0.5.`;
@@ -251,10 +248,8 @@ If you cannot identify the fish with reasonable confidence, return confidence be
 //         baroInHg, moonPct, goodBiteScore, sessionToken }
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DAILY_CAP  = 1200;
-const BASE_PTS   = 100;
-const DECAY_STEP = 20;
-const MIN_PTS    = 20;
+const DAILY_CAP     = 30;
+const PTS_PER_CATCH = 10;
 
 app.post('/api/catches', async (req, res) => {
   const {
@@ -270,50 +265,23 @@ app.post('/api/catches', async (req, res) => {
 
   try {
     const user = await getOrCreateUser(deviceId);
-    const today = new Date().toISOString().slice(0, 10);
 
-    // Species decay
-    const { rows: speciesRows } = await pool.query(
-      `SELECT COUNT(*) AS cnt FROM catches
-       WHERE user_id = $1 AND DATE(caught_at) = $2 AND LOWER(species) = LOWER($3)`,
-      [user.id, today, species]
-    );
-    const speciesCountToday = parseInt(speciesRows[0].cnt);
-    const rawPts = Math.max(MIN_PTS, BASE_PTS - (speciesCountToday * DECAY_STEP));
-
-    // Daily cap
+    // Check daily points cap
+    const today = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
     const { rows: todayRows } = await pool.query(
-      `SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches
-       WHERE user_id = $1 AND DATE(caught_at) = $2`,
+      `SELECT COALESCE(SUM(pts_awarded), 0) AS total
+       FROM catches
+       WHERE user_id = $1
+         AND DATE(caught_at) = $2`,
       [user.id, today]
     );
-    const todayPts = parseInt(todayRows[0].total);
-    const ptsLeft  = Math.max(0, DAILY_CAP - todayPts);
+    const todayPts   = parseInt(todayRows[0].total);
+    const ptsLeft    = Math.max(0, DAILY_CAP - todayPts);
 
-    // ── Session token check (5-min window) ───────────────────────────────────
-    const tokenCheck = validateSessionToken(sessionToken);
-    const tokenLat   = tokenCheck.lat ?? lat;
-    const tokenLon   = tokenCheck.lon ?? lon;
-
-    // ── NOAA saltwater proximity check ───────────────────────────────────────
-    // NOAA water-level stations are exclusively on tidal saltwater.
-    // Within 15km of any station = confirmed near tidal/saltwater body.
-    const { nearSaltwater, distKm, station: nearestStation } = await getNearestNoaaStation(
-      parseFloat(tokenLat), parseFloat(tokenLon)
-    );
-
-    if (!tokenCheck.valid) console.warn(`[catches] Invalid token: ${tokenCheck.reason} device=${deviceId}`);
-    if (!nearSaltwater)    console.warn(`[catches] Not near saltwater: ${distKm}km from nearest station device=${deviceId}`);
-
-    // Points require: valid 5-min session token + within 15km of NOAA tidal station
-    const ptsBlockReason = !sessionToken     ? 'no_token'
-      : !tokenCheck.valid                    ? tokenCheck.reason
-      : !nearSaltwater                       ? 'not_near_saltwater'
-      : ptsLeft === 0                        ? 'daily_cap'
-      : null;
-
-    const ptsAwarded = (tokenCheck.valid && nearSaltwater && ptsLeft > 0)
-      ? Math.min(rawPts, ptsLeft)
+    // Award points only if photo session token present and cap not hit
+    // sessionToken = proof the photo came from the in-app camera
+    const ptsAwarded = sessionToken && ptsLeft > 0
+      ? Math.min(PTS_PER_CATCH, ptsLeft)
       : 0;
 
     // Insert catch
@@ -345,8 +313,6 @@ app.post('/api/catches', async (req, res) => {
     }
 
     res.json({
-      ptsBlockReason: ptsAwarded === 0 ? ptsBlockReason : null,
-      nearestStation: nearestStation ?? null,
       catch: {
         id:             newCatch.id,
         species:        newCatch.species,
@@ -584,81 +550,6 @@ function degreesToCardinal(deg) {
   return dirs[Math.round(deg / 45) % 8];
 }
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Session token validation
-// Token = JSON { ts, lat, lon, n } embedded by CatchCameraScreen at capture time.
-// Must be < 5 minutes old to qualify for points.
-// ─────────────────────────────────────────────────────────────────────────────
-
-function validateSessionToken(token) {
-  if (!token) return { valid: false, reason: 'no_token' };
-  try {
-    const payload = JSON.parse(token);
-    const age = Date.now() - payload.ts;
-    if (age < 0)                return { valid: false, reason: 'invalid_timestamp' };
-    if (age > 5 * 60 * 1000)   return { valid: false, reason: 'token_expired' }; // > 5 min
-    return { valid: true, lat: payload.lat ?? null, lon: payload.lon ?? null };
-  } catch {
-    return { valid: false, reason: 'malformed_token' };
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// NOAA saltwater proximity check
-// Fetches the NOAA water-level station list (same API used for tide station
-// search) and finds the nearest station. NOAA water-level stations are
-// exclusively on tidal saltwater — rivers, estuaries, bays, and coast.
-// If the nearest station is within 15km the user is confirmed near saltwater.
-// Result is cached for 24h since station locations never change.
-// ─────────────────────────────────────────────────────────────────────────────
-
-let _noaaStationCache = null; // { stations, fetchedAt }
-
-async function getNearestNoaaStation(lat, lon) {
-  if (lat == null || lon == null) return { nearSaltwater: true, distKm: null, station: null };
-
-  // Load station list once per server restart (or if >24h old)
-  if (!_noaaStationCache || (Date.now() - _noaaStationCache.fetchedAt) > 24 * 3600 * 1000) {
-    try {
-      const res  = await fetch(
-        'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels&units=english',
-        { signal: AbortSignal.timeout(6000) }
-      );
-      const data = await res.json();
-      if (data.stations?.length) {
-        _noaaStationCache = { stations: data.stations, fetchedAt: Date.now() };
-      }
-    } catch (e) {
-      console.warn('[noaa] Station list fetch failed:', e.message);
-      // If NOAA is down, fail open — don't punish anglers for API outages
-      return { nearSaltwater: true, distKm: null, station: null };
-    }
-  }
-
-  if (!_noaaStationCache) return { nearSaltwater: true, distKm: null, station: null };
-
-  // Find nearest station using Haversine distance
-  let nearest = null;
-  let minKm   = Infinity;
-
-  for (const st of _noaaStationCache.stations) {
-    const dLat = (st.lat - lat) * Math.PI / 180;
-    const dLon = (st.lng - lon) * Math.PI / 180;
-    const a = Math.sin(dLat/2)**2 +
-              Math.cos(lat * Math.PI/180) * Math.cos(st.lat * Math.PI/180) *
-              Math.sin(dLon/2)**2;
-    const km = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    if (km < minKm) { minKm = km; nearest = st; }
-  }
-
-  return {
-    nearSaltwater: minKm <= 15, // 15km (~9 miles) from any NOAA tidal station
-    distKm:        Math.round(minKm),
-    station:       nearest ? { id: nearest.id, name: nearest.name } : null,
-  };
-}
-
 function windCategory(kts) {
   if (kts < 5)  return 'calm';
   if (kts < 15) return 'light';
@@ -754,9 +645,6 @@ app.post('/api/redeem', async (req, res) => {
       [deviceId]
     );
     if (!user) throw new Error('User not found');
-    if (user.points_balance < pointsCost) {
-      throw new Error(`Insufficient points. Have ${user.points_balance}, need ${pointsCost}.`);
-    }
 
     // Check for existing pending hold on this product
     const { rows: existing } = await client.query(
@@ -769,24 +657,30 @@ app.post('/api/redeem', async (req, res) => {
       throw new Error('You already have a pending redemption for this item.');
     }
 
-    // Generate Shopify discount code via Admin API
+    // Enforce 500-pt increments server-side
+    const safePoints = Math.floor(pointsCost / 500) * 500;
+    if (safePoints < 500) throw new Error('Minimum redemption is 500 points ($4.00).');
+    const dollarValue = (safePoints / 125).toFixed(2); // 125 pts = $1
+
+    if (user.points_balance < safePoints) {
+      throw new Error(`Insufficient points. You have ${user.points_balance.toLocaleString()} pts, need ${safePoints.toLocaleString()} pts.`);
+    }
+
+    // Generate Shopify discount code — fixed dollar amount off entire order
     const codeStr  = `BTC-${deviceId.slice(-6).toUpperCase()}-${Date.now()}`;
     const priceRule = await shopifyAdminPost('/price_rules.json', {
       price_rule: {
         title:              codeStr,
         target_type:        'line_item',
-        target_selection:   'entitled',
+        target_selection:   'all',
         allocation_method:  'across',
-        value_type:         'percentage',
-        value:              '-100.0',
+        value_type:         'fixed_amount',
+        value:              `-${dollarValue}`,
         customer_selection: 'all',
         usage_limit:        1,
         once_per_customer:  true,
         starts_at:          new Date().toISOString(),
-        ends_at:            new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
-        entitled_product_ids: [
-          shopifyProductId.replace('gid://shopify/Product/', ''),
-        ],
+        ends_at:            new Date(Date.now() + 48 * 3600 * 1000).toISOString(),
       },
     });
 
@@ -800,8 +694,8 @@ app.post('/api/redeem', async (req, res) => {
       `INSERT INTO points_holds
          (user_id, points_held, shopify_product_id, product_title,
           discount_code, discount_code_id, status, expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,'pending', NOW() + INTERVAL '24 hours')`,
-      [user.id, pointsCost, shopifyProductId, productTitle,
+       VALUES ($1,$2,$3,$4,$5,$6,'pending', NOW() + INTERVAL '48 hours')`,
+      [user.id, safePoints, shopifyProductId, productTitle,
        discountCode.discount_code.code,
        discountCode.discount_code.id.toString()]
     );
@@ -809,10 +703,12 @@ app.post('/api/redeem', async (req, res) => {
     await client.query('COMMIT');
 
     res.json({
-      discountCode: discountCode.discount_code.code,
-      pointsHeld:   pointsCost,
-      expiresIn:    '24 hours',
-      message:      'Apply this code at checkout. Points deducted on order confirmation.',
+      discountCode:   discountCode.discount_code.code,
+      pointsDeducted: safePoints,
+      dollarValue:    parseFloat(dollarValue),
+      newBalance:     user.points_balance, // still full — deducted on order confirmation
+      expiresIn:      '48 hours',
+      message:        'Apply this code at checkout on bonetideco.com. Points deducted when your order is confirmed.',
     });
 
   } catch (err) {
@@ -912,6 +808,102 @@ async function handleShopifyWebhook(req, res) {
   }
 }
 
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/currents — nearest NOAA current stations with live predictions
+// Query: ?lat=31.1234&lon=-81.4567
+// Cached 1 hour server-side
+// ─────────────────────────────────────────────────────────────────────────────
+
+const currentsCache = new Map();
+
+app.get('/api/currents', async (req, res) => {
+  const { lat = '31.1234', lon = '-81.4567' } = req.query;
+  const cacheKey = `${parseFloat(lat).toFixed(2)}_${parseFloat(lon).toFixed(2)}`;
+  const cached   = currentsCache.get(cacheKey);
+  if (cached && (Date.now() - cached.fetchedAt) < 60 * 60 * 1000) return res.json(cached.data);
+
+  try {
+    // 1. Fetch all NOAA current prediction stations
+    const stRes  = await fetch(
+      'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=currentpredictions&units=english',
+      { signal: AbortSignal.timeout(6000) }
+    );
+    const stData = await stRes.json();
+    if (!stData.stations?.length) throw new Error('No current stations returned');
+
+    // 2. Find 3 nearest by Haversine
+    const userLat = parseFloat(lat);
+    const userLon = parseFloat(lon);
+
+    const nearest = stData.stations.map(st => {
+      const dLat = (st.lat - userLat) * Math.PI / 180;
+      const dLon = (st.lng - userLon) * Math.PI / 180;
+      const a = Math.sin(dLat/2)**2 +
+                Math.cos(userLat * Math.PI/180) * Math.cos(st.lat * Math.PI/180) *
+                Math.sin(dLon/2)**2;
+      const km = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return { ...st, distKm: km };
+    })
+    .sort((a, b) => a.distKm - b.distKm)
+    .slice(0, 3);
+
+    // 3. Fetch current predictions for each station
+    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const nowMs   = Date.now();
+
+    const stationsWithData = await Promise.all(nearest.map(async st => {
+      try {
+        const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter`
+          + `?begin_date=${dateStr}&range=2&station=${st.id}`
+          + `&product=currents_predictions&time_zone=lst_ldt&interval=MAX_SLACK`
+          + `&units=english&application=bonetideco&format=json`;
+        const predRes  = await fetch(url, { signal: AbortSignal.timeout(5000) });
+        const predData = await predRes.json();
+
+        const preds = predData.current_predictions?.cp ?? [];
+        let closest = null, minDiff = Infinity;
+        for (const p of preds) {
+          const diff = Math.abs(new Date(p.Time).getTime() - nowMs);
+          if (diff < minDiff) { minDiff = diff; closest = p; }
+        }
+
+        const velocityMajor = closest ? parseFloat(closest.Velocity_Major) : null;
+        const speedKts      = velocityMajor != null ? Math.abs(velocityMajor) : null;
+        const isFlood       = velocityMajor != null ? velocityMajor >= 0 : null;
+        const floodDir      = st.meanFloodDir != null ? parseFloat(st.meanFloodDir) : null;
+        const direction     = floodDir != null && isFlood != null
+          ? (isFlood ? floodDir : (floodDir + 180) % 360)
+          : null;
+
+        return {
+          id:             st.id,
+          name:           st.name,
+          distMi:         Math.round(st.distKm * 0.621),
+          speedKts:       speedKts != null ? Math.round(speedKts * 10) / 10 : null,
+          direction,
+          directionLabel: isFlood === null ? '—' : isFlood ? 'Flood' : 'Ebb',
+          isFlood,
+        };
+      } catch {
+        return {
+          id: st.id, name: st.name,
+          distMi: Math.round(st.distKm * 0.621),
+          speedKts: null, direction: null, directionLabel: '—', isFlood: null,
+        };
+      }
+    }));
+
+    const data = { stations: stationsWithData };
+    currentsCache.set(cacheKey, { data, fetchedAt: Date.now() });
+    res.json(data);
+
+  } catch (err) {
+    console.error('Currents error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/products — fetch Shopify products via Admin REST API
