@@ -31,13 +31,35 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Cloudinary — catch photo storage
+// ─────────────────────────────────────────────────────────────────────────────
+const CLOUDINARY_CLOUD  = process.env.CLOUDINARY_CLOUD_NAME  || 'dojxysc50';
+const CLOUDINARY_KEY    = process.env.CLOUDINARY_API_KEY     || '629822632696159';
+const CLOUDINARY_SECRET = process.env.CLOUDINARY_API_SECRET  || 'RaqA4ZBnQxqVhwAJk8xAGL2ghno';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-migration — add image_url + is_public to catches if not already there
+// Safe to run on every cold start
+// ─────────────────────────────────────────────────────────────────────────────
+async function runMigrations() {
+  try {
+    await pool.query(`ALTER TABLE catches ADD COLUMN IF NOT EXISTS image_url TEXT`);
+    await pool.query(`ALTER TABLE catches ADD COLUMN IF NOT EXISTS is_public BOOLEAN DEFAULT FALSE`);
+    console.log('[migration] catches table up to date');
+  } catch (err) {
+    console.error('[migration] failed:', err.message);
+  }
+}
+runMigrations();
+
 app.post('/webhooks/shopify/orders-paid',
   express.raw({ type: 'application/json' }),
   handleShopifyWebhook
 );
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '15mb' }));
 
 async function getOrCreateUser(deviceId) {
   if (!deviceId) throw new Error('deviceId required');
@@ -109,10 +131,93 @@ If you cannot identify the fish with reasonable confidence, return confidence be
   }
 });
 
-const DAILY_CAP = 30, PTS_PER_CATCH = 10;
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/upload-image — Upload catch photo to Cloudinary
+// • Resizes to max 1200px, compresses to ~80% quality, converts to WebP
+// • Stamps Bone Tide Co. watermark bottom-right
+// • Returns { url, publicId } — url is the stored optimized image URL
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/upload-image', async (req, res) => {
+  const { imageBase64, deviceId } = req.body;
+  if (!imageBase64) return res.status(400).json({ error: 'imageBase64 required' });
+
+  try {
+    // Build Cloudinary upload URL
+    const timestamp = Math.floor(Date.now() / 1000);
+    const folder    = 'bonetide/catches';
+
+    // Transformation: resize max 1200px, auto quality/format, watermark overlay
+    // The watermark uses a text overlay since we may not have the logo uploaded yet.
+    // Once you upload the logo to Cloudinary as 'bonetide_logo', swap the overlay below.
+    const transformation = [
+      'w_1200,h_1200,c_limit',   // resize max 1200x1200, keep aspect ratio
+      'q_auto:good',             // auto quality — good tier saves ~30% vs default
+      'f_webp',                  // convert to WebP
+      'l_text:Arial_18_bold:Bone%20Tide%20Co.,co_white,o_70,g_south_east,x_12,y_12', // watermark
+    ].join('/');
+
+    // Sign the upload (required for authenticated uploads)
+    const signStr = `folder=${folder}&timestamp=${timestamp}&transformation=${transformation}${CLOUDINARY_SECRET}`;
+    const { createHash } = await import('crypto');
+    const signature = createHash('sha256').update(signStr).digest('hex');
+
+    const formData = new URLSearchParams();
+    formData.append('file', `data:image/jpeg;base64,${imageBase64}`);
+    formData.append('timestamp', timestamp);
+    formData.append('api_key', CLOUDINARY_KEY);
+    formData.append('signature', signature);
+    formData.append('folder', folder);
+    formData.append('transformation', transformation);
+
+    const uploadRes = await fetch(
+      `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/image/upload`,
+      { method: 'POST', body: formData, signal: AbortSignal.timeout(15000) }
+    );
+    const uploadData = await uploadRes.json();
+
+    if (uploadData.error) throw new Error(uploadData.error.message);
+
+    // Return the secure URL — already has watermark baked in
+    res.json({
+      url:      uploadData.secure_url,
+      publicId: uploadData.public_id,
+      width:    uploadData.width,
+      height:   uploadData.height,
+      bytes:    uploadData.bytes,
+    });
+  } catch (err) {
+    console.error('Upload error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/catches/public — recent public catches from all users (community feed)
+// Used by HomeScreen Recent Catches card
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/catches/public', async (req, res) => {
+  const { limit = 20, page = 1 } = req.query;
+  try {
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const { rows } = await pool.query(
+      `SELECT c.*, u.device_id
+       FROM catches c
+       JOIN users u ON u.id = c.user_id
+       WHERE c.is_public = TRUE AND c.image_url IS NOT NULL
+       ORDER BY c.caught_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    res.json({ catches: rows.map(formatCatch) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 
 app.post('/api/catches', async (req, res) => {
-  const { deviceId, species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken } = req.body;
+  const { deviceId, species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken, imageUrl, isPublic } = req.body;
   if (!deviceId || !species) return res.status(400).json({ error: 'deviceId and species required' });
   try {
     const user = await getOrCreateUser(deviceId);
@@ -122,9 +227,9 @@ app.post('/api/catches', async (req, res) => {
     const ptsLeft = Math.max(0, DAILY_CAP - todayPts);
     const ptsAwarded = sessionToken && ptsLeft > 0 ? Math.min(PTS_PER_CATCH, ptsLeft) : 0;
     const { rows: [newCatch] } = await pool.query(
-      `INSERT INTO catches (user_id,species,length_in,released,bait,note,lat,lon,tide_height_ft,tide_direction,wind_kts,wind_direction,baro_in_hg,moon_pct,good_bite_score,pts_awarded,caught_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW()) RETURNING *`,
-      [user.id,species,lengthIn,released??true,bait,note,lat,lon,tideHeightFt,tideDirection,windKts,windDirection,baroInHg,moonPct,goodBiteScore,ptsAwarded]
+      `INSERT INTO catches (user_id,species,length_in,released,bait,note,lat,lon,tide_height_ft,tide_direction,wind_kts,wind_direction,baro_in_hg,moon_pct,good_bite_score,pts_awarded,image_url,is_public,caught_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) RETURNING *`,
+      [user.id,species,lengthIn,released??true,bait,note,lat,lon,tideHeightFt,tideDirection,windKts,windDirection,baroInHg,moonPct,goodBiteScore,ptsAwarded,imageUrl??null,isPublic??false]
     );
     if (ptsAwarded > 0) {
       await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [ptsAwarded, user.id]);
@@ -149,7 +254,7 @@ app.get('/api/catches', async (req, res) => {
 });
 
 function formatCatch(row) {
-  return { id: row.id, species: row.species, lengthIn: row.length_in, released: row.released, bait: row.bait, note: row.note, lat: row.lat, lon: row.lon, tideHeightFt: row.tide_height_ft, tideDirection: row.tide_direction, windKts: row.wind_kts, windDirection: row.wind_direction, baroInHg: row.baro_in_hg, moonPct: row.moon_pct, goodBiteScore: row.good_bite_score, ptsAwarded: row.pts_awarded, caughtAt: row.caught_at };
+  return { id: row.id, species: row.species, lengthIn: row.length_in, released: row.released, bait: row.bait, note: row.note, lat: row.lat, lon: row.lon, tideHeightFt: row.tide_height_ft, tideDirection: row.tide_direction, windKts: row.wind_kts, windDirection: row.wind_direction, baroInHg: row.baro_in_hg, moonPct: row.moon_pct, goodBiteScore: row.good_bite_score, ptsAwarded: row.pts_awarded, imageUrl: row.image_url ?? null, isPublic: row.is_public ?? false, caughtAt: row.caught_at };
 }
 
 const tidePredictionsCache = new Map();
