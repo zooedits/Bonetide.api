@@ -216,16 +216,33 @@ app.get('/api/catches/public', async (req, res) => {
 
 
 
+const DAILY_CAP  = 1200;
+const CATCH_BASE =  100;
+const CATCH_DECAY =  20;
+const CATCH_MIN  =   20;
+
+function calcCatchPts(speciesCountToday) {
+  return Math.max(CATCH_MIN, CATCH_BASE - (speciesCountToday * CATCH_DECAY));
+}
+
 app.post('/api/catches', async (req, res) => {
   const { deviceId, species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken, imageUrl, isPublic } = req.body;
   if (!deviceId || !species) return res.status(400).json({ error: 'deviceId and species required' });
   try {
     const user = await getOrCreateUser(deviceId);
     const today = new Date().toISOString().slice(0, 10);
+    // Total pts earned today
     const { rows: todayRows } = await pool.query(`SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2`, [user.id, today]);
     const todayPts = parseInt(todayRows[0].total);
+    // How many times has this species been caught today (for diminishing returns)
+    const { rows: speciesRows } = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2 AND LOWER(species)=LOWER($3)`,
+      [user.id, today, species]
+    );
+    const speciesCountToday = parseInt(speciesRows[0].cnt);
     const ptsLeft = Math.max(0, DAILY_CAP - todayPts);
-    const ptsAwarded = sessionToken && ptsLeft > 0 ? Math.min(PTS_PER_CATCH, ptsLeft) : 0;
+    const basePts = sessionToken ? calcCatchPts(speciesCountToday) : 0;
+    const ptsAwarded = Math.min(basePts, ptsLeft);
     const { rows: [newCatch] } = await pool.query(
       `INSERT INTO catches (user_id,species,length_in,released,bait,note,lat,lon,tide_height_ft,tide_direction,wind_kts,wind_direction,baro_in_hg,moon_pct,good_bite_score,pts_awarded,image_url,is_public,caught_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) RETURNING *`,
