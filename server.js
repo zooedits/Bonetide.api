@@ -1,12 +1,4 @@
 // server.js — Bone Tide Co. Backend
-// Deploy on Railway. Add these environment variables in Railway dashboard:
-//   ANTHROPIC_API_KEY      — from console.anthropic.com
-//   SHOPIFY_ADMIN_TOKEN    — from Shopify admin → Settings → Apps → private app
-//   SHOPIFY_STORE_DOMAIN   — e.g. bonetideco.myshopify.com
-//   SHOPIFY_WEBHOOK_SECRET — from Shopify admin → Settings → Notifications → Webhooks
-//   DATABASE_URL           — auto-set by Railway Postgres plugin
-//   JWT_SECRET             — any long random string, e.g. "btc-secret-2025-xk29z"
-
 import express    from 'express';
 import cors       from 'cors';
 import crypto     from 'crypto';
@@ -17,6 +9,7 @@ import jwt           from 'jsonwebtoken';
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const JWT_SECRET       = process.env.JWT_SECRET;
+const STORMGLASS_KEY   = process.env.STORMGLASS_API_KEY || '5c7590d4-6417-11f1-8990-0242ac120004-5c759142-6417-11f1-8990-0242ac120004';
 const googleClient     = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 function issueJwt(user) {
@@ -157,24 +150,15 @@ app.get('/api/catches', async (req, res) => {
 });
 
 function formatCatch(row) {
-  return { id: row.id, species: row.species, lengthIn: row.length_in, released: row.released, bait: row.bait, note: row.note, tideHeightFt: row.tide_height_ft, tideDirection: row.tide_direction, windKts: row.wind_kts, windDirection: row.wind_direction, baroInHg: row.baro_in_hg, moonPct: row.moon_pct, goodBiteScore: row.good_bite_score, ptsAwarded: row.pts_awarded, caughtAt: row.caught_at };
+  return { id: row.id, species: row.species, lengthIn: row.length_in, released: row.released, bait: row.bait, note: row.note, lat: row.lat, lon: row.lon, tideHeightFt: row.tide_height_ft, tideDirection: row.tide_direction, windKts: row.wind_kts, windDirection: row.wind_direction, baroInHg: row.baro_in_hg, moonPct: row.moon_pct, goodBiteScore: row.good_bite_score, ptsAwarded: row.pts_awarded, caughtAt: row.caught_at };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/tides — FIXED version
-// - Predictions cached 6 hrs (they don't change)
-// - currentHeight/currentDirection computed fresh on every request via interpolation
-// ─────────────────────────────────────────────────────────────────────────────
-
-const tidePredictionsCache = new Map(); // station → { predictions, fetchedAt }
+const tidePredictionsCache = new Map();
 
 app.get('/api/tides', async (req, res) => {
   const { station = '8677344', days = 7 } = req.query;
   const cached = tidePredictionsCache.get(station);
-
   let predictions;
-
-  // Cache predictions for 6 hrs — they don't change
   if (cached && (Date.now() - cached.fetchedAt) < 6 * 3600 * 1000) {
     predictions = cached.predictions;
   } else {
@@ -183,100 +167,59 @@ app.get('/api/tides', async (req, res) => {
       const end   = new Date(today);
       end.setDate(end.getDate() + parseInt(days));
       const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
-
-      // Use 6-minute interval for accurate interpolation (not hourly)
-      const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter`
-        + `?begin_date=${fmt(today)}&end_date=${fmt(end)}`
-        + `&station=${station}&product=predictions&datum=MLLW`
-        + `&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
-
+      const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${station}&product=predictions&datum=MLLW&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
       const response = await fetch(url);
       const noaaData = await response.json();
       if (!noaaData.predictions) throw new Error(noaaData.error?.message ?? 'NOAA returned no predictions');
-
-      predictions = noaaData.predictions.map(p => ({
-        t: p.t, // keep as local time string — do NOT convert to UTC ISO
-        v: parseFloat(p.v),
-      }));
-
+      predictions = noaaData.predictions.map(p => ({ t: p.t, v: parseFloat(p.v) }));
       tidePredictionsCache.set(station, { predictions, fetchedAt: Date.now() });
     } catch (err) {
       console.error('Tides error:', err);
       return res.status(500).json({ error: err.message });
     }
   }
-
-  // ── Compute current height by interpolating between the two bracketing points ──
-  // Use local time string comparison to avoid timezone issues
   const now = new Date();
-  // Format now as "YYYY-MM-DD HH:MM" in local time to match NOAA's lst_ldt strings
   const pad = n => String(n).padStart(2, '0');
   const nowStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
-
   let beforePt = null, afterPt = null;
   for (let i = 0; i < predictions.length - 1; i++) {
-    if (predictions[i].t <= nowStr && predictions[i+1].t > nowStr) {
-      beforePt = predictions[i];
-      afterPt  = predictions[i+1];
-      break;
-    }
+    if (predictions[i].t <= nowStr && predictions[i+1].t > nowStr) { beforePt = predictions[i]; afterPt = predictions[i+1]; break; }
   }
-
   let currentHeight, currentDirection, currentPhase;
-
   if (beforePt && afterPt) {
-    // Linear interpolation between the two bracketing hourly points
-    const t0  = new Date(beforePt.t.replace(' ', 'T')).getTime();
-    const t1  = new Date(afterPt.t.replace(' ', 'T')).getTime();
-    const tNow = now.getTime();
-    const frac = (tNow - t0) / (t1 - t0);
-    currentHeight    = beforePt.v + frac * (afterPt.v - beforePt.v);
-    const rising     = afterPt.v > beforePt.v;
+    const t0 = new Date(beforePt.t.replace(' ', 'T')).getTime();
+    const t1 = new Date(afterPt.t.replace(' ', 'T')).getTime();
+    const frac = (now.getTime() - t0) / (t1 - t0);
+    currentHeight = beforePt.v + frac * (afterPt.v - beforePt.v);
+    const rising = afterPt.v > beforePt.v;
     currentDirection = rising ? 'Incoming' : 'Outgoing';
-    // Determine phase more precisely
-    const heightRange = Math.abs(afterPt.v - beforePt.v);
-    if (heightRange < 0.3) {
-      currentPhase = rising ? 'slack_high' : 'slack_low';
-    } else {
-      currentPhase = rising ? 'incoming_fast' : 'outgoing_fast';
-    }
+    currentPhase = Math.abs(afterPt.v - beforePt.v) < 0.3 ? (rising ? 'slack_high' : 'slack_low') : (rising ? 'incoming_fast' : 'outgoing_fast');
   } else {
-    // Fallback: use closest point
-    const closest = predictions.reduce((best, p) =>
-      Math.abs(new Date(p.t.replace(' ', 'T')) - now) < Math.abs(new Date(best.t.replace(' ', 'T')) - now) ? p : best
-    , predictions[0]);
-    currentHeight    = closest?.v ?? null;
-    currentDirection = 'Incoming';
-    currentPhase     = 'incoming_fast';
+    const closest = predictions.reduce((best, p) => Math.abs(new Date(p.t.replace(' ', 'T')) - now) < Math.abs(new Date(best.t.replace(' ', 'T')) - now) ? p : best, predictions[0]);
+    currentHeight = closest?.v ?? null; currentDirection = 'Incoming'; currentPhase = 'incoming_fast';
   }
-
-  // Daily range for today
   const todayStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
   const todayVals = predictions.filter(p => p.t.startsWith(todayStr)).map(p => p.v);
   const dailyRange = todayVals.length ? Math.max(...todayVals) - Math.min(...todayVals) : 6;
-
   res.json({
-    stationId:        station,
-    predictions:      predictions.map(p => ({ t: new Date(p.t.replace(' ', 'T')).toISOString(), v: p.v })),
-    currentHeight:    Math.round(currentHeight * 100) / 100,
-    currentDirection,
-    currentPhase,
-    dailyRange,
+    stationId: station,
+    predictions: predictions.map(p => ({ t: new Date(p.t.replace(' ', 'T')).toISOString(), v: p.v })),
+    currentHeight: Math.round(currentHeight * 100) / 100,
+    currentDirection, currentPhase, dailyRange,
   });
 });
-
 
 const conditionsCache = new Map();
 
 app.get('/api/conditions', async (req, res) => {
   const { lat = '31.1234', lon = '-81.4567' } = req.query;
   const cacheKey = `${lat}_${lon}`;
-  const cached   = conditionsCache.get(cacheKey);
+  const cached = conditionsCache.get(cacheKey);
   if (cached && (Date.now() - cached.fetchedAt) < 30 * 60 * 1000) return res.json(cached.data);
   try {
     const [marineRes, forecastRes] = await Promise.all([
-      fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&hourly=wave_height,wave_period,wave_direction,ocean_current_velocity&current=wave_height,wave_period,wave_direction&wind_speed_unit=kn&length_unit=imperial`),
-      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index&hourly=temperature_2m,wind_speed_10m,weather_code&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
+      fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=wave_height,wave_period,wave_direction&wind_speed_unit=kn&length_unit=imperial`),
+      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
     ]);
     const marine = await marineRes.json();
     const forecast = await forecastRes.json();
@@ -284,25 +227,118 @@ app.get('/api/conditions', async (req, res) => {
     const windKts = cur?.wind_speed_10m ?? 0;
     const windDir = degreesToCardinal(cur?.wind_direction_10m ?? 0);
     const pressHpa = cur?.surface_pressure ?? 1013;
-    const pressInHg = (pressHpa * 0.02953).toFixed(2);
     const data = {
-      wind: { speedKts: Math.round(windKts), direction: windDir, speedCategory: windCategory(windKts), gustKts: Math.round(windKts * 1.3) },
-      pressure: { inHg: parseFloat(pressInHg), trend: 'stable' },
-      waveHeight: mari?.wave_height ?? 1.5,
-      wavePeriod: mari?.wave_period ?? 6,
-      waveDir: degreesToCardinal(mari?.wave_direction ?? 90) + ` ${mari?.wave_direction ?? 90}°`,
-      waterTemp: 72,
+      wind: { speedKts: Math.round(windKts), direction: windDir, directionDeg: cur?.wind_direction_10m ?? 0, speedCategory: windCategory(windKts), gustKts: Math.round(windKts * 1.3) },
+      pressure: { inHg: parseFloat((pressHpa * 0.02953).toFixed(2)), trend: 'stable' },
+      waveHeight: mari?.wave_height ?? null,
+      wavePeriod: mari?.wave_period ?? null,
+      waveDir: mari?.wave_direction != null ? degreesToCardinal(mari.wave_direction) + ` ${mari.wave_direction}°` : null,
+      waterTemp: null,
       visibility: 8,
       uvIndex: cur?.uv_index ?? 5,
       airTempF: Math.round(cur?.temperature_2m ?? 80),
       sunrise: forecast.daily?.sunrise?.[0] ? new Date(forecast.daily.sunrise[0]).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '6:30 AM',
-      sunset: forecast.daily?.sunset?.[0] ? new Date(forecast.daily.sunset[0]).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '8:00 PM',
+      sunset:  forecast.daily?.sunset?.[0]  ? new Date(forecast.daily.sunset[0]).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '8:00 PM',
       solunar: computeSolunar(parseFloat(lat), parseFloat(lon)),
     };
     conditionsCache.set(cacheKey, { data, fetchedAt: Date.now() });
     res.json(data);
   } catch (err) {
     console.error('Conditions error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/marine — Stormglass marine data
+// Currents, waves, swell, water temp, wind — cached 1hr per location
+// ─────────────────────────────────────────────────────────────────────────────
+const marineCache = new Map();
+
+app.get('/api/marine', async (req, res) => {
+  const { lat = '31.1234', lon = '-81.4567' } = req.query;
+  const cacheKey = `${parseFloat(lat).toFixed(2)}_${parseFloat(lon).toFixed(2)}`;
+  const cached = marineCache.get(cacheKey);
+  if (cached && (Date.now() - cached.fetchedAt) < 60 * 60 * 1000) return res.json(cached.data);
+
+  try {
+    const params = [
+      'currentSpeed', 'currentDirection',
+      'waveHeight', 'wavePeriod', 'waveDirection',
+      'swellHeight', 'swellDirection', 'swellPeriod',
+      'windWaveHeight', 'windWaveDirection',
+      'waterTemperature',
+      'windSpeed', 'windDirection',
+      'visibility',
+    ].join(',');
+
+    const url = `https://api.stormglass.io/v2/weather/point?lat=${lat}&lng=${lon}&params=${params}&source=noaa,sg`;
+    const sgRes = await fetch(url, {
+      headers: { 'Authorization': STORMGLASS_KEY },
+      signal: AbortSignal.timeout(10000),
+    });
+    const sgData = await sgRes.json();
+
+    if (!sgData.hours?.length) throw new Error(sgData.errors?.key || 'No data from Stormglass');
+
+    // Get the closest hour to now
+    const nowMs = Date.now();
+    const closest = sgData.hours.reduce((best, h) =>
+      Math.abs(new Date(h.time).getTime() - nowMs) < Math.abs(new Date(best.time).getTime() - nowMs) ? h : best
+    , sgData.hours[0]);
+
+    // Helper: pick best value from sources (noaa first, then sg)
+    const pick = (field) => {
+      const h = closest[field];
+      if (!h) return null;
+      return h.noaa ?? h.sg ?? h[Object.keys(h)[0]] ?? null;
+    };
+
+    const round1 = v => v != null ? Math.round(v * 10) / 10 : null;
+    const round0 = v => v != null ? Math.round(v) : null;
+
+    const currentSpeedMs = pick('currentSpeed');
+    const currentSpeedKts = currentSpeedMs != null ? round1(currentSpeedMs * 1.944) : null;
+
+    const data = {
+      // Currents
+      currentSpeedKts,
+      currentDirection:     round0(pick('currentDirection')),
+      currentDirectionCard: pick('currentDirection') != null ? degreesToCardinal(pick('currentDirection')) : null,
+
+      // Waves
+      waveHeightFt:   pick('waveHeight') != null ? round1(pick('waveHeight') * 3.281) : null,
+      wavePeriodSec:  round1(pick('wavePeriod')),
+      waveDirection:  round0(pick('waveDirection')),
+      waveDirCard:    pick('waveDirection') != null ? degreesToCardinal(pick('waveDirection')) : null,
+
+      // Swell
+      swellHeightFt:  pick('swellHeight') != null ? round1(pick('swellHeight') * 3.281) : null,
+      swellPeriodSec: round1(pick('swellPeriod')),
+      swellDirection: round0(pick('swellDirection')),
+      swellDirCard:   pick('swellDirection') != null ? degreesToCardinal(pick('swellDirection')) : null,
+
+      // Wind waves
+      windWaveHeightFt: pick('windWaveHeight') != null ? round1(pick('windWaveHeight') * 3.281) : null,
+
+      // Water
+      waterTempF: pick('waterTemperature') != null ? round1(pick('waterTemperature') * 9/5 + 32) : null,
+
+      // Wind (from Stormglass)
+      windSpeedKts:   pick('windSpeed') != null ? round1(pick('windSpeed') * 1.944) : null,
+      windDirection:  round0(pick('windDirection')),
+      windDirCard:    pick('windDirection') != null ? degreesToCardinal(pick('windDirection')) : null,
+
+      // Visibility
+      visibilityMi:   pick('visibility') != null ? round1(pick('visibility') * 0.621) : null,
+
+      fetchedAt: new Date().toISOString(),
+    };
+
+    marineCache.set(cacheKey, { data, fetchedAt: Date.now() });
+    res.json(data);
+  } catch (err) {
+    console.error('Marine error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
