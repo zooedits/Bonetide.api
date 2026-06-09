@@ -259,7 +259,7 @@ app.get('/api/marine', async (req, res) => {
   const { lat = '31.1234', lon = '-81.4567' } = req.query;
   const cacheKey = `${parseFloat(lat).toFixed(2)}_${parseFloat(lon).toFixed(2)}`;
   const cached = marineCache.get(cacheKey);
-  if (cached && (Date.now() - cached.fetchedAt) < 60 * 60 * 1000) return res.json(cached.data);
+  if (cached && (Date.now() - cached.fetchedAt) < 150 * 60 * 1000) return res.json(cached.data); // 2.5hr cache for free tier
 
   try {
     const params = [
