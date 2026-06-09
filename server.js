@@ -9,7 +9,6 @@ import jwt           from 'jsonwebtoken';
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const JWT_SECRET       = process.env.JWT_SECRET;
-const STORMGLASS_KEY   = process.env.STORMGLASS_API_KEY || '5c7590d4-6417-11f1-8990-0242ac120004-5c759142-6417-11f1-8990-0242ac120004';
 const googleClient     = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 function issueJwt(user) {
@@ -250,8 +249,12 @@ app.get('/api/conditions', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/marine — Stormglass marine data
-// Currents, waves, swell, water temp, wind — cached 1hr per location
+// GET /api/marine — Open-Meteo Marine + NOAA water temp fallback
+// 100% free, no API keys, no quota
+// Sources:
+//   • Open-Meteo Marine API — waves, swell, currents, sea surface temp
+//   • NOAA CO-OPS — water temp fallback for inshore/estuary locations
+//     where Open-Meteo marine model has no coverage
 // ─────────────────────────────────────────────────────────────────────────────
 const marineCache = new Map();
 
@@ -259,80 +262,107 @@ app.get('/api/marine', async (req, res) => {
   const { lat = '31.1234', lon = '-81.4567' } = req.query;
   const cacheKey = `${parseFloat(lat).toFixed(2)}_${parseFloat(lon).toFixed(2)}`;
   const cached = marineCache.get(cacheKey);
-  if (cached && (Date.now() - cached.fetchedAt) < 150 * 60 * 1000) return res.json(cached.data); // 2.5hr cache for free tier
+  if (cached && (Date.now() - cached.fetchedAt) < 60 * 60 * 1000) return res.json(cached.data);
 
   try {
-    const params = [
-      'currentSpeed', 'currentDirection',
-      'waveHeight', 'wavePeriod', 'waveDirection',
-      'swellHeight', 'swellDirection', 'swellPeriod',
-      'windWaveHeight', 'windWaveDirection',
-      'waterTemperature',
-      'windSpeed', 'windDirection',
-      'visibility',
-    ].join(',');
+    // ── Open-Meteo Marine ─────────────────────────────────────────────────────
+    // current= fields give us the latest snapshot (no hourly parsing needed)
+    const marineUrl = [
+      `https://marine-api.open-meteo.com/v1/marine`,
+      `?latitude=${lat}&longitude=${lon}`,
+      `&current=wave_height,wave_period,wave_direction`,
+      `,swell_wave_height,swell_wave_period,swell_wave_direction`,
+      `,ocean_current_velocity,ocean_current_direction`,
+      `,sea_surface_temperature`,
+      `&wind_speed_unit=kn&length_unit=imperial`,
+    ].join('');
 
-    const url = `https://api.stormglass.io/v2/weather/point?lat=${lat}&lng=${lon}&params=${params}&source=noaa,sg`;
-    const sgRes = await fetch(url, {
-      headers: { 'Authorization': STORMGLASS_KEY },
-      signal: AbortSignal.timeout(10000),
-    });
-    const sgData = await sgRes.json();
-
-    if (!sgData.hours?.length) throw new Error(sgData.errors?.key || 'No data from Stormglass');
-
-    // Get the closest hour to now
-    const nowMs = Date.now();
-    const closest = sgData.hours.reduce((best, h) =>
-      Math.abs(new Date(h.time).getTime() - nowMs) < Math.abs(new Date(best.time).getTime() - nowMs) ? h : best
-    , sgData.hours[0]);
-
-    // Helper: pick best value from sources (noaa first, then sg)
-    const pick = (field) => {
-      const h = closest[field];
-      if (!h) return null;
-      return h.noaa ?? h.sg ?? h[Object.keys(h)[0]] ?? null;
-    };
+    const marineRes = await fetch(marineUrl, { signal: AbortSignal.timeout(8000) });
+    const marineData = await marineRes.json();
+    const mc = marineData.current ?? {};
 
     const round1 = v => v != null ? Math.round(v * 10) / 10 : null;
     const round0 = v => v != null ? Math.round(v) : null;
 
-    const currentSpeedMs = pick('currentSpeed');
-    const currentSpeedKts = currentSpeedMs != null ? round1(currentSpeedMs * 1.944) : null;
+    // Ocean current velocity from Open-Meteo is already in knots
+    const currentSpeedKts = round1(mc.ocean_current_velocity ?? null);
+    const currentDirDeg   = round0(mc.ocean_current_direction ?? null);
+
+    // Sea surface temp from Open-Meteo is in °C
+    let waterTempF = mc.sea_surface_temperature != null
+      ? round1(mc.sea_surface_temperature * 9/5 + 32)
+      : null;
+
+    // ── NOAA water temp fallback ──────────────────────────────────────────────
+    // Open-Meteo marine model only covers open ocean — inshore/estuary coords
+    // return null for sea_surface_temperature. Fall back to nearest NOAA station.
+    if (waterTempF == null) {
+      try {
+        const noaaWaterUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter`
+          + `?date=latest&station=nearest&product=water_temperature`
+          + `&units=english&time_zone=lst_ldt&format=json`
+          + `&lat=${lat}&lon=${lon}`;
+        // NOAA doesn't support lat/lon lookup directly for water_temperature,
+        // so we find the nearest station first then fetch its water temp
+        const stRes = await fetch(
+          'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels&units=english',
+          { signal: AbortSignal.timeout(5000) }
+        );
+        const stData = await stRes.json();
+        if (stData.stations?.length) {
+          const userLat = parseFloat(lat), userLon = parseFloat(lon);
+          const nearest = stData.stations.map(st => {
+            const dLat = (st.lat - userLat) * Math.PI / 180;
+            const dLon = (st.lng - userLon) * Math.PI / 180;
+            const a = Math.sin(dLat/2)**2 + Math.cos(userLat*Math.PI/180)*Math.cos(st.lat*Math.PI/180)*Math.sin(dLon/2)**2;
+            return { ...st, distKm: 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)) };
+          }).sort((a, b) => a.distKm - b.distKm)[0];
+
+          if (nearest) {
+            const wtUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter`
+              + `?date=latest&station=${nearest.id}&product=water_temperature`
+              + `&units=english&time_zone=lst_ldt&format=json`;
+            const wtRes = await fetch(wtUrl, { signal: AbortSignal.timeout(5000) });
+            const wtData = await wtRes.json();
+            const tempF = parseFloat(wtData.data?.[0]?.v);
+            if (!isNaN(tempF)) waterTempF = round1(tempF);
+          }
+        }
+      } catch (noaaErr) {
+        console.warn('NOAA water temp fallback failed:', noaaErr.message);
+      }
+    }
 
     const data = {
       // Currents
       currentSpeedKts,
-      currentDirection:     round0(pick('currentDirection')),
-      currentDirectionCard: pick('currentDirection') != null ? degreesToCardinal(pick('currentDirection')) : null,
+      currentDirection:     currentDirDeg,
+      currentDirectionCard: currentDirDeg != null ? degreesToCardinal(currentDirDeg) : null,
 
       // Waves
-      waveHeightFt:   pick('waveHeight') != null ? round1(pick('waveHeight') * 3.281) : null,
-      wavePeriodSec:  round1(pick('wavePeriod')),
-      waveDirection:  round0(pick('waveDirection')),
-      waveDirCard:    pick('waveDirection') != null ? degreesToCardinal(pick('waveDirection')) : null,
+      waveHeightFt:  round1(mc.wave_height ?? null),
+      wavePeriodSec: round1(mc.wave_period ?? null),
+      waveDirection: round0(mc.wave_direction ?? null),
+      waveDirCard:   mc.wave_direction != null ? degreesToCardinal(mc.wave_direction) : null,
 
       // Swell
-      swellHeightFt:  pick('swellHeight') != null ? round1(pick('swellHeight') * 3.281) : null,
-      swellPeriodSec: round1(pick('swellPeriod')),
-      swellDirection: round0(pick('swellDirection')),
-      swellDirCard:   pick('swellDirection') != null ? degreesToCardinal(pick('swellDirection')) : null,
-
-      // Wind waves
-      windWaveHeightFt: pick('windWaveHeight') != null ? round1(pick('windWaveHeight') * 3.281) : null,
+      swellHeightFt:  round1(mc.swell_wave_height ?? null),
+      swellPeriodSec: round1(mc.swell_wave_period ?? null),
+      swellDirection: round0(mc.swell_wave_direction ?? null),
+      swellDirCard:   mc.swell_wave_direction != null ? degreesToCardinal(mc.swell_wave_direction) : null,
 
       // Water
-      waterTempF: pick('waterTemperature') != null ? round1(pick('waterTemperature') * 9/5 + 32) : null,
+      waterTempF,
 
-      // Wind (from Stormglass)
-      windSpeedKts:   pick('windSpeed') != null ? round1(pick('windSpeed') * 1.944) : null,
-      windDirection:  round0(pick('windDirection')),
-      windDirCard:    pick('windDirection') != null ? degreesToCardinal(pick('windDirection')) : null,
+      // Visibility — not in Open-Meteo marine; comes from /api/conditions
+      visibilityMi: null,
 
-      // Visibility
-      visibilityMi:   pick('visibility') != null ? round1(pick('visibility') * 0.621) : null,
+      // Wind — comes from /api/conditions (Open-Meteo atmosphere)
+      windSpeedKts: null,
+      windDirCard:  null,
 
       fetchedAt: new Date().toISOString(),
+      source: 'open-meteo-marine',
     };
 
     marineCache.set(cacheKey, { data, fetchedAt: Date.now() });
