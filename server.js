@@ -73,6 +73,40 @@ async function getUserFromRequest(req) {
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Bone Tide Co. API' }));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/radar — Iowa State Mesonet NEXRAD animated frames
+// tile cache format works reliably in MapLibre WebViews, no CORS issues
+// ─────────────────────────────────────────────────────────────────────────────
+const radarCache = { data: null, fetchedAt: 0 };
+
+app.get('/api/radar', async (req, res) => {
+  if (radarCache.data && (Date.now() - radarCache.fetchedAt) < 5 * 60 * 1000) {
+    return res.json(radarCache.data);
+  }
+  try {
+    const frames = [];
+    const now = new Date();
+    const roundedMs = Math.floor(now.getTime() / (5 * 60 * 1000)) * (5 * 60 * 1000);
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(roundedMs - i * 5 * 60 * 1000);
+      const pad = n => String(n).padStart(2, '0');
+      const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
+      frames.push({
+        time: Math.floor(d.getTime() / 1000),
+        isoTime: d.toISOString(),
+        tileUrl: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/{z}/{x}/{y}.png`,
+        isForecast: false,
+      });
+    }
+    radarCache.data = { frames };
+    radarCache.fetchedAt = Date.now();
+    res.json({ frames });
+  } catch (err) {
+    console.error('Radar proxy error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/auth/google', async (req, res) => {
   try {
     const { idToken, deviceId } = req.body ?? {};
