@@ -88,10 +88,11 @@ app.post('/api/auth/google', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/radar — Iowa State Mesonet NEXRAD radar frames proxy
-// Fetches available radar timestamps server-side (no CORS issues from device)
-// Returns list of frames with tile URL templates ready for MapLibre
-// Cached 5 minutes — radar updates every ~5 min anyway
+// GET /api/radar — Iowa State Mesonet NEXRAD tile frames
+// IEM updates every 5 minutes. We generate the last 24 frames (2 hours)
+// by building timestamps ourselves — no API call needed, no CORS issues.
+// Tile URL format: nexrad-n0q-YYYYMMDDHHII/{z}/{x}/{y}.png
+// Cached 5 minutes server-side.
 // ─────────────────────────────────────────────────────────────────────────────
 const radarCache = { data: null, fetchedAt: 0 };
 
@@ -100,42 +101,27 @@ app.get('/api/radar', async (req, res) => {
     return res.json(radarCache.data);
   }
   try {
-    // Iowa State Mesonet publishes a JSON list of available NEXRAD times
-    const r = await fetch(
-      'https://mesonet.agron.iastate.edu/api/1/radartime.json?product=N0Q',
-      { signal: AbortSignal.timeout(8000) }
-    );
-    const raw = await r.json();
-    // Response is { N0Q: ["YYYY-MM-DDTHH:MM:SSZ", ...] }
-    const times = (raw.N0Q || raw.times || Object.values(raw)[0] || []).slice(-12);
-    if (!times.length) throw new Error('No radar times returned');
-
-    const frames = times.map((isoTime, i) => {
-      // Convert ISO time to the format Iowa State uses in tile URLs: YYYYMMDDHHII
-      const d = new Date(isoTime);
+    const frames = [];
+    const now = new Date();
+    // Round down to nearest 5-min mark, go back 2 hours = 24 frames
+    const roundedMs = Math.floor(now.getTime() / (5 * 60 * 1000)) * (5 * 60 * 1000);
+    for (let i = 23; i >= 0; i--) {
+      const d = new Date(roundedMs - i * 5 * 60 * 1000);
       const pad = n => String(n).padStart(2, '0');
       const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
-      return {
+      frames.push({
         time: Math.floor(d.getTime() / 1000),
-        isoTime,
+        isoTime: d.toISOString(),
         tileUrl: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/{z}/{x}/{y}.png`,
         isForecast: false,
-      };
-    });
-
+      });
+    }
     radarCache.data = { frames };
     radarCache.fetchedAt = Date.now();
     res.json({ frames });
   } catch (err) {
     console.error('Radar proxy error:', err.message);
-    // Fallback: return a single current frame with the live composite URL
-    const fallbackFrames = [{
-      time: Math.floor(Date.now() / 1000),
-      isoTime: new Date().toISOString(),
-      tileUrl: 'https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png',
-      isForecast: false,
-    }];
-    res.json({ frames: fallbackFrames });
+    res.status(500).json({ error: err.message });
   }
 });
 
