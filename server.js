@@ -31,105 +31,108 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-const CLOUDINARY_CLOUD  = process.env.CLOUDINARY_CLOUD_NAME  || 'dojxysc50';
-const CLOUDINARY_KEY    = process.env.CLOUDINARY_API_KEY     || '629822632696159';
-const CLOUDINARY_SECRET = process.env.CLOUDINARY_API_SECRET  || 'RaqA4ZBnQxqVhwAJk8xAGL2ghno';
-
-async function runMigrations() {
-  try {
-    await pool.query(`ALTER TABLE catches ADD COLUMN IF NOT EXISTS image_url TEXT`);
-    await pool.query(`ALTER TABLE catches ADD COLUMN IF NOT EXISTS is_public BOOLEAN DEFAULT FALSE`);
-    console.log('[migration] catches table up to date');
-  } catch (err) {
-    console.error('[migration] failed:', err.message);
-  }
-}
-runMigrations();
-
 app.post('/webhooks/shopify/orders-paid',
   express.raw({ type: 'application/json' }),
   handleShopifyWebhook
 );
 
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 async function getOrCreateUser(deviceId) {
   if (!deviceId) throw new Error('deviceId required');
-  const existing = await pool.query('SELECT id, points_balance FROM users WHERE device_id = $1', [deviceId]);
+  const existing = await pool.query(
+    'SELECT id, points_balance FROM users WHERE device_id = $1', [deviceId]
+  );
   if (existing.rows.length) return existing.rows[0];
   const created = await pool.query(
-    `INSERT INTO users (device_id, points_balance, created_at) VALUES ($1, 0, NOW()) RETURNING id, points_balance`, [deviceId]
+    `INSERT INTO users (device_id, points_balance, created_at)
+     VALUES ($1, 0, NOW()) RETURNING id, points_balance`, [deviceId]
   );
   return created.rows[0];
+}
+
+// JWT first (logged-in), deviceId fallback (guest)
+async function getUserFromRequest(req) {
+  const header = req.headers['authorization'] ?? '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const { rows } = await pool.query(
+        'SELECT id, points_balance FROM users WHERE google_id=$1 LIMIT 1',
+        [decoded.id]
+      );
+      if (rows.length) return rows[0];
+    } catch {}
+  }
+  const deviceId = req.body?.deviceId || req.query?.deviceId;
+  if (deviceId) return getOrCreateUser(deviceId);
+  throw new Error('No auth token or deviceId');
 }
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Bone Tide Co. API' }));
 
 app.post('/api/auth/google', async (req, res) => {
   try {
-    const { idToken } = req.body ?? {};
+    const { idToken, deviceId } = req.body ?? {};
     if (!idToken) return res.status(400).json({ error: 'idToken required' });
     const ticket  = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
     const payload = ticket.getPayload();
     if (!payload.email_verified) return res.status(403).json({ error: 'Google account email not verified' });
     const user = { id: payload.sub, email: payload.email, name: payload.name ?? '', avatar: payload.picture ?? null };
+
+    // Upsert Google user
     await pool.query(
       `INSERT INTO users (google_id, email, name, avatar, points_balance, created_at)
        VALUES ($1, $2, $3, $4, 0, NOW())
        ON CONFLICT (google_id) DO UPDATE SET email=EXCLUDED.email, name=EXCLUDED.name, avatar=EXCLUDED.avatar`,
       [user.id, user.email, user.name, user.avatar]
     );
+
+    // Get the Google user's DB row
+    const { rows: [googleUser] } = await pool.query(
+      'SELECT id, points_balance FROM users WHERE google_id=$1', [user.id]
+    );
+
+    // ── Merge device user catches + points into Google account ──────────────
+    // Only runs if deviceId sent and a device user exists (first login on this device)
+    if (deviceId) {
+      const { rows: deviceUsers } = await pool.query(
+        'SELECT id, points_balance FROM users WHERE device_id=$1 AND google_id IS NULL', [deviceId]
+      );
+      if (deviceUsers.length) {
+        const deviceUser = deviceUsers[0];
+        if (deviceUser.id !== googleUser.id) {
+          const client = await pool.connect();
+          try {
+            await client.query('BEGIN');
+            // Move catches to Google account
+            await client.query('UPDATE catches SET user_id=$1 WHERE user_id=$2', [googleUser.id, deviceUser.id]);
+            // Move points transactions
+            await client.query('UPDATE points_transactions SET user_id=$1 WHERE user_id=$2', [googleUser.id, deviceUser.id]);
+            // Add device user's points balance to Google account
+            await client.query('UPDATE users SET points_balance=points_balance+$1 WHERE id=$2', [deviceUser.points_balance, googleUser.id]);
+            // Link device_id to Google account so future guest sessions also merge
+            await client.query('UPDATE users SET device_id=$1 WHERE id=$2', [deviceId, googleUser.id]);
+            // Remove old device user
+            await client.query('DELETE FROM users WHERE id=$1', [deviceUser.id]);
+            await client.query('COMMIT');
+            console.log(`[auth] Merged device user ${deviceUser.id} into Google user ${googleUser.id}`);
+          } catch (mergeErr) {
+            await client.query('ROLLBACK');
+            console.error('[auth] Merge failed (non-fatal):', mergeErr.message);
+          } finally {
+            client.release();
+          }
+        }
+      }
+    }
+
     return res.json({ token: issueJwt(user), user });
   } catch (err) {
     console.error('[auth] Google verification failed:', err.message);
     return res.status(401).json({ error: 'Google token verification failed' });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/radar — Iowa State Mesonet NEXRAD WMS tiles
-// Uses the n0q-t WMS time service which serves proper map tiles
-// Generates last 12 frames at 5-minute intervals
-// ─────────────────────────────────────────────────────────────────────────────
-const radarCache = { data: null, fetchedAt: 0 };
-
-app.get('/api/radar', async (req, res) => {
-  if (radarCache.data && (Date.now() - radarCache.fetchedAt) < 5 * 60 * 1000) {
-    return res.json(radarCache.data);
-  }
-  try {
-    const frames = [];
-    const now = new Date();
-    // Round down to nearest 5-min mark, go back 1 hour = 12 frames
-    const roundedMs = Math.floor(now.getTime() / (5 * 60 * 1000)) * (5 * 60 * 1000);
-    for (let i = 11; i >= 0; i--) {
-      const d = new Date(roundedMs - i * 5 * 60 * 1000);
-      const pad = n => String(n).padStart(2, '0');
-      // WMS time parameter format: YYYY-MM-DDTHH:MM:SSZ
-      const wmsTime = d.toISOString().replace(/\.\d{3}Z$/, 'Z');
-      // WMS tile URL for MapLibre — bbox-epsg-3857 is replaced by MapLibre automatically
-      const tileUrl = `https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q-t.cgi`
-        + `?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap`
-        + `&LAYERS=nexrad-n0q-wmst`
-        + `&STYLES=&FORMAT=image/png&TRANSPARENT=TRUE`
-        + `&TIME=${encodeURIComponent(wmsTime)}`
-        + `&SRS=EPSG:3857`
-        + `&WIDTH=256&HEIGHT=256`
-        + `&BBOX={bbox-epsg-3857}`;
-      frames.push({
-        time: Math.floor(d.getTime() / 1000),
-        isoTime: wmsTime,
-        tileUrl,
-        isForecast: false,
-      });
-    }
-    radarCache.data = { frames };
-    radarCache.fetchedAt = Date.now();
-    res.json({ frames });
-  } catch (err) {
-    console.error('Radar proxy error:', err.message);
-    res.status(500).json({ error: err.message });
   }
 });
 
@@ -167,80 +170,18 @@ If you cannot identify the fish with reasonable confidence, return confidence be
   }
 });
 
-app.post('/api/upload-image', async (req, res) => {
-  const { imageBase64, deviceId } = req.body;
-  if (!imageBase64) return res.status(400).json({ error: 'imageBase64 required' });
-  try {
-    const timestamp = Math.floor(Date.now() / 1000);
-    const folder    = 'bonetide/catches';
-    const transformation = [
-      'w_1200,h_1200,c_limit',
-      'q_auto:good',
-      'f_webp',
-      'l_text:Arial_18_bold:Bone%20Tide%20Co.,co_white,o_70,g_south_east,x_12,y_12',
-    ].join('/');
-    const signStr = `folder=${folder}&timestamp=${timestamp}&transformation=${transformation}${CLOUDINARY_SECRET}`;
-    const { createHash } = await import('crypto');
-    const signature = createHash('sha256').update(signStr).digest('hex');
-    const formData = new URLSearchParams();
-    formData.append('file', `data:image/jpeg;base64,${imageBase64}`);
-    formData.append('timestamp', timestamp);
-    formData.append('api_key', CLOUDINARY_KEY);
-    formData.append('signature', signature);
-    formData.append('folder', folder);
-    formData.append('transformation', transformation);
-    const uploadRes = await fetch(
-      `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/image/upload`,
-      { method: 'POST', body: formData, signal: AbortSignal.timeout(15000) }
-    );
-    const uploadData = await uploadRes.json();
-    if (uploadData.error) throw new Error(uploadData.error.message);
-    res.json({ url: uploadData.secure_url, publicId: uploadData.public_id, width: uploadData.width, height: uploadData.height, bytes: uploadData.bytes });
-  } catch (err) {
-    console.error('Upload error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/catches/public', async (req, res) => {
-  const { limit = 20, page = 1 } = req.query;
-  try {
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    const { rows } = await pool.query(
-      `SELECT c.*, u.device_id FROM catches c JOIN users u ON u.id = c.user_id
-       WHERE c.is_public = TRUE AND c.image_url IS NOT NULL
-       ORDER BY c.caught_at DESC LIMIT $1 OFFSET $2`,
-      [limit, offset]
-    );
-    res.json({ catches: rows.map(formatCatch) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-const DAILY_CAP  = 1200;
-const CATCH_BASE =  100;
-const CATCH_DECAY =  20;
-const CATCH_MIN  =   20;
-
-function calcCatchPts(speciesCountToday) {
-  return Math.max(CATCH_MIN, CATCH_BASE - (speciesCountToday * CATCH_DECAY));
-}
+const DAILY_CAP = 30, PTS_PER_CATCH = 10;
 
 app.post('/api/catches', async (req, res) => {
-  const { deviceId, species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken, imageUrl, isPublic } = req.body;
-  if (!deviceId || !species) return res.status(400).json({ error: 'deviceId and species required' });
+  const { species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken, imageUrl, isPublic } = req.body;
+  if (!species) return res.status(400).json({ error: 'species required' });
   try {
-    const user = await getOrCreateUser(deviceId);
+    const user = await getUserFromRequest(req);
     const today = new Date().toISOString().slice(0, 10);
     const { rows: todayRows } = await pool.query(`SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2`, [user.id, today]);
     const todayPts = parseInt(todayRows[0].total);
-    const { rows: speciesRows } = await pool.query(
-      `SELECT COUNT(*) AS cnt FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2 AND LOWER(species)=LOWER($3)`,
-      [user.id, today, species]
-    );
-    const speciesCountToday = parseInt(speciesRows[0].cnt);
     const ptsLeft = Math.max(0, DAILY_CAP - todayPts);
-    const basePts = sessionToken ? calcCatchPts(speciesCountToday) : 0;
-    const ptsAwarded = Math.min(basePts, ptsLeft);
+    const ptsAwarded = sessionToken && ptsLeft > 0 ? Math.min(PTS_PER_CATCH, ptsLeft) : 0;
     const { rows: [newCatch] } = await pool.query(
       `INSERT INTO catches (user_id,species,length_in,released,bait,note,lat,lon,tide_height_ft,tide_direction,wind_kts,wind_direction,baro_in_hg,moon_pct,good_bite_score,pts_awarded,image_url,is_public,caught_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) RETURNING *`,
@@ -258,10 +199,9 @@ app.post('/api/catches', async (req, res) => {
 });
 
 app.get('/api/catches', async (req, res) => {
-  const { deviceId, page=1, limit=20 } = req.query;
-  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  const { page=1, limit=20 } = req.query;
   try {
-    const user = await getOrCreateUser(deviceId);
+    const user = await getUserFromRequest(req);
     const offset = (parseInt(page)-1)*parseInt(limit);
     const { rows } = await pool.query(`SELECT * FROM catches WHERE user_id=$1 ORDER BY caught_at DESC LIMIT $2 OFFSET $3`, [user.id, limit, offset]);
     res.json({ catches: rows.map(formatCatch), page: parseInt(page) });
@@ -368,6 +308,14 @@ app.get('/api/conditions', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/marine — Open-Meteo Marine + NOAA water temp fallback
+// 100% free, no API keys, no quota
+// Sources:
+//   • Open-Meteo Marine API — waves, swell, currents, sea surface temp
+//   • NOAA CO-OPS — water temp fallback for inshore/estuary locations
+//     where Open-Meteo marine model has no coverage
+// ─────────────────────────────────────────────────────────────────────────────
 const marineCache = new Map();
 
 app.get('/api/marine', async (req, res) => {
@@ -375,7 +323,10 @@ app.get('/api/marine', async (req, res) => {
   const cacheKey = `${parseFloat(lat).toFixed(2)}_${parseFloat(lon).toFixed(2)}`;
   const cached = marineCache.get(cacheKey);
   if (cached && (Date.now() - cached.fetchedAt) < 60 * 60 * 1000) return res.json(cached.data);
+
   try {
+    // ── Open-Meteo Marine ─────────────────────────────────────────────────────
+    // current= fields give us the latest snapshot (no hourly parsing needed)
     const marineUrl = [
       `https://marine-api.open-meteo.com/v1/marine`,
       `?latitude=${lat}&longitude=${lon}`,
@@ -385,17 +336,38 @@ app.get('/api/marine', async (req, res) => {
       `,sea_surface_temperature`,
       `&wind_speed_unit=kn&length_unit=imperial`,
     ].join('');
+
     const marineRes = await fetch(marineUrl, { signal: AbortSignal.timeout(8000) });
     const marineData = await marineRes.json();
     const mc = marineData.current ?? {};
+
     const round1 = v => v != null ? Math.round(v * 10) / 10 : null;
     const round0 = v => v != null ? Math.round(v) : null;
+
+    // Ocean current velocity from Open-Meteo is already in knots
     const currentSpeedKts = round1(mc.ocean_current_velocity ?? null);
     const currentDirDeg   = round0(mc.ocean_current_direction ?? null);
-    let waterTempF = mc.sea_surface_temperature != null ? round1(mc.sea_surface_temperature * 9/5 + 32) : null;
+
+    // Sea surface temp from Open-Meteo is in °C
+    let waterTempF = mc.sea_surface_temperature != null
+      ? round1(mc.sea_surface_temperature * 9/5 + 32)
+      : null;
+
+    // ── NOAA water temp fallback ──────────────────────────────────────────────
+    // Open-Meteo marine model only covers open ocean — inshore/estuary coords
+    // return null for sea_surface_temperature. Fall back to nearest NOAA station.
     if (waterTempF == null) {
       try {
-        const stRes = await fetch('https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels&units=english', { signal: AbortSignal.timeout(5000) });
+        const noaaWaterUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter`
+          + `?date=latest&station=nearest&product=water_temperature`
+          + `&units=english&time_zone=lst_ldt&format=json`
+          + `&lat=${lat}&lon=${lon}`;
+        // NOAA doesn't support lat/lon lookup directly for water_temperature,
+        // so we find the nearest station first then fetch its water temp
+        const stRes = await fetch(
+          'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels&units=english',
+          { signal: AbortSignal.timeout(5000) }
+        );
         const stData = await stRes.json();
         if (stData.stations?.length) {
           const userLat = parseFloat(lat), userLon = parseFloat(lon);
@@ -405,8 +377,11 @@ app.get('/api/marine', async (req, res) => {
             const a = Math.sin(dLat/2)**2 + Math.cos(userLat*Math.PI/180)*Math.cos(st.lat*Math.PI/180)*Math.sin(dLon/2)**2;
             return { ...st, distKm: 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)) };
           }).sort((a, b) => a.distKm - b.distKm)[0];
+
           if (nearest) {
-            const wtUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?date=latest&station=${nearest.id}&product=water_temperature&units=english&time_zone=lst_ldt&format=json`;
+            const wtUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter`
+              + `?date=latest&station=${nearest.id}&product=water_temperature`
+              + `&units=english&time_zone=lst_ldt&format=json`;
             const wtRes = await fetch(wtUrl, { signal: AbortSignal.timeout(5000) });
             const wtData = await wtRes.json();
             const tempF = parseFloat(wtData.data?.[0]?.v);
@@ -417,18 +392,39 @@ app.get('/api/marine', async (req, res) => {
         console.warn('NOAA water temp fallback failed:', noaaErr.message);
       }
     }
+
     const data = {
-      currentSpeedKts, currentDirection: currentDirDeg,
+      // Currents
+      currentSpeedKts,
+      currentDirection:     currentDirDeg,
       currentDirectionCard: currentDirDeg != null ? degreesToCardinal(currentDirDeg) : null,
-      waveHeightFt: round1(mc.wave_height ?? null), wavePeriodSec: round1(mc.wave_period ?? null),
+
+      // Waves
+      waveHeightFt:  round1(mc.wave_height ?? null),
+      wavePeriodSec: round1(mc.wave_period ?? null),
       waveDirection: round0(mc.wave_direction ?? null),
-      waveDirCard: mc.wave_direction != null ? degreesToCardinal(mc.wave_direction) : null,
-      swellHeightFt: round1(mc.swell_wave_height ?? null), swellPeriodSec: round1(mc.swell_wave_period ?? null),
+      waveDirCard:   mc.wave_direction != null ? degreesToCardinal(mc.wave_direction) : null,
+
+      // Swell
+      swellHeightFt:  round1(mc.swell_wave_height ?? null),
+      swellPeriodSec: round1(mc.swell_wave_period ?? null),
       swellDirection: round0(mc.swell_wave_direction ?? null),
-      swellDirCard: mc.swell_wave_direction != null ? degreesToCardinal(mc.swell_wave_direction) : null,
-      waterTempF, visibilityMi: null, windSpeedKts: null, windDirCard: null,
-      fetchedAt: new Date().toISOString(), source: 'open-meteo-marine',
+      swellDirCard:   mc.swell_wave_direction != null ? degreesToCardinal(mc.swell_wave_direction) : null,
+
+      // Water
+      waterTempF,
+
+      // Visibility — not in Open-Meteo marine; comes from /api/conditions
+      visibilityMi: null,
+
+      // Wind — comes from /api/conditions (Open-Meteo atmosphere)
+      windSpeedKts: null,
+      windDirCard:  null,
+
+      fetchedAt: new Date().toISOString(),
+      source: 'open-meteo-marine',
     };
+
     marineCache.set(cacheKey, { data, fetchedAt: Date.now() });
     res.json(data);
   } catch (err) {
