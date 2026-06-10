@@ -31,17 +31,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Cloudinary — catch photo storage
-// ─────────────────────────────────────────────────────────────────────────────
 const CLOUDINARY_CLOUD  = process.env.CLOUDINARY_CLOUD_NAME  || 'dojxysc50';
 const CLOUDINARY_KEY    = process.env.CLOUDINARY_API_KEY     || '629822632696159';
 const CLOUDINARY_SECRET = process.env.CLOUDINARY_API_SECRET  || 'RaqA4ZBnQxqVhwAJk8xAGL2ghno';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Auto-migration — add image_url + is_public to catches if not already there
-// Safe to run on every cold start
-// ─────────────────────────────────────────────────────────────────────────────
 async function runMigrations() {
   try {
     await pool.query(`ALTER TABLE catches ADD COLUMN IF NOT EXISTS image_url TEXT`);
@@ -63,13 +56,10 @@ app.use(express.json({ limit: '15mb' }));
 
 async function getOrCreateUser(deviceId) {
   if (!deviceId) throw new Error('deviceId required');
-  const existing = await pool.query(
-    'SELECT id, points_balance FROM users WHERE device_id = $1', [deviceId]
-  );
+  const existing = await pool.query('SELECT id, points_balance FROM users WHERE device_id = $1', [deviceId]);
   if (existing.rows.length) return existing.rows[0];
   const created = await pool.query(
-    `INSERT INTO users (device_id, points_balance, created_at)
-     VALUES ($1, 0, NOW()) RETURNING id, points_balance`, [deviceId]
+    `INSERT INTO users (device_id, points_balance, created_at) VALUES ($1, 0, NOW()) RETURNING id, points_balance`, [deviceId]
   );
   return created.rows[0];
 }
@@ -94,6 +84,58 @@ app.post('/api/auth/google', async (req, res) => {
   } catch (err) {
     console.error('[auth] Google verification failed:', err.message);
     return res.status(401).json({ error: 'Google token verification failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/radar — Iowa State Mesonet NEXRAD radar frames proxy
+// Fetches available radar timestamps server-side (no CORS issues from device)
+// Returns list of frames with tile URL templates ready for MapLibre
+// Cached 5 minutes — radar updates every ~5 min anyway
+// ─────────────────────────────────────────────────────────────────────────────
+const radarCache = { data: null, fetchedAt: 0 };
+
+app.get('/api/radar', async (req, res) => {
+  if (radarCache.data && (Date.now() - radarCache.fetchedAt) < 5 * 60 * 1000) {
+    return res.json(radarCache.data);
+  }
+  try {
+    // Iowa State Mesonet publishes a JSON list of available NEXRAD times
+    const r = await fetch(
+      'https://mesonet.agron.iastate.edu/api/1/radartime.json?product=N0Q',
+      { signal: AbortSignal.timeout(8000) }
+    );
+    const raw = await r.json();
+    // Response is { N0Q: ["YYYY-MM-DDTHH:MM:SSZ", ...] }
+    const times = (raw.N0Q || raw.times || Object.values(raw)[0] || []).slice(-12);
+    if (!times.length) throw new Error('No radar times returned');
+
+    const frames = times.map((isoTime, i) => {
+      // Convert ISO time to the format Iowa State uses in tile URLs: YYYYMMDDHHII
+      const d = new Date(isoTime);
+      const pad = n => String(n).padStart(2, '0');
+      const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
+      return {
+        time: Math.floor(d.getTime() / 1000),
+        isoTime,
+        tileUrl: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/{z}/{x}/{y}.png`,
+        isForecast: false,
+      };
+    });
+
+    radarCache.data = { frames };
+    radarCache.fetchedAt = Date.now();
+    res.json({ frames });
+  } catch (err) {
+    console.error('Radar proxy error:', err.message);
+    // Fallback: return a single current frame with the live composite URL
+    const fallbackFrames = [{
+      time: Math.floor(Date.now() / 1000),
+      isoTime: new Date().toISOString(),
+      tileUrl: 'https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png',
+      isForecast: false,
+    }];
+    res.json({ frames: fallbackFrames });
   }
 });
 
@@ -131,36 +173,21 @@ If you cannot identify the fish with reasonable confidence, return confidence be
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/upload-image — Upload catch photo to Cloudinary
-// • Resizes to max 1200px, compresses to ~80% quality, converts to WebP
-// • Stamps Bone Tide Co. watermark bottom-right
-// • Returns { url, publicId } — url is the stored optimized image URL
-// ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/upload-image', async (req, res) => {
   const { imageBase64, deviceId } = req.body;
   if (!imageBase64) return res.status(400).json({ error: 'imageBase64 required' });
-
   try {
-    // Build Cloudinary upload URL
     const timestamp = Math.floor(Date.now() / 1000);
     const folder    = 'bonetide/catches';
-
-    // Transformation: resize max 1200px, auto quality/format, watermark overlay
-    // The watermark uses a text overlay since we may not have the logo uploaded yet.
-    // Once you upload the logo to Cloudinary as 'bonetide_logo', swap the overlay below.
     const transformation = [
-      'w_1200,h_1200,c_limit',   // resize max 1200x1200, keep aspect ratio
-      'q_auto:good',             // auto quality — good tier saves ~30% vs default
-      'f_webp',                  // convert to WebP
-      'l_text:Arial_18_bold:Bone%20Tide%20Co.,co_white,o_70,g_south_east,x_12,y_12', // watermark
+      'w_1200,h_1200,c_limit',
+      'q_auto:good',
+      'f_webp',
+      'l_text:Arial_18_bold:Bone%20Tide%20Co.,co_white,o_70,g_south_east,x_12,y_12',
     ].join('/');
-
-    // Sign the upload (required for authenticated uploads)
     const signStr = `folder=${folder}&timestamp=${timestamp}&transformation=${transformation}${CLOUDINARY_SECRET}`;
     const { createHash } = await import('crypto');
     const signature = createHash('sha256').update(signStr).digest('hex');
-
     const formData = new URLSearchParams();
     formData.append('file', `data:image/jpeg;base64,${imageBase64}`);
     formData.append('timestamp', timestamp);
@@ -168,53 +195,32 @@ app.post('/api/upload-image', async (req, res) => {
     formData.append('signature', signature);
     formData.append('folder', folder);
     formData.append('transformation', transformation);
-
     const uploadRes = await fetch(
       `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/image/upload`,
       { method: 'POST', body: formData, signal: AbortSignal.timeout(15000) }
     );
     const uploadData = await uploadRes.json();
-
     if (uploadData.error) throw new Error(uploadData.error.message);
-
-    // Return the secure URL — already has watermark baked in
-    res.json({
-      url:      uploadData.secure_url,
-      publicId: uploadData.public_id,
-      width:    uploadData.width,
-      height:   uploadData.height,
-      bytes:    uploadData.bytes,
-    });
+    res.json({ url: uploadData.secure_url, publicId: uploadData.public_id, width: uploadData.width, height: uploadData.height, bytes: uploadData.bytes });
   } catch (err) {
     console.error('Upload error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/catches/public — recent public catches from all users (community feed)
-// Used by HomeScreen Recent Catches card
-// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/catches/public', async (req, res) => {
   const { limit = 20, page = 1 } = req.query;
   try {
     const offset = (parseInt(page) - 1) * parseInt(limit);
     const { rows } = await pool.query(
-      `SELECT c.*, u.device_id
-       FROM catches c
-       JOIN users u ON u.id = c.user_id
+      `SELECT c.*, u.device_id FROM catches c JOIN users u ON u.id = c.user_id
        WHERE c.is_public = TRUE AND c.image_url IS NOT NULL
-       ORDER BY c.caught_at DESC
-       LIMIT $1 OFFSET $2`,
+       ORDER BY c.caught_at DESC LIMIT $1 OFFSET $2`,
       [limit, offset]
     );
     res.json({ catches: rows.map(formatCatch) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
-
 
 const DAILY_CAP  = 1200;
 const CATCH_BASE =  100;
@@ -231,10 +237,8 @@ app.post('/api/catches', async (req, res) => {
   try {
     const user = await getOrCreateUser(deviceId);
     const today = new Date().toISOString().slice(0, 10);
-    // Total pts earned today
     const { rows: todayRows } = await pool.query(`SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2`, [user.id, today]);
     const todayPts = parseInt(todayRows[0].total);
-    // How many times has this species been caught today (for diminishing returns)
     const { rows: speciesRows } = await pool.query(
       `SELECT COUNT(*) AS cnt FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2 AND LOWER(species)=LOWER($3)`,
       [user.id, today, species]
@@ -370,14 +374,6 @@ app.get('/api/conditions', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/marine — Open-Meteo Marine + NOAA water temp fallback
-// 100% free, no API keys, no quota
-// Sources:
-//   • Open-Meteo Marine API — waves, swell, currents, sea surface temp
-//   • NOAA CO-OPS — water temp fallback for inshore/estuary locations
-//     where Open-Meteo marine model has no coverage
-// ─────────────────────────────────────────────────────────────────────────────
 const marineCache = new Map();
 
 app.get('/api/marine', async (req, res) => {
@@ -385,10 +381,7 @@ app.get('/api/marine', async (req, res) => {
   const cacheKey = `${parseFloat(lat).toFixed(2)}_${parseFloat(lon).toFixed(2)}`;
   const cached = marineCache.get(cacheKey);
   if (cached && (Date.now() - cached.fetchedAt) < 60 * 60 * 1000) return res.json(cached.data);
-
   try {
-    // ── Open-Meteo Marine ─────────────────────────────────────────────────────
-    // current= fields give us the latest snapshot (no hourly parsing needed)
     const marineUrl = [
       `https://marine-api.open-meteo.com/v1/marine`,
       `?latitude=${lat}&longitude=${lon}`,
@@ -398,38 +391,17 @@ app.get('/api/marine', async (req, res) => {
       `,sea_surface_temperature`,
       `&wind_speed_unit=kn&length_unit=imperial`,
     ].join('');
-
     const marineRes = await fetch(marineUrl, { signal: AbortSignal.timeout(8000) });
     const marineData = await marineRes.json();
     const mc = marineData.current ?? {};
-
     const round1 = v => v != null ? Math.round(v * 10) / 10 : null;
     const round0 = v => v != null ? Math.round(v) : null;
-
-    // Ocean current velocity from Open-Meteo is already in knots
     const currentSpeedKts = round1(mc.ocean_current_velocity ?? null);
     const currentDirDeg   = round0(mc.ocean_current_direction ?? null);
-
-    // Sea surface temp from Open-Meteo is in °C
-    let waterTempF = mc.sea_surface_temperature != null
-      ? round1(mc.sea_surface_temperature * 9/5 + 32)
-      : null;
-
-    // ── NOAA water temp fallback ──────────────────────────────────────────────
-    // Open-Meteo marine model only covers open ocean — inshore/estuary coords
-    // return null for sea_surface_temperature. Fall back to nearest NOAA station.
+    let waterTempF = mc.sea_surface_temperature != null ? round1(mc.sea_surface_temperature * 9/5 + 32) : null;
     if (waterTempF == null) {
       try {
-        const noaaWaterUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter`
-          + `?date=latest&station=nearest&product=water_temperature`
-          + `&units=english&time_zone=lst_ldt&format=json`
-          + `&lat=${lat}&lon=${lon}`;
-        // NOAA doesn't support lat/lon lookup directly for water_temperature,
-        // so we find the nearest station first then fetch its water temp
-        const stRes = await fetch(
-          'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels&units=english',
-          { signal: AbortSignal.timeout(5000) }
-        );
+        const stRes = await fetch('https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels&units=english', { signal: AbortSignal.timeout(5000) });
         const stData = await stRes.json();
         if (stData.stations?.length) {
           const userLat = parseFloat(lat), userLon = parseFloat(lon);
@@ -439,11 +411,8 @@ app.get('/api/marine', async (req, res) => {
             const a = Math.sin(dLat/2)**2 + Math.cos(userLat*Math.PI/180)*Math.cos(st.lat*Math.PI/180)*Math.sin(dLon/2)**2;
             return { ...st, distKm: 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)) };
           }).sort((a, b) => a.distKm - b.distKm)[0];
-
           if (nearest) {
-            const wtUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter`
-              + `?date=latest&station=${nearest.id}&product=water_temperature`
-              + `&units=english&time_zone=lst_ldt&format=json`;
+            const wtUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?date=latest&station=${nearest.id}&product=water_temperature&units=english&time_zone=lst_ldt&format=json`;
             const wtRes = await fetch(wtUrl, { signal: AbortSignal.timeout(5000) });
             const wtData = await wtRes.json();
             const tempF = parseFloat(wtData.data?.[0]?.v);
@@ -454,39 +423,18 @@ app.get('/api/marine', async (req, res) => {
         console.warn('NOAA water temp fallback failed:', noaaErr.message);
       }
     }
-
     const data = {
-      // Currents
-      currentSpeedKts,
-      currentDirection:     currentDirDeg,
+      currentSpeedKts, currentDirection: currentDirDeg,
       currentDirectionCard: currentDirDeg != null ? degreesToCardinal(currentDirDeg) : null,
-
-      // Waves
-      waveHeightFt:  round1(mc.wave_height ?? null),
-      wavePeriodSec: round1(mc.wave_period ?? null),
+      waveHeightFt: round1(mc.wave_height ?? null), wavePeriodSec: round1(mc.wave_period ?? null),
       waveDirection: round0(mc.wave_direction ?? null),
-      waveDirCard:   mc.wave_direction != null ? degreesToCardinal(mc.wave_direction) : null,
-
-      // Swell
-      swellHeightFt:  round1(mc.swell_wave_height ?? null),
-      swellPeriodSec: round1(mc.swell_wave_period ?? null),
+      waveDirCard: mc.wave_direction != null ? degreesToCardinal(mc.wave_direction) : null,
+      swellHeightFt: round1(mc.swell_wave_height ?? null), swellPeriodSec: round1(mc.swell_wave_period ?? null),
       swellDirection: round0(mc.swell_wave_direction ?? null),
-      swellDirCard:   mc.swell_wave_direction != null ? degreesToCardinal(mc.swell_wave_direction) : null,
-
-      // Water
-      waterTempF,
-
-      // Visibility — not in Open-Meteo marine; comes from /api/conditions
-      visibilityMi: null,
-
-      // Wind — comes from /api/conditions (Open-Meteo atmosphere)
-      windSpeedKts: null,
-      windDirCard:  null,
-
-      fetchedAt: new Date().toISOString(),
-      source: 'open-meteo-marine',
+      swellDirCard: mc.swell_wave_direction != null ? degreesToCardinal(mc.swell_wave_direction) : null,
+      waterTempF, visibilityMi: null, windSpeedKts: null, windDirCard: null,
+      fetchedAt: new Date().toISOString(), source: 'open-meteo-marine',
     };
-
     marineCache.set(cacheKey, { data, fetchedAt: Date.now() });
     res.json(data);
   } catch (err) {
