@@ -88,11 +88,9 @@ app.post('/api/auth/google', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/radar — Iowa State Mesonet NEXRAD tile frames
-// IEM updates every 5 minutes. We generate the last 24 frames (2 hours)
-// by building timestamps ourselves — no API call needed, no CORS issues.
-// Tile URL format: nexrad-n0q-YYYYMMDDHHII/{z}/{x}/{y}.png
-// Cached 5 minutes server-side.
+// GET /api/radar — Iowa State Mesonet NEXRAD WMS tiles
+// Uses the n0q-t WMS time service which serves proper map tiles
+// Generates last 12 frames at 5-minute intervals
 // ─────────────────────────────────────────────────────────────────────────────
 const radarCache = { data: null, fetchedAt: 0 };
 
@@ -103,16 +101,26 @@ app.get('/api/radar', async (req, res) => {
   try {
     const frames = [];
     const now = new Date();
-    // Round down to nearest 5-min mark, go back 2 hours = 24 frames
+    // Round down to nearest 5-min mark, go back 1 hour = 12 frames
     const roundedMs = Math.floor(now.getTime() / (5 * 60 * 1000)) * (5 * 60 * 1000);
-    for (let i = 23; i >= 0; i--) {
+    for (let i = 11; i >= 0; i--) {
       const d = new Date(roundedMs - i * 5 * 60 * 1000);
       const pad = n => String(n).padStart(2, '0');
-      const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
+      // WMS time parameter format: YYYY-MM-DDTHH:MM:SSZ
+      const wmsTime = d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+      // WMS tile URL for MapLibre — bbox-epsg-3857 is replaced by MapLibre automatically
+      const tileUrl = `https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q-t.cgi`
+        + `?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap`
+        + `&LAYERS=nexrad-n0q-wmst`
+        + `&STYLES=&FORMAT=image/png&TRANSPARENT=TRUE`
+        + `&TIME=${encodeURIComponent(wmsTime)}`
+        + `&SRS=EPSG:3857`
+        + `&WIDTH=256&HEIGHT=256`
+        + `&BBOX={bbox-epsg-3857}`;
       frames.push({
         time: Math.floor(d.getTime() / 1000),
-        isoTime: d.toISOString(),
-        tileUrl: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/{z}/{x}/{y}.png`,
+        isoTime: wmsTime,
+        tileUrl,
         isForecast: false,
       });
     }
