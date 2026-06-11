@@ -106,7 +106,7 @@ app.get('/api/radar', async (req, res) => {
     }
 
     // If we're near midnight, also fetch yesterday's directory
-    if (timestamps.length < 12) {
+    if (timestamps.length < 24) {
       const yesterday = new Date(now.getTime() - 24*60*60*1000);
       const y2 = yesterday.getUTCFullYear(), m2 = pad(yesterday.getUTCMonth()+1), d2 = pad(yesterday.getUTCDate());
       try {
@@ -119,8 +119,8 @@ app.get('/api/radar', async (req, res) => {
       } catch {}
     }
 
-    // Take last 12, build frames
-    const frames = timestamps.slice(-12).map(ts => {
+    // Take last 24 frames (2 hours), build frame objects
+    const frames = timestamps.slice(-24).map(ts => {
       const yr = ts.slice(0,4), mo = ts.slice(4,6), da = ts.slice(6,8);
       const hr = ts.slice(8,10), mi = ts.slice(10,12);
       const d = new Date(`${yr}-${mo}-${da}T${hr}:${mi}:00Z`);
