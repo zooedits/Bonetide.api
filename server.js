@@ -75,35 +75,67 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Bone Tide Co
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/radar — Iowa State Mesonet NEXRAD animated frames
-// tile cache format works reliably in MapLibre WebViews, no CORS issues
+// Fetches real available timestamps from IEM — classic colors, unlimited zoom
 // ─────────────────────────────────────────────────────────────────────────────
 const radarCache = { data: null, fetchedAt: 0 };
 
 app.get('/api/radar', async (req, res) => {
-  if (radarCache.data && (Date.now() - radarCache.fetchedAt) < 5 * 60 * 1000) {
+  if (radarCache.data && (Date.now() - radarCache.fetchedAt) < 2 * 60 * 1000) {
     return res.json(radarCache.data);
   }
   try {
-    const frames = [];
-    const now = new Date();
-    const roundedMs = Math.floor(now.getTime() / (5 * 60 * 1000)) * (5 * 60 * 1000);
-    for (let i = 11; i >= 0; i--) {
-      const d = new Date(roundedMs - i * 5 * 60 * 1000);
-      const pad = n => String(n).padStart(2, '0');
-      const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
-      frames.push({
-        time: Math.floor(d.getTime() / 1000),
-        isoTime: d.toISOString(),
-        tileUrl: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/{z}/{x}/{y}.png`,
-        isForecast: false,
+    // Ask IEM for actual available N0Q composite scan times
+    const r = await fetch(
+      'https://mesonet.agron.iastate.edu/json/radar.py?operation=products&product=N0Q&radar=USCOMP&start=&fmt=json',
+      { signal: AbortSignal.timeout(8000), headers: { 'User-Agent': 'BoneTideCo/1.0' } }
+    );
+    const data = await r.json();
+    const rawTimes = (data?.data || []).map(d => d.valid || d.time || d.ts).filter(Boolean);
+
+    let frames = [];
+    if (rawTimes.length) {
+      frames = rawTimes.slice(-12).map(t => {
+        const d = new Date(t);
+        const pad = n => String(n).padStart(2, '0');
+        const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
+        return {
+          time: Math.floor(d.getTime() / 1000),
+          isoTime: d.toISOString(),
+          tileUrl: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/{z}/{x}/{y}.png`,
+          isForecast: false,
+        };
       });
     }
+
+    // Fallback: generate plausible timestamps with 3-min processing lag
+    if (!frames.length) {
+      const now = new Date();
+      for (let i = 11; i >= 0; i--) {
+        const d = new Date(now.getTime() - (i * 5 + 3) * 60 * 1000);
+        d.setUTCSeconds(0, 0);
+        const pad = n => String(n).padStart(2, '0');
+        const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
+        frames.push({
+          time: Math.floor(d.getTime() / 1000),
+          isoTime: d.toISOString(),
+          tileUrl: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/{z}/{x}/{y}.png`,
+          isForecast: false,
+        });
+      }
+    }
+
     radarCache.data = { frames };
     radarCache.fetchedAt = Date.now();
     res.json({ frames });
   } catch (err) {
-    console.error('Radar proxy error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Radar error:', err.message);
+    // Last resort: single live tile
+    res.json({ frames: [{
+      time: Math.floor(Date.now() / 1000),
+      isoTime: new Date().toISOString(),
+      tileUrl: 'https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png',
+      isForecast: false,
+    }]});
   }
 });
 
