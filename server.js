@@ -75,102 +75,36 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Bone Tide Co
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/radar — Iowa State Mesonet NEXRAD animated frames
-// Scrapes IEM archive directory for real filenames → guaranteed valid tiles
+// Generates 12 frames at 5-min intervals — direct IEM tile cache URLs
 // Classic green/yellow/red NEXRAD colors, works at any zoom level
 // ─────────────────────────────────────────────────────────────────────────────
 const radarCache = { data: null, fetchedAt: 0 };
 
 app.get('/api/radar', async (req, res) => {
-  if (radarCache.data && (Date.now() - radarCache.fetchedAt) < 2 * 60 * 1000) {
+  if (radarCache.data && (Date.now() - radarCache.fetchedAt) < 5 * 60 * 1000) {
     return res.json(radarCache.data);
   }
   try {
+    const frames = [];
     const now = new Date();
+    const roundedMs = Math.floor(now.getTime() / (5 * 60 * 1000)) * (5 * 60 * 1000);
     const pad = n => String(n).padStart(2, '0');
-    const y = now.getUTCFullYear(), m = pad(now.getUTCMonth()+1), d = pad(now.getUTCDate());
-
-    // Scrape today's directory listing for actual n0q composite filenames
-    const dirUrl = `https://mesonet.agron.iastate.edu/archive/data/${y}/${m}/${d}/GIS/uscomp/`;
-    const r = await fetch(dirUrl, {
-      signal: AbortSignal.timeout(8000),
-      headers: { 'User-Agent': 'BoneTideCo/1.0' }
-    });
-    const html = await r.text();
-
-    // Parse filenames like n0q_202606111215.png — deduplicate
-    const regex = /n0q_(\d{12})\.png/g;
-    const seen = new Set();
-    const timestamps = [];
-    let match;
-    while ((match = regex.exec(html)) !== null) {
-      if (!seen.has(match[1])) { seen.add(match[1]); timestamps.push(match[1]); }
-    }
-
-    // If we're near midnight, also fetch yesterday's directory
-    if (timestamps.length < 24) {
-      const yesterday = new Date(now.getTime() - 24*60*60*1000);
-      const y2 = yesterday.getUTCFullYear(), m2 = pad(yesterday.getUTCMonth()+1), d2 = pad(yesterday.getUTCDate());
-      try {
-        const r2 = await fetch(`https://mesonet.agron.iastate.edu/archive/data/${y2}/${m2}/${d2}/GIS/uscomp/`, {
-          signal: AbortSignal.timeout(5000), headers: { 'User-Agent': 'BoneTideCo/1.0' }
-        });
-        const html2 = await r2.text();
-        const regex2 = /n0q_(\d{12})\.png/g;
-        let m2r;
-        while ((m2r = regex2.exec(html2)) !== null) {
-          if (!seen.has(m2r[1])) { seen.add(m2r[1]); timestamps.unshift(m2r[1]); }
-        }
-      } catch {}
-    }
-
-    // Take last 24 frames (2 hours), build frame objects
-    const frames = timestamps.slice(-24).map(ts => {
-      const yr = ts.slice(0,4), mo = ts.slice(4,6), da = ts.slice(6,8);
-      const hr = ts.slice(8,10), mi = ts.slice(10,12);
-      const d = new Date(`${yr}-${mo}-${da}T${hr}:${mi}:00Z`);
-      return {
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(roundedMs - i * 5 * 60 * 1000);
+      const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
+      frames.push({
         time: Math.floor(d.getTime() / 1000),
         isoTime: d.toISOString(),
-        tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile/${ts}/{z}/{x}/{y}`,
+        tileUrl: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/{z}/{x}/{y}.png`,
         isForecast: false,
-      };
-    });
-
-    if (!frames.length) throw new Error('No frames found in directory');
-
+      });
+    }
     radarCache.data = { frames };
     radarCache.fetchedAt = Date.now();
     res.json({ frames });
   } catch (err) {
     console.error('Radar error:', err.message);
-    // Fallback: single live tile
-    res.json({ frames: [{
-      time: Math.floor(Date.now() / 1000),
-      isoTime: new Date().toISOString(),
-      tileUrl: 'https://bonetideapi-production.up.railway.app/api/radar-tile/900913/{z}/{x}/{y}',
-      isForecast: false,
-    }]});
-  }
-});
-
-// GET /api/radar-tile/:ts/:z/:x/:y — proxy IEM NEXRAD tiles (IEM blocks WebView direct requests)
-app.get('/api/radar-tile/:ts/:z/:x/:y', async (req, res) => {
-  const { ts, z, x } = req.params;
-  const y = req.params.y.replace('.png', ''); // strip .png if MapLibre appends it
-  const iemUrl = `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/${z}/${x}/${y}.png`;
-  try {
-    const r = await fetch(iemUrl, {
-      signal: AbortSignal.timeout(8000),
-      headers: { 'User-Agent': 'BoneTideCo/1.0' },
-    });
-    if (!r.ok) return res.status(r.status).end();
-    const buf = await r.arrayBuffer();
-    res.set('Content-Type', 'image/png');
-    res.set('Cache-Control', 'public, max-age=300');
-    res.set('Access-Control-Allow-Origin', '*');
-    res.send(Buffer.from(buf));
-  } catch (err) {
-    res.status(504).end();
+    res.status(500).json({ error: err.message });
   }
 });
 
