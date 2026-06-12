@@ -75,8 +75,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Bone Tide Co
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/radar — Iowa State Mesonet NEXRAD animated frames
-// Generates 12 frames at 5-min intervals — direct IEM tile cache URLs
-// Classic green/yellow/red NEXRAD colors, works at any zoom level
+// Math-based timestamps, proxied through Railway so iOS WebView can load them
 // ─────────────────────────────────────────────────────────────────────────────
 const radarCache = { data: null, fetchedAt: 0 };
 
@@ -84,27 +83,43 @@ app.get('/api/radar', async (req, res) => {
   if (radarCache.data && (Date.now() - radarCache.fetchedAt) < 5 * 60 * 1000) {
     return res.json(radarCache.data);
   }
+  const frames = [];
+  const now = new Date();
+  const roundedMs = Math.floor(now.getTime() / (5 * 60 * 1000)) * (5 * 60 * 1000);
+  const pad = n => String(n).padStart(2, '0');
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(roundedMs - i * 5 * 60 * 1000);
+    const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
+    frames.push({
+      time: Math.floor(d.getTime() / 1000),
+      isoTime: d.toISOString(),
+      tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile/${ts}/{z}/{x}/{y}`,
+      isForecast: false,
+    });
+  }
+  radarCache.data = { frames };
+  radarCache.fetchedAt = Date.now();
+  res.json({ frames });
+});
+
+// GET /api/radar-tile/:ts/:z/:x/:y — proxy IEM tiles through Railway
+// iOS WebView blocks direct IEM requests; Railway fetches them server-side
+app.get('/api/radar-tile/:ts/:z/:x/:y', async (req, res) => {
+  const { ts, z, x, y } = req.params;
+  const iemUrl = `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/${z}/${x}/${y}.png`;
   try {
-    const frames = [];
-    const now = new Date();
-    const roundedMs = Math.floor(now.getTime() / (5 * 60 * 1000)) * (5 * 60 * 1000);
-    const pad = n => String(n).padStart(2, '0');
-    for (let i = 11; i >= 0; i--) {
-      const d = new Date(roundedMs - i * 5 * 60 * 1000);
-      const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
-      frames.push({
-        time: Math.floor(d.getTime() / 1000),
-        isoTime: d.toISOString(),
-        tileUrl: `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/{z}/{x}/{y}.png`,
-        isForecast: false,
-      });
-    }
-    radarCache.data = { frames };
-    radarCache.fetchedAt = Date.now();
-    res.json({ frames });
-  } catch (err) {
-    console.error('Radar error:', err.message);
-    res.status(500).json({ error: err.message });
+    const r = await fetch(iemUrl, {
+      signal: AbortSignal.timeout(8000),
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BoneTideCo/1.0)' },
+    });
+    if (!r.ok) return res.status(r.status).end();
+    const buf = await r.arrayBuffer();
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=300');
+    res.set('Access-Control-Allow-Origin', '*');
+    res.send(Buffer.from(buf));
+  } catch {
+    res.status(504).end();
   }
 });
 
