@@ -93,7 +93,7 @@ app.get('/api/radar', async (req, res) => {
     frames.push({
       time: Math.floor(d.getTime() / 1000),
       isoTime: d.toISOString(),
-      tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile/${ts}/{z}/{x}/{y}`,
+      tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile?ts=${ts}&z={z}&x={x}&y={y}`,
       isForecast: false,
     });
   }
@@ -102,10 +102,10 @@ app.get('/api/radar', async (req, res) => {
   res.json({ frames });
 });
 
-// GET /api/radar-tile/:ts/:z/:x/:y — proxy IEM tiles through Railway
-// iOS WebView blocks direct IEM requests; Railway fetches them server-side
-app.get('/api/radar-tile/:ts/:z/:x/:y', async (req, res) => {
-  const { ts, z, x, y } = req.params;
+// GET /api/radar-tile?ts=202606121355&z=6&x=15&y=26 — proxy IEM tiles through Railway
+app.get('/api/radar-tile', async (req, res) => {
+  const { ts, z, x, y } = req.query;
+  if (!ts || !z || !x || !y) return res.status(400).end();
   const iemUrl = `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/${z}/${x}/${y}.png`;
   try {
     const r = await fetch(iemUrl, {
