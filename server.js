@@ -93,7 +93,7 @@ app.get('/api/radar', async (req, res) => {
     frames.push({
       time: Math.floor(d.getTime() / 1000),
       isoTime: d.toISOString(),
-      tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile?ts=${ts}&z={z}&x={x}&y={y}`,
+      tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile?t=${ts}_{z}_{x}_{y}`,
       isForecast: false,
     });
   }
@@ -102,9 +102,11 @@ app.get('/api/radar', async (req, res) => {
   res.json({ frames });
 });
 
-// GET /api/radar-tile?ts=202606121355&z=6&x=15&y=26 — proxy IEM tiles through Railway
+// GET /api/radar-tile?t=TS_Z_X_Y — proxy IEM tiles, single param avoids Railway & issues
 app.get('/api/radar-tile', async (req, res) => {
-  const { ts, z, x, y } = req.query;
+  const t = req.query.t;
+  if (!t) return res.status(400).end();
+  const [ts, z, x, y] = t.split('_');
   if (!ts || !z || !x || !y) return res.status(400).end();
   const iemUrl = `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/${z}/${x}/${y}.png`;
   try {
