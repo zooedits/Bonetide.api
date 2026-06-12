@@ -97,12 +97,13 @@ app.get('/api/radar', async (req, res) => {
     });
     const html = await r.text();
 
-    // Parse filenames like n0q_202606111215.png
+    // Parse filenames like n0q_202606111215.png — deduplicate
     const regex = /n0q_(\d{12})\.png/g;
+    const seen = new Set();
     const timestamps = [];
     let match;
     while ((match = regex.exec(html)) !== null) {
-      timestamps.push(match[1]); // e.g. "202606111215"
+      if (!seen.has(match[1])) { seen.add(match[1]); timestamps.push(match[1]); }
     }
 
     // If we're near midnight, also fetch yesterday's directory
@@ -114,8 +115,11 @@ app.get('/api/radar', async (req, res) => {
           signal: AbortSignal.timeout(5000), headers: { 'User-Agent': 'BoneTideCo/1.0' }
         });
         const html2 = await r2.text();
+        const regex2 = /n0q_(\d{12})\.png/g;
         let m2r;
-        while ((m2r = regex.exec(html2)) !== null) timestamps.unshift(m2r[1]);
+        while ((m2r = regex2.exec(html2)) !== null) {
+          if (!seen.has(m2r[1])) { seen.add(m2r[1]); timestamps.unshift(m2r[1]); }
+        }
       } catch {}
     }
 
@@ -127,7 +131,7 @@ app.get('/api/radar', async (req, res) => {
       return {
         time: Math.floor(d.getTime() / 1000),
         isoTime: d.toISOString(),
-        tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile/${ts}/{z}/{x}/{y}.png`,
+        tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile/${ts}/{z}/{x}/{y}`,
         isForecast: false,
       };
     });
@@ -143,24 +147,23 @@ app.get('/api/radar', async (req, res) => {
     res.json({ frames: [{
       time: Math.floor(Date.now() / 1000),
       isoTime: new Date().toISOString(),
-      tileUrl: 'https://bonetideapi-production.up.railway.app/api/radar-tile/900913/{z}/{x}/{y}.png',
+      tileUrl: 'https://bonetideapi-production.up.railway.app/api/radar-tile/900913/{z}/{x}/{y}',
       isForecast: false,
     }]});
   }
 });
 
-// GET /api/radar-tile/:ts/:z/:x/:y.png — proxy IEM NEXRAD tiles to avoid 403
-// IEM blocks direct tile requests from WebViews; Railway proxies them cleanly
+// GET /api/radar-tile/:ts/:z/:x/:y — proxy IEM NEXRAD tiles (IEM blocks WebView direct requests)
 app.get('/api/radar-tile/:ts/:z/:x/:y', async (req, res) => {
-  const { ts, z, x, y } = req.params;
-  const iemUrl = ts === '900913'
-    ? `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/${z}/${x}/${y}.png`
-    : `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/${z}/${x}/${y}.png`;
+  const { ts, z, x } = req.params;
+  const y = req.params.y.replace('.png', ''); // strip .png if MapLibre appends it
+  const iemUrl = `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/${z}/${x}/${y}.png`;
   try {
     const r = await fetch(iemUrl, {
       signal: AbortSignal.timeout(8000),
       headers: { 'User-Agent': 'BoneTideCo/1.0' },
     });
+    if (!r.ok) return res.status(r.status).end();
     const buf = await r.arrayBuffer();
     res.set('Content-Type', 'image/png');
     res.set('Cache-Control', 'public, max-age=300');
