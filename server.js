@@ -93,7 +93,7 @@ app.get('/api/radar', async (req, res) => {
     frames.push({
       time: Math.floor(d.getTime() / 1000),
       isoTime: d.toISOString(),
-      tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile?t=${ts}_{z}_{x}_{y}`,
+      tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile/${ts}/{z}/{x}/{y}`,
       isForecast: false,
     });
   }
@@ -102,12 +102,10 @@ app.get('/api/radar', async (req, res) => {
   res.json({ frames });
 });
 
-// GET /api/radar-tile?t=TS_Z_X_Y — proxy IEM tiles, single param avoids Railway & issues
-app.get('/api/radar-tile', async (req, res) => {
-  const t = req.query.t;
-  if (!t) return res.status(400).end();
-  const [ts, z, x, y] = t.split('_');
-  if (!ts || !z || !x || !y) return res.status(400).end();
+// GET /api/radar-tile/:ts/:z/:x/:y — proxy IEM tiles through Railway
+// iOS WebView blocks direct IEM requests; Railway fetches them server-side
+app.get('/api/radar-tile/:ts/:z/:x/:y', async (req, res) => {
+  const { ts, z, x, y } = req.params;
   const iemUrl = `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/${z}/${x}/${y}.png`;
   try {
     const r = await fetch(iemUrl, {
@@ -368,6 +366,81 @@ app.get('/api/conditions', async (req, res) => {
 //   • NOAA CO-OPS — water temp fallback for inshore/estuary locations
 //     where Open-Meteo marine model has no coverage
 // ─────────────────────────────────────────────────────────────────────────────
+// ── NDBC buoy fallback helpers ──────────────────────────────────────────────
+// Open-Meteo marine model has no coverage for inshore/estuary coords.
+// Fall back to the nearest NOAA NDBC buoy for wave height/period/direction.
+let ndbcStationCache = { stations: null, fetchedAt: 0 };
+
+async function getNdbcStations() {
+  if (ndbcStationCache.stations && (Date.now() - ndbcStationCache.fetchedAt) < 24 * 3600 * 1000) {
+    return ndbcStationCache.stations;
+  }
+  const res = await fetch('https://www.ndbc.noaa.gov/data/stations/station_table.txt', {
+    signal: AbortSignal.timeout(8000),
+  });
+  const text = await res.text();
+  const stations = [];
+  for (const line of text.split('\n')) {
+    if (!line || line.startsWith('#')) continue;
+    const cols = line.split('|');
+    if (cols.length < 7) continue;
+    const id = cols[0]?.trim();
+    const loc = cols[6] ?? '';
+    const m = loc.match(/(\d+\.\d+)\s*N\s+(\d+\.\d+)\s*W/) || loc.match(/(\d+\.\d+)\s*S\s+(\d+\.\d+)\s*W/);
+    if (!id || !m) continue;
+    const lat = loc.includes('S') ? -parseFloat(m[1]) : parseFloat(m[1]);
+    const lon = -parseFloat(m[2]);
+    stations.push({ id, lat, lon });
+  }
+  ndbcStationCache = { stations, fetchedAt: Date.now() };
+  return stations;
+}
+
+async function getNearestBuoyMarine(lat, lon) {
+  const stations = await getNdbcStations();
+  if (!stations.length) return null;
+  const userLat = parseFloat(lat), userLon = parseFloat(lon);
+  const sorted = stations.map(st => {
+    const dLat = (st.lat - userLat) * Math.PI / 180;
+    const dLon = (st.lon - userLon) * Math.PI / 180;
+    const a = Math.sin(dLat/2)**2 + Math.cos(userLat*Math.PI/180)*Math.cos(st.lat*Math.PI/180)*Math.sin(dLon/2)**2;
+    return { ...st, distKm: 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)) };
+  }).sort((a, b) => a.distKm - b.distKm);
+
+  // Try the nearest few buoys until one returns valid wave data
+  for (const buoy of sorted.slice(0, 5)) {
+    try {
+      const res = await fetch(`https://www.ndbc.noaa.gov/data/realtime2/${buoy.id}.txt`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) continue;
+      const text = await res.text();
+      const lines = text.trim().split('\n');
+      if (lines.length < 3) continue;
+      const headers = lines[0].replace('#', '').trim().split(/\s+/);
+      const row = lines[2].trim().split(/\s+/);
+      const get = (name) => {
+        const idx = headers.indexOf(name);
+        if (idx === -1) return null;
+        const v = parseFloat(row[idx]);
+        return isNaN(v) || v >= 99 ? null : v;
+      };
+      const wvhtM = get('WVHT');
+      if (wvhtM == null) continue; // try next buoy
+      return {
+        waveHeightFt: Math.round(wvhtM * 3.28084 * 10) / 10,
+        wavePeriodSec: get('DPD') ?? get('APD'),
+        waveDirection: get('MWD'),
+        waterTempC: get('WTMP'),
+        distMi: Math.round(buoy.distKm * 0.621),
+        buoyId: buoy.id,
+      };
+    } catch { continue; }
+  }
+  return null;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 const marineCache = new Map();
 
 app.get('/api/marine', async (req, res) => {
@@ -445,6 +518,15 @@ app.get('/api/marine', async (req, res) => {
       }
     }
 
+    // ── NDBC buoy fallback for waves/swell/water temp ───────────────────────
+    // Open-Meteo marine model has no coverage for inshore/estuary coords —
+    // fall back to the nearest NOAA buoy reading wave height, period, direction
+    let buoyData = null;
+    if (round1(mc.wave_height ?? null) == null) {
+      try { buoyData = await getNearestBuoyMarine(lat, lon); }
+      catch (buoyErr) { console.warn('NDBC buoy fallback failed:', buoyErr.message); }
+    }
+
     const data = {
       // Currents
       currentSpeedKts,
@@ -452,10 +534,12 @@ app.get('/api/marine', async (req, res) => {
       currentDirectionCard: currentDirDeg != null ? degreesToCardinal(currentDirDeg) : null,
 
       // Waves
-      waveHeightFt:  round1(mc.wave_height ?? null),
-      wavePeriodSec: round1(mc.wave_period ?? null),
-      waveDirection: round0(mc.wave_direction ?? null),
-      waveDirCard:   mc.wave_direction != null ? degreesToCardinal(mc.wave_direction) : null,
+      waveHeightFt:  round1(mc.wave_height ?? null) ?? buoyData?.waveHeightFt ?? null,
+      wavePeriodSec: round1(mc.wave_period ?? null) ?? buoyData?.wavePeriodSec ?? null,
+      waveDirection: round0(mc.wave_direction ?? null) ?? buoyData?.waveDirection ?? null,
+      waveDirCard:   mc.wave_direction != null
+                       ? degreesToCardinal(mc.wave_direction)
+                       : (buoyData?.waveDirection != null ? degreesToCardinal(buoyData.waveDirection) : null),
 
       // Swell
       swellHeightFt:  round1(mc.swell_wave_height ?? null),
@@ -474,7 +558,7 @@ app.get('/api/marine', async (req, res) => {
       windDirCard:  null,
 
       fetchedAt: new Date().toISOString(),
-      source: 'open-meteo-marine',
+      source: buoyData ? `open-meteo-marine+ndbc-${buoyData.buoyId}` : 'open-meteo-marine',
     };
 
     marineCache.set(cacheKey, { data, fetchedAt: Date.now() });
