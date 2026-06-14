@@ -93,7 +93,7 @@ app.get('/api/radar', async (req, res) => {
     frames.push({
       time: Math.floor(d.getTime() / 1000),
       isoTime: d.toISOString(),
-      tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile/${ts}/{z}/{x}/{y}`,
+      tileUrl: `https://bonetideapi-production.up.railway.app/api/radar-tile?t=${ts}_{z}_{x}_{y}`,
       isForecast: false,
     });
   }
@@ -102,10 +102,12 @@ app.get('/api/radar', async (req, res) => {
   res.json({ frames });
 });
 
-// GET /api/radar-tile/:ts/:z/:x/:y — proxy IEM tiles through Railway
-// iOS WebView blocks direct IEM requests; Railway fetches them server-side
-app.get('/api/radar-tile/:ts/:z/:x/:y', async (req, res) => {
-  const { ts, z, x, y } = req.params;
+// GET /api/radar-tile?t=TS_Z_X_Y — proxy IEM tiles, single param avoids Railway & issues
+app.get('/api/radar-tile', async (req, res) => {
+  const t = req.query.t;
+  if (!t) return res.status(400).end();
+  const [ts, z, x, y] = t.split('_');
+  if (!ts || !z || !x || !y) return res.status(400).end();
   const iemUrl = `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-${ts}/${z}/${x}/${y}.png`;
   try {
     const r = await fetch(iemUrl, {
@@ -369,6 +371,35 @@ app.get('/api/conditions', async (req, res) => {
 // ── NDBC buoy fallback helpers ──────────────────────────────────────────────
 // Open-Meteo marine model has no coverage for inshore/estuary coords.
 // Fall back to the nearest NOAA NDBC buoy for wave height/period/direction.
+// Curated list of NDBC buoy stations with known coordinates covering US
+// coastlines — used first since it's instant and reliable. If none of the
+// nearby curated buoys have data, fall back to the full station table.
+const NDBC_BUOYS = [
+  // Southeast / South Atlantic
+  { id: '41008', lat: 31.40, lon: -80.87 },  // Grays Reef, GA
+  { id: '41004', lat: 32.50, lon: -79.10 },  // Edisto, SC
+  { id: '41013', lat: 33.44, lon: -77.74 },  // Frying Pan Shoals, NC
+  { id: '41009', lat: 28.51, lon: -80.18 },  // Canaveral, FL
+  { id: '41010', lat: 28.91, lon: -78.47 },  // Canaveral East, FL
+  { id: '41002', lat: 32.31, lon: -75.36 },  // South Hatteras
+  { id: '41001', lat: 34.70, lon: -72.30 },  // East Hatteras
+  // Gulf of Mexico
+  { id: '42036', lat: 28.50, lon: -84.52 },  // West Tampa
+  { id: '42039', lat: 28.79, lon: -86.01 },  // Pensacola
+  { id: '42040', lat: 29.21, lon: -88.21 },  // Mobile
+  { id: '42020', lat: 26.97, lon: -96.69 },  // Corpus Christi
+  // Mid-Atlantic / Northeast
+  { id: '44009', lat: 38.46, lon: -74.70 },  // Delaware Bay
+  { id: '44025', lat: 40.25, lon: -73.16 },  // Long Island
+  { id: '44013', lat: 42.35, lon: -70.65 },  // Boston
+  { id: '44027', lat: 44.28, lon: -67.31 },  // Mount Desert Rock, ME
+  // West Coast
+  { id: '46026', lat: 37.76, lon: -122.83 }, // San Francisco
+  { id: '46025', lat: 33.75, lon: -119.05 }, // Santa Monica Basin
+  { id: '46029', lat: 46.14, lon: -124.51 }, // Columbia River
+  { id: '46050', lat: 44.66, lon: -124.53 }, // Newport, OR
+];
+
 let ndbcStationCache = { stations: null, fetchedAt: 0 };
 
 async function getNdbcStations() {
@@ -377,6 +408,7 @@ async function getNdbcStations() {
   }
   const res = await fetch('https://www.ndbc.noaa.gov/data/stations/station_table.txt', {
     signal: AbortSignal.timeout(8000),
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BoneTideCo/1.0)' },
   });
   const text = await res.text();
   const stations = [];
@@ -386,57 +418,79 @@ async function getNdbcStations() {
     if (cols.length < 7) continue;
     const id = cols[0]?.trim();
     const loc = cols[6] ?? '';
-    const m = loc.match(/(\d+\.\d+)\s*N\s+(\d+\.\d+)\s*W/) || loc.match(/(\d+\.\d+)\s*S\s+(\d+\.\d+)\s*W/);
-    if (!id || !m) continue;
-    const lat = loc.includes('S') ? -parseFloat(m[1]) : parseFloat(m[1]);
-    const lon = -parseFloat(m[2]);
+    let m = loc.match(/(\d+\.\d+)\s*N\s+(\d+\.\d+)\s*W/);
+    let lat, lon;
+    if (m) { lat = parseFloat(m[1]); lon = -parseFloat(m[2]); }
+    else {
+      m = loc.match(/(\d+\.\d+)\s*S\s+(\d+\.\d+)\s*W/);
+      if (m) { lat = -parseFloat(m[1]); lon = -parseFloat(m[2]); }
+    }
+    if (!id || lat == null) continue;
     stations.push({ id, lat, lon });
   }
   ndbcStationCache = { stations, fetchedAt: Date.now() };
   return stations;
 }
 
-async function getNearestBuoyMarine(lat, lon) {
-  const stations = await getNdbcStations();
-  if (!stations.length) return null;
+async function fetchBuoyWaveData(buoyId) {
+  const res = await fetch(`https://www.ndbc.noaa.gov/data/realtime2/${buoyId}.txt`, {
+    signal: AbortSignal.timeout(5000),
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BoneTideCo/1.0)' },
+  });
+  if (!res.ok) return null;
+  const text = await res.text();
+  const lines = text.trim().split('\n');
+  if (lines.length < 3) return null;
+  const headers = lines[0].replace('#', '').trim().split(/\s+/);
+  const row = lines[2].trim().split(/\s+/);
+  const get = (name) => {
+    const idx = headers.indexOf(name);
+    if (idx === -1) return null;
+    const v = parseFloat(row[idx]);
+    return isNaN(v) || v >= 99 ? null : v;
+  };
+  const wvhtM = get('WVHT');
+  if (wvhtM == null) return null;
+  return {
+    waveHeightFt: Math.round(wvhtM * 3.28084 * 10) / 10,
+    wavePeriodSec: get('DPD') ?? get('APD'),
+    waveDirection: get('MWD'),
+    waterTempC: get('WTMP'),
+  };
+}
+
+function sortByDistance(stations, lat, lon) {
   const userLat = parseFloat(lat), userLon = parseFloat(lon);
-  const sorted = stations.map(st => {
+  return stations.map(st => {
     const dLat = (st.lat - userLat) * Math.PI / 180;
     const dLon = (st.lon - userLon) * Math.PI / 180;
     const a = Math.sin(dLat/2)**2 + Math.cos(userLat*Math.PI/180)*Math.cos(st.lat*Math.PI/180)*Math.sin(dLon/2)**2;
     return { ...st, distKm: 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)) };
   }).sort((a, b) => a.distKm - b.distKm);
+}
 
-  // Try the nearest few buoys until one returns valid wave data
-  for (const buoy of sorted.slice(0, 5)) {
+async function getNearestBuoyMarine(lat, lon) {
+  // Try curated buoy list first — fast, no extra fetch
+  const curated = sortByDistance(NDBC_BUOYS, lat, lon).slice(0, 6);
+  for (const buoy of curated) {
     try {
-      const res = await fetch(`https://www.ndbc.noaa.gov/data/realtime2/${buoy.id}.txt`, {
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!res.ok) continue;
-      const text = await res.text();
-      const lines = text.trim().split('\n');
-      if (lines.length < 3) continue;
-      const headers = lines[0].replace('#', '').trim().split(/\s+/);
-      const row = lines[2].trim().split(/\s+/);
-      const get = (name) => {
-        const idx = headers.indexOf(name);
-        if (idx === -1) return null;
-        const v = parseFloat(row[idx]);
-        return isNaN(v) || v >= 99 ? null : v;
-      };
-      const wvhtM = get('WVHT');
-      if (wvhtM == null) continue; // try next buoy
-      return {
-        waveHeightFt: Math.round(wvhtM * 3.28084 * 10) / 10,
-        wavePeriodSec: get('DPD') ?? get('APD'),
-        waveDirection: get('MWD'),
-        waterTempC: get('WTMP'),
-        distMi: Math.round(buoy.distKm * 0.621),
-        buoyId: buoy.id,
-      };
-    } catch { continue; }
+      const wave = await fetchBuoyWaveData(buoy.id);
+      if (wave) return { ...wave, distMi: Math.round(buoy.distKm * 0.621), buoyId: buoy.id };
+    } catch {}
   }
+  // Fall back to full NDBC station table for more candidates
+  try {
+    const stations = await getNdbcStations();
+    if (stations.length) {
+      const nearby = sortByDistance(stations, lat, lon).slice(0, 8);
+      for (const buoy of nearby) {
+        try {
+          const wave = await fetchBuoyWaveData(buoy.id);
+          if (wave) return { ...wave, distMi: Math.round(buoy.distKm * 0.621), buoyId: buoy.id };
+        } catch {}
+      }
+    }
+  } catch {}
   return null;
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -518,13 +572,26 @@ app.get('/api/marine', async (req, res) => {
       }
     }
 
-    // ── NDBC buoy fallback for waves/swell/water temp ───────────────────────
-    // Open-Meteo marine model has no coverage for inshore/estuary coords —
-    // fall back to the nearest NOAA buoy reading wave height, period, direction
+    // ── NDBC buoy fallback for waves/swell when Open-Meteo has no coverage ──
     let buoyData = null;
     if (round1(mc.wave_height ?? null) == null) {
       try { buoyData = await getNearestBuoyMarine(lat, lon); }
       catch (buoyErr) { console.warn('NDBC buoy fallback failed:', buoyErr.message); }
+    }
+
+    const waveHeightFt  = round1(mc.wave_height ?? null)  ?? buoyData?.waveHeightFt  ?? null;
+    const wavePeriodSec = round1(mc.wave_period ?? null)  ?? buoyData?.wavePeriodSec ?? null;
+    const waveDirection = round0(mc.wave_direction ?? null) ?? buoyData?.waveDirection ?? null;
+
+    // If swell data is unavailable from Open-Meteo, use the buoy's overall
+    // wave reading as a proxy for swell (buoys report combined sea state)
+    const swellHeightFt  = round1(mc.swell_wave_height ?? null) ?? (buoyData ? buoyData.waveHeightFt : null);
+    const swellPeriodSec = round1(mc.swell_wave_period ?? null) ?? (buoyData ? buoyData.wavePeriodSec : null);
+    const swellDirection = round0(mc.swell_wave_direction ?? null) ?? (buoyData ? buoyData.waveDirection : null);
+
+    // Use buoy water temp as a further fallback if NOAA tide station also failed
+    if (waterTempF == null && buoyData?.waterTempC != null) {
+      waterTempF = round1(buoyData.waterTempC * 9/5 + 32);
     }
 
     const data = {
@@ -534,18 +601,16 @@ app.get('/api/marine', async (req, res) => {
       currentDirectionCard: currentDirDeg != null ? degreesToCardinal(currentDirDeg) : null,
 
       // Waves
-      waveHeightFt:  round1(mc.wave_height ?? null) ?? buoyData?.waveHeightFt ?? null,
-      wavePeriodSec: round1(mc.wave_period ?? null) ?? buoyData?.wavePeriodSec ?? null,
-      waveDirection: round0(mc.wave_direction ?? null) ?? buoyData?.waveDirection ?? null,
-      waveDirCard:   mc.wave_direction != null
-                       ? degreesToCardinal(mc.wave_direction)
-                       : (buoyData?.waveDirection != null ? degreesToCardinal(buoyData.waveDirection) : null),
+      waveHeightFt,
+      wavePeriodSec,
+      waveDirection,
+      waveDirCard: waveDirection != null ? degreesToCardinal(waveDirection) : null,
 
       // Swell
-      swellHeightFt:  round1(mc.swell_wave_height ?? null),
-      swellPeriodSec: round1(mc.swell_wave_period ?? null),
-      swellDirection: round0(mc.swell_wave_direction ?? null),
-      swellDirCard:   mc.swell_wave_direction != null ? degreesToCardinal(mc.swell_wave_direction) : null,
+      swellHeightFt,
+      swellPeriodSec,
+      swellDirection,
+      swellDirCard: swellDirection != null ? degreesToCardinal(swellDirection) : null,
 
       // Water
       waterTempF,
@@ -577,17 +642,42 @@ function windCategory(kts) {
   if (kts < 5) return 'calm'; if (kts < 15) return 'light';
   if (kts < 25) return 'moderate'; if (kts < 35) return 'strong'; return 'gale';
 }
+function computeMoonPhase(date) {
+  // Known new moon reference: Jan 6, 2000 18:14 UTC
+  const knownNewMoon = new Date('2000-01-06T18:14:00Z').getTime();
+  const synodicMonth = 29.530588853; // days
+  const daysSince = (date.getTime() - knownNewMoon) / 86400000;
+  let age = daysSince % synodicMonth;
+  if (age < 0) age += synodicMonth;
+  const fraction = age / synodicMonth; // 0 = new, 0.5 = full, 1 = new again
+  const illumPct = Math.round((1 - Math.cos(2 * Math.PI * fraction)) / 2 * 100);
+
+  let phaseName, emoji;
+  if      (fraction < 0.03 || fraction > 0.97) { phaseName = 'New Moon';        emoji = '🌑'; }
+  else if (fraction < 0.22)                    { phaseName = 'Waxing Crescent'; emoji = '🌒'; }
+  else if (fraction < 0.28)                    { phaseName = 'First Quarter';   emoji = '🌓'; }
+  else if (fraction < 0.47)                    { phaseName = 'Waxing Gibbous';  emoji = '🌔'; }
+  else if (fraction < 0.53)                    { phaseName = 'Full Moon';       emoji = '🌕'; }
+  else if (fraction < 0.72)                    { phaseName = 'Waning Gibbous';  emoji = '🌖'; }
+  else if (fraction < 0.78)                    { phaseName = 'Last Quarter';    emoji = '🌗'; }
+  else                                          { phaseName = 'Waning Crescent'; emoji = '🌘'; }
+
+  return { illumPct, phaseName, emoji, fraction };
+}
+
 function computeSolunar(lat, lon) {
   const now = new Date();
   const hourOfDay = now.getHours() + now.getMinutes() / 60;
-  const moonPct = Math.round(50 + 50 * Math.sin((now.getDate() / 29.5) * Math.PI * 2));
+  const moon = computeMoonPhase(now);
   const majorHours = [6.5, 18.5];
   const nearMajor = majorHours.some(h => Math.abs(hourOfDay - h) < 1.5);
   const atMajor   = majorHours.some(h => Math.abs(hourOfDay - h) < 0.5);
   return {
     window: atMajor ? 'major_peak' : nearMajor ? 'major_near' : 'between',
-    moonPhase: moonPct > 85 || moonPct < 15 ? (moonPct > 50 ? 'full' : 'new') : 'other',
-    moonPct,
+    moonPhase: moon.phaseName.toLowerCase().includes('full') ? 'full' : moon.phaseName.toLowerCase().includes('new') ? 'new' : 'other',
+    moonPhaseName: moon.phaseName,
+    moonPhaseEmoji: moon.emoji,
+    moonPct: moon.illumPct,
     lightWindow: hourOfDay < 7.5 ? 'dawn' : hourOfDay > 19.5 ? 'dusk' : 'other',
     majorWindows: [{ label: 'MAJ', xPct: 0.28 }, { label: 'MAJ', xPct: 0.78 }],
   };
