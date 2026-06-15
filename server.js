@@ -178,24 +178,26 @@ app.post('/api/auth/google', async (req, res) => {
     const ticket  = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
     const payload = ticket.getPayload();
     if (!payload.email_verified) return res.status(403).json({ error: 'Google account email not verified' });
-    const user = { id: payload.sub, email: payload.email, name: payload.name ?? '', avatar: payload.picture ?? null, provider: 'google' };
+    const user = { id: payload.sub, email: payload.email, name: '', avatar: payload.picture ?? null, provider: 'google' };
 
-    // Upsert Google user
+    // Upsert Google user — never write `name` here; the app prompts every
+    // user for a display name regardless of auth provider.
     await pool.query(
-      `INSERT INTO users (google_id, email, name, avatar, points_balance, created_at)
-       VALUES ($1, $2, $3, $4, 0, NOW())
-       ON CONFLICT (google_id) DO UPDATE SET email=EXCLUDED.email, name=COALESCE(NULLIF(EXCLUDED.name, ''), users.name), avatar=EXCLUDED.avatar`,
-      [user.id, user.email, user.name, user.avatar]
+      `INSERT INTO users (google_id, email, avatar, points_balance, created_at)
+       VALUES ($1, $2, $3, 0, NOW())
+       ON CONFLICT (google_id) DO UPDATE SET email=EXCLUDED.email, avatar=EXCLUDED.avatar`,
+      [user.id, user.email, user.avatar]
     );
 
     // Get the Google user's DB row
     const { rows: [googleUser] } = await pool.query(
-      'SELECT id, points_balance FROM users WHERE google_id=$1', [user.id]
+      'SELECT id, points_balance, name FROM users WHERE google_id=$1', [user.id]
     );
 
     await mergeDeviceUser(deviceId, googleUser, 'google_id');
 
-    return res.json({ token: issueJwt(user), user });
+    user.name = googleUser.name ?? '';
+    return res.json({ token: issueJwt(user), user, needsName: !user.name });
   } catch (err) {
     console.error('[auth] Google verification failed:', err.message);
     return res.status(401).json({ error: 'Google token verification failed' });
@@ -240,26 +242,21 @@ async function verifyAppleIdentityToken(identityToken) {
 
 app.post('/api/auth/apple', async (req, res) => {
   try {
-    const { identityToken, fullName, email: clientEmail, deviceId } = req.body ?? {};
+    const { identityToken, email: clientEmail, deviceId } = req.body ?? {};
     if (!identityToken) return res.status(400).json({ error: 'identityToken required' });
 
     const payload = await verifyAppleIdentityToken(identityToken);
     const email = payload.email ?? clientEmail ?? null;
 
-    // fullName only present on first-ever sign-in with this Apple ID
-    let name = '';
-    if (fullName && (fullName.givenName || fullName.familyName)) {
-      name = [fullName.givenName, fullName.familyName].filter(Boolean).join(' ');
-    }
+    const user = { id: payload.sub, email, name: '', avatar: null, provider: 'apple' };
 
-    const user = { id: payload.sub, email, name, avatar: null, provider: 'apple' };
-
-    // Upsert Apple user — only overwrite name if we have a new non-empty one
+    // Upsert Apple user — never write `name` here; the app prompts every
+    // user for a display name regardless of auth provider.
     await pool.query(
-      `INSERT INTO users (apple_id, email, name, points_balance, created_at)
-       VALUES ($1, $2, $3, 0, NOW())
-       ON CONFLICT (apple_id) DO UPDATE SET email=COALESCE(EXCLUDED.email, users.email), name=COALESCE(NULLIF(EXCLUDED.name, ''), users.name)`,
-      [user.id, user.email, user.name]
+      `INSERT INTO users (apple_id, email, points_balance, created_at)
+       VALUES ($1, $2, 0, NOW())
+       ON CONFLICT (apple_id) DO UPDATE SET email=COALESCE(EXCLUDED.email, users.email)`,
+      [user.id, user.email]
     );
 
     const { rows: [appleUser] } = await pool.query(
@@ -268,11 +265,8 @@ app.post('/api/auth/apple', async (req, res) => {
 
     await mergeDeviceUser(deviceId, appleUser, 'apple_id');
 
-    // Return the stored name (in case this isn't the first login and we
-    // didn't get a fresh fullName from Apple)
-    user.name = appleUser.name ?? user.name;
-
-    return res.json({ token: issueJwt(user), user });
+    user.name = appleUser.name ?? '';
+    return res.json({ token: issueJwt(user), user, needsName: !user.name });
   } catch (err) {
     console.error('[auth] Apple verification failed:', err.message);
     return res.status(401).json({ error: 'Apple token verification failed' });
@@ -326,7 +320,7 @@ app.post('/api/auth/otp/send', async (req, res) => {
 
 app.post('/api/auth/otp/verify', async (req, res) => {
   try {
-    const { email, phone, code, name, deviceId } = req.body ?? {};
+    const { email, phone, code, deviceId } = req.body ?? {};
     const contact = email ?? phone;
     if (!contact || !code) return res.status(400).json({ error: 'email/phone and code required' });
 
@@ -349,20 +343,12 @@ app.post('/api/auth/otp/verify', async (req, res) => {
     let userRow;
     if (existingRows.length) {
       userRow = existingRows[0];
-      if (name && name.trim() && !userRow.name) {
-        await pool.query('UPDATE users SET name=$1 WHERE id=$2', [name.trim(), userRow.id]);
-        userRow.name = name.trim();
-      }
     } else {
-      if (!name || !name.trim()) {
-        // First-time user, no name yet — tell client to collect one
-        return res.json({ needsName: true });
-      }
-      const insertCols = email ? `auth_id, email, name` : `auth_id, phone, name`;
+      const insertCols = email ? `auth_id, email` : `auth_id, phone`;
       const { rows: [created] } = await pool.query(
         `INSERT INTO users (${insertCols}, points_balance, created_at)
-         VALUES ($1, $2, $3, 0, NOW()) RETURNING id, points_balance, name`,
-        [key, contact.trim(), name.trim()]
+         VALUES ($1, $2, 0, NOW()) RETURNING id, points_balance, name`,
+        [key, contact.trim()]
       );
       userRow = created;
     }
@@ -377,9 +363,27 @@ app.post('/api/auth/otp/verify', async (req, res) => {
 
     await mergeDeviceUser(deviceId, userRow, 'auth_id');
 
-    return res.json({ token: issueJwt(user), user });
+    return res.json({ token: issueJwt(user), user, needsName: !user.name });
   } catch (err) {
     console.error('[auth] OTP verify failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Set/update the user's display name. Used by the universal "What should we
+// call you?" prompt shown after first login regardless of auth provider.
+app.put('/api/auth/name', requireAuth, async (req, res) => {
+  try {
+    const { name } = req.body ?? {};
+    if (!name || !name.trim()) return res.status(400).json({ error: 'name required' });
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows } = await pool.query(
+      `UPDATE users SET name=$1 WHERE ${column}=$2 RETURNING id, name`,
+      [name.trim().slice(0, 40), req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ name: rows[0].name });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
