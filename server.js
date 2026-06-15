@@ -12,8 +12,17 @@ const JWT_SECRET       = process.env.JWT_SECRET;
 const googleClient     = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 function issueJwt(user) {
-  return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '90d' });
+  // `id` is the provider-specific identifier (google sub, apple sub, or
+  // email/phone for OTP users). `provider` tells getUserFromRequest which
+  // column to look the user up by.
+  return jwt.sign({ id: user.id, email: user.email, provider: user.provider }, JWT_SECRET, { expiresIn: '90d' });
 }
+
+const PROVIDER_COLUMN = {
+  google: 'google_id',
+  apple:  'apple_id',
+  otp:    'auth_id', // email or phone, normalized
+};
 
 function requireAuth(req, res, next) {
   const header = req.headers['authorization'] ?? '';
@@ -59,8 +68,9 @@ async function getUserFromRequest(req) {
   if (token) {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
+      const column = PROVIDER_COLUMN[decoded.provider] ?? 'google_id';
       const { rows } = await pool.query(
-        'SELECT id, points_balance FROM users WHERE google_id=$1 LIMIT 1',
+        `SELECT id, points_balance FROM users WHERE ${column}=$1 LIMIT 1`,
         [decoded.id]
       );
       if (rows.length) return rows[0];
@@ -125,6 +135,42 @@ app.get('/api/radar-tile', async (req, res) => {
   }
 });
 
+// Merge a guest/device-id account's catches and points into a newly
+// authenticated account (Google, Apple, or email/phone OTP). Generic across
+// providers — `idColumn` is the provider-specific column (google_id, apple_id,
+// auth_id) so we don't accidentally re-merge an account into itself.
+//
+// Requires DB migration for Apple + Email/Phone OTP support:
+//   ALTER TABLE users ADD COLUMN apple_id text UNIQUE;
+//   ALTER TABLE users ADD COLUMN auth_id  text UNIQUE; -- normalized email/phone for OTP users
+//   ALTER TABLE users ADD COLUMN phone    text;
+async function mergeDeviceUser(deviceId, targetUser, idColumn) {
+  if (!deviceId) return;
+  const { rows: deviceUsers } = await pool.query(
+    `SELECT id, points_balance FROM users WHERE device_id=$1 AND ${idColumn} IS NULL`, [deviceId]
+  );
+  if (!deviceUsers.length) return;
+  const deviceUser = deviceUsers[0];
+  if (deviceUser.id === targetUser.id) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE catches SET user_id=$1 WHERE user_id=$2', [targetUser.id, deviceUser.id]);
+    await client.query('UPDATE points_transactions SET user_id=$1 WHERE user_id=$2', [targetUser.id, deviceUser.id]);
+    await client.query('UPDATE users SET points_balance=points_balance+$1 WHERE id=$2', [deviceUser.points_balance, targetUser.id]);
+    await client.query('UPDATE users SET device_id=$1 WHERE id=$2', [deviceId, targetUser.id]);
+    await client.query('DELETE FROM users WHERE id=$1', [deviceUser.id]);
+    await client.query('COMMIT');
+    console.log(`[auth] Merged device user ${deviceUser.id} into user ${targetUser.id}`);
+  } catch (mergeErr) {
+    await client.query('ROLLBACK');
+    console.error('[auth] Merge failed (non-fatal):', mergeErr.message);
+  } finally {
+    client.release();
+  }
+}
+
 app.post('/api/auth/google', async (req, res) => {
   try {
     const { idToken, deviceId } = req.body ?? {};
@@ -132,13 +178,13 @@ app.post('/api/auth/google', async (req, res) => {
     const ticket  = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
     const payload = ticket.getPayload();
     if (!payload.email_verified) return res.status(403).json({ error: 'Google account email not verified' });
-    const user = { id: payload.sub, email: payload.email, name: payload.name ?? '', avatar: payload.picture ?? null };
+    const user = { id: payload.sub, email: payload.email, name: payload.name ?? '', avatar: payload.picture ?? null, provider: 'google' };
 
     // Upsert Google user
     await pool.query(
       `INSERT INTO users (google_id, email, name, avatar, points_balance, created_at)
        VALUES ($1, $2, $3, $4, 0, NOW())
-       ON CONFLICT (google_id) DO UPDATE SET email=EXCLUDED.email, name=EXCLUDED.name, avatar=EXCLUDED.avatar`,
+       ON CONFLICT (google_id) DO UPDATE SET email=EXCLUDED.email, name=COALESCE(NULLIF(EXCLUDED.name, ''), users.name), avatar=EXCLUDED.avatar`,
       [user.id, user.email, user.name, user.avatar]
     );
 
@@ -147,44 +193,194 @@ app.post('/api/auth/google', async (req, res) => {
       'SELECT id, points_balance FROM users WHERE google_id=$1', [user.id]
     );
 
-    // ── Merge device user catches + points into Google account ──────────────
-    // Only runs if deviceId sent and a device user exists (first login on this device)
-    if (deviceId) {
-      const { rows: deviceUsers } = await pool.query(
-        'SELECT id, points_balance FROM users WHERE device_id=$1 AND google_id IS NULL', [deviceId]
-      );
-      if (deviceUsers.length) {
-        const deviceUser = deviceUsers[0];
-        if (deviceUser.id !== googleUser.id) {
-          const client = await pool.connect();
-          try {
-            await client.query('BEGIN');
-            // Move catches to Google account
-            await client.query('UPDATE catches SET user_id=$1 WHERE user_id=$2', [googleUser.id, deviceUser.id]);
-            // Move points transactions
-            await client.query('UPDATE points_transactions SET user_id=$1 WHERE user_id=$2', [googleUser.id, deviceUser.id]);
-            // Add device user's points balance to Google account
-            await client.query('UPDATE users SET points_balance=points_balance+$1 WHERE id=$2', [deviceUser.points_balance, googleUser.id]);
-            // Link device_id to Google account so future guest sessions also merge
-            await client.query('UPDATE users SET device_id=$1 WHERE id=$2', [deviceId, googleUser.id]);
-            // Remove old device user
-            await client.query('DELETE FROM users WHERE id=$1', [deviceUser.id]);
-            await client.query('COMMIT');
-            console.log(`[auth] Merged device user ${deviceUser.id} into Google user ${googleUser.id}`);
-          } catch (mergeErr) {
-            await client.query('ROLLBACK');
-            console.error('[auth] Merge failed (non-fatal):', mergeErr.message);
-          } finally {
-            client.release();
-          }
-        }
-      }
-    }
+    await mergeDeviceUser(deviceId, googleUser, 'google_id');
 
     return res.json({ token: issueJwt(user), user });
   } catch (err) {
     console.error('[auth] Google verification failed:', err.message);
     return res.status(401).json({ error: 'Google token verification failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Apple Sign In
+//
+// Verifies the identityToken against Apple's published JWKS
+// (https://appleid.apple.com/auth/keys). `fullName` is only included by Apple
+// on the user's FIRST sign-in ever — we capture it then since it won't be sent
+// again on subsequent logins.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let appleJwksCache = null;
+let appleJwksFetchedAt = 0;
+
+async function getApplePublicKey(kid) {
+  if (!appleJwksCache || Date.now() - appleJwksFetchedAt > 24 * 3600 * 1000) {
+    const res = await fetch('https://appleid.apple.com/auth/keys', { signal: AbortSignal.timeout(5000) });
+    const data = await res.json();
+    appleJwksCache = data.keys ?? [];
+    appleJwksFetchedAt = Date.now();
+  }
+  const key = appleJwksCache.find(k => k.kid === kid);
+  if (!key) throw new Error('Apple signing key not found');
+  return crypto.createPublicKey({ key, format: 'jwk' });
+}
+
+async function verifyAppleIdentityToken(identityToken) {
+  const [headerB64] = identityToken.split('.');
+  const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8'));
+  const publicKey = await getApplePublicKey(header.kid);
+  const decoded = jwt.verify(identityToken, publicKey, {
+    algorithms: ['RS256'],
+    audience: process.env.APPLE_CLIENT_ID || 'com.bonetideco.app',
+    issuer: 'https://appleid.apple.com',
+  });
+  return decoded; // { sub, email, email_verified, ... }
+}
+
+app.post('/api/auth/apple', async (req, res) => {
+  try {
+    const { identityToken, fullName, email: clientEmail, deviceId } = req.body ?? {};
+    if (!identityToken) return res.status(400).json({ error: 'identityToken required' });
+
+    const payload = await verifyAppleIdentityToken(identityToken);
+    const email = payload.email ?? clientEmail ?? null;
+
+    // fullName only present on first-ever sign-in with this Apple ID
+    let name = '';
+    if (fullName && (fullName.givenName || fullName.familyName)) {
+      name = [fullName.givenName, fullName.familyName].filter(Boolean).join(' ');
+    }
+
+    const user = { id: payload.sub, email, name, avatar: null, provider: 'apple' };
+
+    // Upsert Apple user — only overwrite name if we have a new non-empty one
+    await pool.query(
+      `INSERT INTO users (apple_id, email, name, points_balance, created_at)
+       VALUES ($1, $2, $3, 0, NOW())
+       ON CONFLICT (apple_id) DO UPDATE SET email=COALESCE(EXCLUDED.email, users.email), name=COALESCE(NULLIF(EXCLUDED.name, ''), users.name)`,
+      [user.id, user.email, user.name]
+    );
+
+    const { rows: [appleUser] } = await pool.query(
+      'SELECT id, points_balance, name FROM users WHERE apple_id=$1', [user.id]
+    );
+
+    await mergeDeviceUser(deviceId, appleUser, 'apple_id');
+
+    // Return the stored name (in case this isn't the first login and we
+    // didn't get a fresh fullName from Apple)
+    user.name = appleUser.name ?? user.name;
+
+    return res.json({ token: issueJwt(user), user });
+  } catch (err) {
+    console.error('[auth] Apple verification failed:', err.message);
+    return res.status(401).json({ error: 'Apple token verification failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Email / Phone OTP
+//
+// NOTE: No email/SMS provider is currently configured. Codes are logged to the
+// server console as a stopgap so this is testable end-to-end during
+// development. Before shipping, wire a real provider:
+//   - Email: Resend, Postmark, or SendGrid
+//   - SMS:   Twilio
+// and replace the `console.log(...)` lines below with the actual send calls.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const otpCodes = new Map(); // key: normalized email/phone -> { code, expiresAt }
+
+function normalizeContact(value) {
+  return value.trim().toLowerCase();
+}
+
+function generateOtpCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+app.post('/api/auth/otp/send', async (req, res) => {
+  try {
+    const { email, phone } = req.body ?? {};
+    const contact = email ?? phone;
+    if (!contact) return res.status(400).json({ error: 'email or phone required' });
+
+    const key = normalizeContact(contact);
+    const code = generateOtpCode();
+    otpCodes.set(key, { code, expiresAt: Date.now() + 10 * 60 * 1000 });
+
+    if (email) {
+      // TODO: send via email provider (Resend/Postmark/SendGrid)
+      console.log(`[otp] Email code for ${email}: ${code}`);
+    } else {
+      // TODO: send via Twilio
+      console.log(`[otp] SMS code for ${phone}: ${code}`);
+    }
+
+    res.json({ sent: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/otp/verify', async (req, res) => {
+  try {
+    const { email, phone, code, name, deviceId } = req.body ?? {};
+    const contact = email ?? phone;
+    if (!contact || !code) return res.status(400).json({ error: 'email/phone and code required' });
+
+    const key = normalizeContact(contact);
+    const entry = otpCodes.get(key);
+    if (!entry || entry.code !== code.trim()) {
+      return res.status(401).json({ error: 'Invalid code' });
+    }
+    if (Date.now() > entry.expiresAt) {
+      otpCodes.delete(key);
+      return res.status(401).json({ error: 'Code expired, please request a new one' });
+    }
+    otpCodes.delete(key); // single-use
+
+    // Look up existing user by auth_id (normalized email/phone)
+    const { rows: existingRows } = await pool.query(
+      'SELECT id, points_balance, name FROM users WHERE auth_id=$1', [key]
+    );
+
+    let userRow;
+    if (existingRows.length) {
+      userRow = existingRows[0];
+      if (name && name.trim() && !userRow.name) {
+        await pool.query('UPDATE users SET name=$1 WHERE id=$2', [name.trim(), userRow.id]);
+        userRow.name = name.trim();
+      }
+    } else {
+      if (!name || !name.trim()) {
+        // First-time user, no name yet — tell client to collect one
+        return res.json({ needsName: true });
+      }
+      const insertCols = email ? `auth_id, email, name` : `auth_id, phone, name`;
+      const { rows: [created] } = await pool.query(
+        `INSERT INTO users (${insertCols}, points_balance, created_at)
+         VALUES ($1, $2, $3, 0, NOW()) RETURNING id, points_balance, name`,
+        [key, contact.trim(), name.trim()]
+      );
+      userRow = created;
+    }
+
+    const user = {
+      id: key,
+      email: email ?? null,
+      name: userRow.name ?? '',
+      avatar: null,
+      provider: 'otp',
+    };
+
+    await mergeDeviceUser(deviceId, userRow, 'auth_id');
+
+    return res.json({ token: issueJwt(user), user });
+  } catch (err) {
+    console.error('[auth] OTP verify failed:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
