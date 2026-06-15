@@ -383,6 +383,9 @@ const NDBC_BUOYS = [
   { id: '41010', lat: 28.91, lon: -78.47 },  // Canaveral East, FL
   { id: '41002', lat: 32.31, lon: -75.36 },  // South Hatteras
   { id: '41001', lat: 34.70, lon: -72.30 },  // East Hatteras
+  { id: '41112', lat: 30.71, lon: -81.29 },  // Fernandina Beach, FL
+  { id: '41117', lat: 32.66, lon: -78.99 },  // Georgetown, SC
+  { id: 'FPSN7',  lat: 33.49, lon: -78.02 }, // Frying Pan Shoals CMAN
   // Gulf of Mexico
   { id: '42036', lat: 28.50, lon: -84.52 },  // West Tampa
   { id: '42039', lat: 28.79, lon: -86.01 },  // Pensacola
@@ -469,26 +472,33 @@ function sortByDistance(stations, lat, lon) {
   }).sort((a, b) => a.distKm - b.distKm);
 }
 
-async function getNearestBuoyMarine(lat, lon) {
-  // Try curated buoy list first — fast, no extra fetch
-  const curated = sortByDistance(NDBC_BUOYS, lat, lon).slice(0, 6);
-  for (const buoy of curated) {
-    try {
+async function fetchBuoysInParallel(candidates) {
+  const results = await Promise.allSettled(
+    candidates.map(async (buoy) => {
       const wave = await fetchBuoyWaveData(buoy.id);
-      if (wave) return { ...wave, distMi: Math.round(buoy.distKm * 0.621), buoyId: buoy.id };
-    } catch {}
-  }
+      if (!wave) throw new Error('no data');
+      return { ...wave, distMi: Math.round(buoy.distKm * 0.621), buoyId: buoy.id, distKm: buoy.distKm };
+    })
+  );
+  const valid = results
+    .filter(r => r.status === 'fulfilled')
+    .map(r => r.value)
+    .sort((a, b) => a.distKm - b.distKm);
+  return valid[0] ?? null;
+}
+
+async function getNearestBuoyMarine(lat, lon) {
+  // Try curated buoy list first — fetch in parallel, pick closest with data
+  const curated = sortByDistance(NDBC_BUOYS, lat, lon).slice(0, 10);
+  const fromCurated = await fetchBuoysInParallel(curated);
+  if (fromCurated) return fromCurated;
+
   // Fall back to full NDBC station table for more candidates
   try {
     const stations = await getNdbcStations();
     if (stations.length) {
-      const nearby = sortByDistance(stations, lat, lon).slice(0, 8);
-      for (const buoy of nearby) {
-        try {
-          const wave = await fetchBuoyWaveData(buoy.id);
-          if (wave) return { ...wave, distMi: Math.round(buoy.distKm * 0.621), buoyId: buoy.id };
-        } catch {}
-      }
+      const nearby = sortByDistance(stations, lat, lon).slice(0, 12);
+      return await fetchBuoysInParallel(nearby);
     }
   } catch {}
   return null;
