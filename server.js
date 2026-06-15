@@ -202,8 +202,9 @@ app.post('/api/identify', async (req, res) => {
   const speciesList = REGION_SPECIES[region] ?? REGION_SPECIES.southeast;
   const prompt = `You are a marine biologist assistant for Bone Tide Co., a fishing app serving ${region} anglers.
 Identify the fish in this photo. Primary species to look for: ${speciesList.join(', ')}.
+Also assess whether this image is a PHOTO OF A SCREEN, PRINTED PHOTO, OR DIGITAL IMAGE (as opposed to a real-life photo taken directly of a fish). Look for: screen glare/reflections, moiré/pixel grid patterns, monitor or phone bezels visible in frame, glass/print texture, unnatural color banding, or a flat/2D appearance inconsistent with a hand-held catch photo.
 Respond ONLY with a valid JSON object, no markdown, no explanation:
-{"commonName":"string","latinName":"string","confidence":0.0,"inRegion":true,"habitat":"inshore","catchRelease":false,"notes":"string"}
+{"commonName":"string","latinName":"string","confidence":0.0,"inRegion":true,"habitat":"inshore","catchRelease":false,"notes":"string","isPhotoOfScreen":false,"screenCheckConfidence":0.0}
 If you cannot identify the fish with reasonable confidence, return confidence below 0.5.`;
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -215,6 +216,23 @@ If you cannot identify the fish with reasonable confidence, return confidence be
     if (data.error) throw new Error(data.error.message);
     const result = JSON.parse(data.content[0].text.replace(/```json|```/g, '').trim());
     result.fallbackImageUrl = null;
+
+    // Issue a short-lived signed scan token tied to this identify result.
+    // /api/catches must present this token to award points; it expires and
+    // can only be used once, and encodes the screen-check outcome so the
+    // points logic can't be bypassed by a client that omits the flag.
+    const scanToken = jwt.sign(
+      {
+        purpose:           'scan',
+        isPhotoOfScreen:   !!result.isPhotoOfScreen,
+        commonName:        result.commonName ?? null,
+        confidence:        result.confidence ?? 0,
+      },
+      JWT_SECRET,
+      { expiresIn: '5m' }
+    );
+    result.scanToken = scanToken;
+
     res.json(result);
   } catch (err) {
     console.error('Identify error:', err);
@@ -223,6 +241,7 @@ If you cannot identify the fish with reasonable confidence, return confidence be
 });
 
 const DAILY_CAP = 30, PTS_PER_CATCH = 10;
+const usedScanTokens = new Set(); // in-memory single-use tracking (resets on deploy/restart)
 
 app.post('/api/catches', async (req, res) => {
   const { species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken, imageUrl, isPublic } = req.body;
@@ -233,7 +252,38 @@ app.post('/api/catches', async (req, res) => {
     const { rows: todayRows } = await pool.query(`SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2`, [user.id, today]);
     const todayPts = parseInt(todayRows[0].total);
     const ptsLeft = Math.max(0, DAILY_CAP - todayPts);
-    const ptsAwarded = sessionToken && ptsLeft > 0 ? Math.min(PTS_PER_CATCH, ptsLeft) : 0;
+
+    // Verify the scan token issued by /api/identify. Points are only awarded
+    // if the token is valid, unexpired, unused, the species matches what was
+    // identified, and the screen-check did not flag this as a photo of a
+    // photo/screen.
+    let scanInfo = null;
+    let scanRejectReason = null;
+    if (sessionToken) {
+      try {
+        const decoded = jwt.verify(sessionToken, JWT_SECRET);
+        if (decoded.purpose !== 'scan') {
+          scanRejectReason = 'invalid token purpose';
+        } else if (usedScanTokens.has(sessionToken)) {
+          scanRejectReason = 'token already used';
+        } else if (decoded.isPhotoOfScreen) {
+          scanRejectReason = 'photo of screen/photo detected';
+        } else if (decoded.commonName && species && decoded.commonName.toLowerCase() !== species.toLowerCase()) {
+          scanRejectReason = 'species mismatch';
+        } else {
+          scanInfo = decoded;
+          usedScanTokens.add(sessionToken);
+        }
+      } catch {
+        scanRejectReason = 'invalid or expired token';
+      }
+    } else {
+      scanRejectReason = 'no scan token provided';
+    }
+
+    if (scanRejectReason) console.log(`Catch logged without points (user ${user.id}): ${scanRejectReason}`);
+
+    const ptsAwarded = scanInfo && ptsLeft > 0 ? Math.min(PTS_PER_CATCH, ptsLeft) : 0;
     const { rows: [newCatch] } = await pool.query(
       `INSERT INTO catches (user_id,species,length_in,released,bait,note,lat,lon,tide_height_ft,tide_direction,wind_kts,wind_direction,baro_in_hg,moon_pct,good_bite_score,pts_awarded,image_url,is_public,caught_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) RETURNING *`,
@@ -243,7 +293,7 @@ app.post('/api/catches', async (req, res) => {
       await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [ptsAwarded, user.id]);
       await pool.query(`INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'catch',$3,NOW())`, [user.id, ptsAwarded, newCatch.id.toString()]);
     }
-    res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap: DAILY_CAP });
+    res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap: DAILY_CAP, pointsRejectReason: scanRejectReason });
   } catch (err) {
     console.error('Log catch error:', err);
     res.status(500).json({ error: err.message });
