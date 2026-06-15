@@ -485,12 +485,14 @@ async function uploadAvatarToCloudinary(base64) {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   const uploadPreset = process.env.CLOUDINARY_UPLOAD_PRESET;
   if (!cloudName) throw new Error('Cloudinary not configured');
+  if (!uploadPreset) throw new Error('CLOUDINARY_UPLOAD_PRESET not configured');
 
   const form = new URLSearchParams();
   form.append('file', `data:image/jpeg;base64,${base64}`);
-  if (uploadPreset) form.append('upload_preset', uploadPreset);
-  // Crop to a square avatar, cap size, convert to webp for smaller payloads
-  form.append('transformation', 'c_fill,g_face,w_400,h_400,f_webp,q_auto:good');
+  form.append('upload_preset', uploadPreset);
+  // NOTE: `transformation` is not allowed on unsigned uploads — Cloudinary
+  // rejects it. Crop/resize is applied at delivery time instead, by
+  // inserting transformation params into the returned secure_url below.
 
   const res = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
     method: 'POST',
@@ -499,7 +501,11 @@ async function uploadAvatarToCloudinary(base64) {
   });
   const data = await res.json();
   if (!data.secure_url) throw new Error(data.error?.message ?? 'Avatar upload failed');
-  return data.secure_url;
+
+  // Insert delivery-time transformation: square crop centered on face,
+  // capped at 400px, webp output. Cloudinary applies transformations in
+  // delivery URLs by inserting them as a path segment after '/upload/'.
+  return data.secure_url.replace('/upload/', '/upload/c_fill,g_face,w_400,h_400,f_webp,q_auto:good/');
 }
 
 // Upload/replace the user's profile picture. Works for any auth provider.
