@@ -555,6 +555,76 @@ async function getNearestBuoyMarine(lat, lon) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tide-derived current estimate fallback
+//
+// Open-Meteo's ocean_current_velocity/direction has no coverage for inshore
+// estuary coordinates (returns null for most of the GA/SC/etc coast). NDBC
+// buoys don't report currents either. As a practical fallback, derive a rough
+// current speed + direction from the rate of change of the nearest NOAA tide
+// station's predicted water level: faster height change ≈ stronger current,
+// rising tide ≈ incoming/flood current, falling tide ≈ outgoing/ebb current.
+//
+// This is an approximation (real current strength varies by inlet geometry),
+// but gives anglers a directionally-useful "Incoming/Outgoing, ~X kts" reading
+// instead of a blank dash.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let tideStationListCache = null;
+
+async function getTideStationList() {
+  if (tideStationListCache) return tideStationListCache;
+  const res = await fetch(
+    'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions&units=english',
+    { signal: AbortSignal.timeout(5000) }
+  );
+  const data = await res.json();
+  tideStationListCache = (data.stations ?? []).map(s => ({ id: s.id, name: s.name, lat: s.lat, lon: s.lng }));
+  return tideStationListCache;
+}
+
+async function getTideDerivedCurrent(lat, lon) {
+  const stations = await getTideStationList();
+  if (!stations.length) return null;
+  const nearest = sortByDistance(stations, lat, lon)[0];
+  if (!nearest) return null;
+
+  const now = new Date();
+  const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
+  const end = new Date(now); end.setDate(end.getDate() + 1);
+  const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(now)}&end_date=${fmt(end)}&station=${nearest.id}&product=predictions&datum=MLLW&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+  const data = await res.json();
+  if (!data.predictions?.length) return null;
+
+  const predictions = data.predictions.map(p => ({ t: p.t, v: parseFloat(p.v) }));
+  const pad = n => String(n).padStart(2, '0');
+  const nowStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+
+  let beforePt = null, afterPt = null;
+  for (let i = 0; i < predictions.length - 1; i++) {
+    if (predictions[i].t <= nowStr && predictions[i+1].t > nowStr) { beforePt = predictions[i]; afterPt = predictions[i+1]; break; }
+  }
+  if (!beforePt || !afterPt) return null;
+
+  // Rate of height change per hour at current time (hourly interval data)
+  const rateFtPerHr = afterPt.v - beforePt.v;
+  const rising = rateFtPerHr > 0;
+
+  // Rough mapping: ~6ft swing over ~6hrs (max rate ~1 ft/hr) historically
+  // corresponds to inshore currents up to roughly 2-3 kts near inlets.
+  // Scale linearly and cap at a sane max.
+  const speedKts = Math.min(2.5, Math.round(Math.abs(rateFtPerHr) * 2 * 10) / 10);
+
+  return {
+    currentSpeedKts: speedKts,
+    currentDirection: rising ? 'Incoming' : 'Outgoing',
+    stationId: nearest.id,
+    stationName: nearest.name,
+    distKm: nearest.distKm,
+  };
+}
+
 const marineCache = new Map();
 
 app.get('/api/marine', async (req, res) => {
@@ -584,8 +654,26 @@ app.get('/api/marine', async (req, res) => {
     const round0 = v => v != null ? Math.round(v) : null;
 
     // Ocean current velocity from Open-Meteo is already in knots
-    const currentSpeedKts = round1(mc.ocean_current_velocity ?? null);
-    const currentDirDeg   = round0(mc.ocean_current_direction ?? null);
+    let currentSpeedKts = round1(mc.ocean_current_velocity ?? null);
+    let currentDirDeg   = round0(mc.ocean_current_direction ?? null);
+    let currentSource   = 'open-meteo-marine';
+    let currentLabel    = null; // "Incoming"/"Outgoing" from tide-derived fallback
+
+    // ── Tide-derived current fallback ─────────────────────────────────────────
+    // Open-Meteo marine model has no ocean current data for inshore/estuary
+    // coords. Estimate from the nearest NOAA tide station's rate of change.
+    if (currentSpeedKts == null) {
+      try {
+        const tideCurrent = await getTideDerivedCurrent(lat, lon);
+        if (tideCurrent) {
+          currentSpeedKts = tideCurrent.currentSpeedKts;
+          currentLabel    = tideCurrent.currentDirection;
+          currentSource   = `tide-derived-${tideCurrent.stationId}`;
+        }
+      } catch (tideErr) {
+        console.warn('Tide-derived current fallback failed:', tideErr.message);
+      }
+    }
 
     // Sea surface temp from Open-Meteo is in °C
     let waterTempF = mc.sea_surface_temperature != null
@@ -659,6 +747,9 @@ app.get('/api/marine', async (req, res) => {
       currentSpeedKts,
       currentDirection:     currentDirDeg,
       currentDirectionCard: currentDirDeg != null ? degreesToCardinal(currentDirDeg) : null,
+      // "Incoming"/"Outgoing" label, populated when using the tide-derived
+      // fallback (no compass direction available, only flood/ebb direction)
+      currentLabel,
 
       // Waves
       waveHeightFt,
@@ -683,7 +774,7 @@ app.get('/api/marine', async (req, res) => {
       windDirCard:  null,
 
       fetchedAt: new Date().toISOString(),
-      source: buoyData ? `open-meteo-marine+ndbc-${buoyData.buoyId}` : 'open-meteo-marine',
+      source: buoyData ? `open-meteo-marine+ndbc-${buoyData.buoyId}+${currentSource}` : currentSource,
     };
 
     marineCache.set(cacheKey, { data, fetchedAt: Date.now() });
