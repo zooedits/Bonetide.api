@@ -370,6 +370,21 @@ app.post('/api/auth/otp/verify', async (req, res) => {
   }
 });
 
+// Returns the current user's profile (name, avatar, email) for the
+// authenticated provider. Used by Settings to show current values.
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows } = await pool.query(
+      `SELECT name, avatar, email, points_balance FROM users WHERE ${column}=$1`, [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Set/update the user's display name. Used by the universal "What should we
 // call you?" prompt shown after first login regardless of auth provider.
 app.put('/api/auth/name', requireAuth, async (req, res) => {
@@ -383,6 +398,69 @@ app.put('/api/auth/name', requireAuth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({ name: rows[0].name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Profile avatar
+//
+// NOTE: this assumes a Cloudinary (or similar) image-upload helper already
+// exists in this file for catch photos (`/api/upload-image`). If so, replace
+// `uploadAvatarToCloudinary` below with that shared helper so both endpoints
+// use the same Cloudinary config/credentials — this is a thin standalone
+// implementation in case that helper isn't visible in this version of the file.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function uploadAvatarToCloudinary(base64) {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const uploadPreset = process.env.CLOUDINARY_UPLOAD_PRESET;
+  if (!cloudName) throw new Error('Cloudinary not configured');
+
+  const form = new URLSearchParams();
+  form.append('file', `data:image/jpeg;base64,${base64}`);
+  if (uploadPreset) form.append('upload_preset', uploadPreset);
+  // Crop to a square avatar, cap size, convert to webp for smaller payloads
+  form.append('transformation', 'c_fill,g_face,w_400,h_400,f_webp,q_auto:good');
+
+  const res = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form,
+  });
+  const data = await res.json();
+  if (!data.secure_url) throw new Error(data.error?.message ?? 'Avatar upload failed');
+  return data.secure_url;
+}
+
+// Upload/replace the user's profile picture. Works for any auth provider.
+app.put('/api/auth/avatar', requireAuth, async (req, res) => {
+  try {
+    const { imageBase64 } = req.body ?? {};
+    if (!imageBase64) return res.status(400).json({ error: 'imageBase64 required' });
+
+    const url = await uploadAvatarToCloudinary(imageBase64);
+
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows } = await pool.query(
+      `UPDATE users SET avatar=$1 WHERE ${column}=$2 RETURNING id, avatar`,
+      [url, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ avatar: rows[0].avatar });
+  } catch (err) {
+    console.error('[avatar] Upload failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Remove the user's profile picture (revert to default placeholder)
+app.delete('/api/auth/avatar', requireAuth, async (req, res) => {
+  try {
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    await pool.query(`UPDATE users SET avatar=NULL WHERE ${column}=$1`, [req.user.id]);
+    res.json({ avatar: null });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
