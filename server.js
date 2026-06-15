@@ -301,18 +301,105 @@ app.post('/api/catches', async (req, res) => {
 });
 
 app.get('/api/catches', async (req, res) => {
-  const { page=1, limit=20 } = req.query;
+  const { page=1, limit=20, community } = req.query;
   try {
-    const user = await getUserFromRequest(req);
     const offset = (parseInt(page)-1)*parseInt(limit);
+
+    if (community === 'true') {
+      // Community feed: catches from users who opted in to share_with_community.
+      // Exact lat/lon is jittered (~0.3-0.8 mile randomized offset, deterministic
+      // per-catch so it doesn't jump around on refresh) so exact spots aren't
+      // exposed. Angler name is included only if that user has NOT enabled
+      // anonymize_shared.
+      const { rows } = await pool.query(
+        `SELECT c.*, u.name AS user_name, u.anonymize_shared
+         FROM catches c
+         JOIN users u ON u.id = c.user_id
+         WHERE u.share_with_community = true
+         ORDER BY c.caught_at DESC LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      );
+      const catches = rows.map(row => {
+        const formatted = formatCatch(row);
+        if (formatted.lat != null && formatted.lon != null) {
+          const jittered = jitterCoords(formatted.lat, formatted.lon, row.id);
+          formatted.lat = jittered.lat;
+          formatted.lon = jittered.lon;
+        }
+        formatted.anglerName = row.anonymize_shared ? null : (row.user_name ?? null);
+        return formatted;
+      });
+      return res.json({ catches, page: parseInt(page) });
+    }
+
+    // Default: the requesting user's own catches (exact coords, no jitter)
+    const user = await getUserFromRequest(req);
     const { rows } = await pool.query(`SELECT * FROM catches WHERE user_id=$1 ORDER BY caught_at DESC LIMIT $2 OFFSET $3`, [user.id, limit, offset]);
     res.json({ catches: rows.map(formatCatch), page: parseInt(page) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Deterministic small jitter based on catch id so a given catch's pin doesn't
+// move between refreshes, but exact coordinates are never exposed publicly.
+function jitterCoords(lat, lon, seed) {
+  const hash = crypto.createHash('md5').update(String(seed)).digest();
+  // Two pseudo-random values in [-1, 1] from the hash bytes
+  const r1 = (hash[0] / 255) * 2 - 1;
+  const r2 = (hash[1] / 255) * 2 - 1;
+  // ~0.3-0.8 miles ≈ 0.0044-0.0116 degrees latitude
+  const offsetLat = r1 * 0.011;
+  const offsetLon = r2 * 0.011;
+  return {
+    lat: Math.round((lat + offsetLat) * 1e6) / 1e6,
+    lon: Math.round((lon + offsetLon) * 1e6) / 1e6,
+  };
+}
+
 function formatCatch(row) {
   return { id: row.id, species: row.species, lengthIn: row.length_in, released: row.released, bait: row.bait, note: row.note, lat: row.lat, lon: row.lon, tideHeightFt: row.tide_height_ft, tideDirection: row.tide_direction, windKts: row.wind_kts, windDirection: row.wind_direction, baroInHg: row.baro_in_hg, moonPct: row.moon_pct, goodBiteScore: row.good_bite_score, ptsAwarded: row.pts_awarded, imageUrl: row.image_url ?? null, isPublic: row.is_public ?? false, caughtAt: row.caught_at };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Privacy preferences — community catch sharing + anonymization
+//
+// Requires DB migration:
+//   ALTER TABLE users ADD COLUMN share_with_community boolean DEFAULT false;
+//   ALTER TABLE users ADD COLUMN anonymize_shared      boolean DEFAULT true;
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/privacy-prefs', async (req, res) => {
+  try {
+    const user = await getUserFromRequest(req);
+    const { rows } = await pool.query(
+      `SELECT share_with_community, anonymize_shared FROM users WHERE id=$1`, [user.id]
+    );
+    const row = rows[0] ?? {};
+    res.json({
+      shareWithCommunity: row.share_with_community ?? false,
+      anonymizeShared:    row.anonymize_shared ?? true,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/privacy-prefs', async (req, res) => {
+  const { shareWithCommunity, anonymizeShared } = req.body;
+  try {
+    const user = await getUserFromRequest(req);
+    const { rows } = await pool.query(
+      `UPDATE users SET
+         share_with_community = COALESCE($1, share_with_community),
+         anonymize_shared      = COALESCE($2, anonymize_shared)
+       WHERE id=$3
+       RETURNING share_with_community, anonymize_shared`,
+      [shareWithCommunity ?? null, anonymizeShared ?? null, user.id]
+    );
+    const row = rows[0] ?? {};
+    res.json({
+      shareWithCommunity: row.share_with_community ?? false,
+      anonymizeShared:    row.anonymize_shared ?? true,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 const tidePredictionsCache = new Map();
 
