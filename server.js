@@ -376,10 +376,78 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     const { rows } = await pool.query(
-      `SELECT name, avatar, email, points_balance FROM users WHERE ${column}=$1`, [req.user.id]
+      `SELECT name, avatar, email, points_balance, birthday_month FROM users WHERE ${column}=$1`, [req.user.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Set/update the user's birthday month (1-12, or null to clear). Month-only —
+// no day/year collected — used solely to award a birthday-month points bonus.
+//
+// Requires DB migration:
+//   ALTER TABLE users ADD COLUMN birthday_month smallint;
+//   ALTER TABLE users ADD COLUMN birthday_bonus_year smallint;
+app.put('/api/auth/birthday-month', requireAuth, async (req, res) => {
+  try {
+    const { birthdayMonth } = req.body ?? {};
+    const month = birthdayMonth === null ? null : parseInt(birthdayMonth);
+    if (month !== null && (isNaN(month) || month < 1 || month > 12)) {
+      return res.status(400).json({ error: 'birthdayMonth must be 1-12 or null' });
+    }
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows } = await pool.query(
+      `UPDATE users SET birthday_month=$1 WHERE ${column}=$2 RETURNING birthday_month`,
+      [month, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ birthdayMonth: rows[0].birthday_month });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Claim the birthday-month points bonus. Idempotent per calendar year — safe
+// to call on every app open; only awards once per year when the current
+// month matches the user's stored birthday_month.
+//
+// Requires DB migration:
+//   ALTER TABLE users ADD COLUMN birthday_bonus_year smallint;
+const BIRTHDAY_BONUS_PTS = 100;
+
+app.post('/api/auth/birthday-bonus/claim', requireAuth, async (req, res) => {
+  try {
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows } = await pool.query(
+      `SELECT id, birthday_month, birthday_bonus_year FROM users WHERE ${column}=$1`, [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    const userRow = rows[0];
+
+    const now = new Date();
+    const currentMonth = now.getMonth() + 1;
+    const currentYear  = now.getFullYear();
+
+    if (userRow.birthday_month !== currentMonth) {
+      return res.json({ awarded: false });
+    }
+    if (userRow.birthday_bonus_year === currentYear) {
+      return res.json({ awarded: false }); // already claimed this year
+    }
+
+    await pool.query(
+      `UPDATE users SET points_balance=points_balance+$1, birthday_bonus_year=$2 WHERE id=$3`,
+      [BIRTHDAY_BONUS_PTS, currentYear, userRow.id]
+    );
+    await pool.query(
+      `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'birthday_bonus',$3,NOW())`,
+      [userRow.id, BIRTHDAY_BONUS_PTS, currentYear.toString()]
+    );
+
+    res.json({ awarded: true, points: BIRTHDAY_BONUS_PTS });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
