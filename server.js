@@ -780,10 +780,24 @@ app.get('/api/tides', async (req, res) => {
       const end   = new Date(today);
       end.setDate(end.getDate() + parseInt(days));
       const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
-      const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${station}&product=predictions&datum=MLLW&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
-      const response = await fetch(url);
-      const noaaData = await response.json();
-      if (!noaaData.predictions) throw new Error(noaaData.error?.message ?? 'NOAA returned no predictions');
+
+      // Not all NOAA stations support every datum. Smaller/secondary
+      // stations (e.g. some near Tybee Island) may only report MSL or
+      // STND rather than MLLW. Try in order of preference, falling
+      // through on NOAA's "datum input is valid" error.
+      const datums = ['MLLW', 'MSL', 'STND'];
+      let noaaData = null;
+      let lastErr = null;
+
+      for (const datum of datums) {
+        const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${station}&product=predictions&datum=${datum}&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
+        const response = await fetch(url);
+        const data = await response.json();
+        if (data.predictions) { noaaData = data; break; }
+        lastErr = data.error?.message ?? 'NOAA returned no predictions';
+      }
+
+      if (!noaaData) throw new Error(lastErr ?? 'NOAA returned no predictions for any supported datum');
       predictions = noaaData.predictions.map(p => ({ t: p.t, v: parseFloat(p.v) }));
       tidePredictionsCache.set(station, { predictions, fetchedAt: Date.now() });
     } catch (err) {
