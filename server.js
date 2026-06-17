@@ -769,7 +769,17 @@ app.put('/api/privacy-prefs', async (req, res) => {
 const tidePredictionsCache = new Map();
 
 app.get('/api/tides', async (req, res) => {
-  const { station = '8677344', days = 7 } = req.query;
+  const { station, days = 7 } = req.query;
+
+  // No station provided yet (e.g. fresh install, user hasn't enabled GPS or
+  // picked a location) — return a clean "no data" shape rather than
+  // defaulting to a specific station. Defaulting silently to one station
+  // (e.g. St. Simons Sound) would show misleading tide data to every user
+  // who hasn't actually chosen a location.
+  if (!station) {
+    return res.json({ available: false, reason: 'no_station_selected', predictions: [] });
+  }
+
   const cached = tidePredictionsCache.get(station);
   let predictions;
   if (cached && (Date.now() - cached.fetchedAt) < 6 * 3600 * 1000) {
@@ -781,48 +791,38 @@ app.get('/api/tides', async (req, res) => {
       end.setDate(end.getDate() + parseInt(days));
       const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
 
-      // Not all NOAA stations support every datum, and some stations
-      // (notably "subordinate" stations like 8677344 St. Simons Sound,
-      // which derives from control station 8670870 Fort Pulaski) aren't
-      // supported by the live predictions datagetter API at all, even
-      // though NOAA's website displays tide predictions for them via a
-      // different computation path. Try datums first, then fall back to a
-      // known-good primary station if the requested station has no
-      // predictions support whatsoever.
+      // Not all NOAA stations support every datum, and some stations are
+      // "subordinate" stations that aren't supported by the live predictions
+      // datagetter API at all, even though NOAA's website displays
+      // predictions for them via a different computation path. Try datums
+      // in order of preference; if none work, this station genuinely has no
+      // live predictions available.
       const datums = ['MLLW', 'MSL', 'STND'];
       let noaaData = null;
       let lastErr = null;
-      let effectiveStation = station;
 
-      const tryStation = async (stationId) => {
-        for (const datum of datums) {
-          const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${stationId}&product=predictions&datum=${datum}&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
-          const response = await fetch(url);
-          const data = await response.json();
-          if (data.predictions) return data;
-          lastErr = data.error?.message ?? 'NOAA returned no predictions';
-        }
-        return null;
-      };
-
-      noaaData = await tryStation(station);
-
-      // Known subordinate-station -> primary/control-station fallbacks.
-      // Add more pairs here as they're discovered.
-      const SUBORDINATE_FALLBACK = {
-        '8677344': '8670870', // St. Simons Sound -> Fort Pulaski, GA
-      };
-      if (!noaaData && SUBORDINATE_FALLBACK[station]) {
-        effectiveStation = SUBORDINATE_FALLBACK[station];
-        noaaData = await tryStation(effectiveStation);
+      for (const datum of datums) {
+        const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${station}&product=predictions&datum=${datum}&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
+        const response = await fetch(url);
+        const data = await response.json();
+        if (data.predictions) { noaaData = data; break; }
+        lastErr = data.error?.message ?? 'NOAA returned no predictions';
       }
 
-      if (!noaaData) throw new Error(lastErr ?? 'NOAA returned no predictions for any supported datum');
+      if (!noaaData) {
+        // Station has no usable predictions under any datum. Return a clean
+        // "unavailable" response (not a 500) so the app can prompt the user
+        // to pick a different station instead of showing a hard error.
+        console.warn(`Tides unavailable for station ${station}: ${lastErr}`);
+        return res.json({ available: false, reason: 'station_unsupported', stationId: station, predictions: [] });
+      }
       predictions = noaaData.predictions.map(p => ({ t: p.t, v: parseFloat(p.v) }));
       tidePredictionsCache.set(station, { predictions, fetchedAt: Date.now() });
     } catch (err) {
       console.error('Tides error:', err);
-      return res.status(500).json({ error: err.message });
+      // Network/unexpected error — still return a clean shape rather than a
+      // hard 500, so the app can show a "try again" state instead of crashing.
+      return res.json({ available: false, reason: 'fetch_error', error: err.message, predictions: [] });
     }
   }
   const now = new Date();
