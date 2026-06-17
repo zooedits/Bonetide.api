@@ -781,20 +781,40 @@ app.get('/api/tides', async (req, res) => {
       end.setDate(end.getDate() + parseInt(days));
       const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
 
-      // Not all NOAA stations support every datum. Smaller/secondary
-      // stations (e.g. some near Tybee Island) may only report MSL or
-      // STND rather than MLLW. Try in order of preference, falling
-      // through on NOAA's "datum input is valid" error.
+      // Not all NOAA stations support every datum, and some stations
+      // (notably "subordinate" stations like 8677344 St. Simons Sound,
+      // which derives from control station 8670870 Fort Pulaski) aren't
+      // supported by the live predictions datagetter API at all, even
+      // though NOAA's website displays tide predictions for them via a
+      // different computation path. Try datums first, then fall back to a
+      // known-good primary station if the requested station has no
+      // predictions support whatsoever.
       const datums = ['MLLW', 'MSL', 'STND'];
       let noaaData = null;
       let lastErr = null;
+      let effectiveStation = station;
 
-      for (const datum of datums) {
-        const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${station}&product=predictions&datum=${datum}&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
-        const response = await fetch(url);
-        const data = await response.json();
-        if (data.predictions) { noaaData = data; break; }
-        lastErr = data.error?.message ?? 'NOAA returned no predictions';
+      const tryStation = async (stationId) => {
+        for (const datum of datums) {
+          const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${stationId}&product=predictions&datum=${datum}&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
+          const response = await fetch(url);
+          const data = await response.json();
+          if (data.predictions) return data;
+          lastErr = data.error?.message ?? 'NOAA returned no predictions';
+        }
+        return null;
+      };
+
+      noaaData = await tryStation(station);
+
+      // Known subordinate-station -> primary/control-station fallbacks.
+      // Add more pairs here as they're discovered.
+      const SUBORDINATE_FALLBACK = {
+        '8677344': '8670870', // St. Simons Sound -> Fort Pulaski, GA
+      };
+      if (!noaaData && SUBORDINATE_FALLBACK[station]) {
+        effectiveStation = SUBORDINATE_FALLBACK[station];
+        noaaData = await tryStation(effectiveStation);
       }
 
       if (!noaaData) throw new Error(lastErr ?? 'NOAA returned no predictions for any supported datum');
