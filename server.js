@@ -481,7 +481,7 @@ app.put('/api/auth/name', requireAuth, async (req, res) => {
 // implementation in case that helper isn't visible in this version of the file.
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function uploadAvatarToCloudinary(base64) {
+async function uploadImageToCloudinary(base64, { folder, transformation }) {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   const apiKey    = process.env.CLOUDINARY_API_KEY;
   const apiSecret = process.env.CLOUDINARY_API_SECRET;
@@ -492,7 +492,6 @@ async function uploadAvatarToCloudinary(base64) {
   // alphabetically sorted "key=value" pairs joined with '&', SHA1 hashed with
   // the secret appended.
   const timestamp = Math.floor(Date.now() / 1000);
-  const folder = 'avatars';
   const paramsToSign = { folder, timestamp };
   const signatureBase = Object.keys(paramsToSign)
     .sort()
@@ -513,12 +512,26 @@ async function uploadAvatarToCloudinary(base64) {
     body: form,
   });
   const data = await res.json();
-  if (!data.secure_url) throw new Error(data.error?.message ?? 'Avatar upload failed');
+  if (!data.secure_url) throw new Error(data.error?.message ?? 'Image upload failed');
+  return data.secure_url.replace('/upload/', `/upload/${transformation}/`);
+}
 
-  // Insert delivery-time transformation: square crop centered on face,
-  // capped at 400px, webp output. Cloudinary applies transformations in
-  // delivery URLs by inserting them as a path segment after '/upload/'.
-  return data.secure_url.replace('/upload/', '/upload/c_fill,g_face,w_400,h_400,f_webp,q_auto:good/');
+async function uploadAvatarToCloudinary(base64) {
+  // Square crop centered on face, capped at 400px, webp output.
+  return uploadImageToCloudinary(base64, {
+    folder: 'avatars',
+    transformation: 'c_fill,g_face,w_400,h_400,f_webp,q_auto:good',
+  });
+}
+
+// Spot reference photos are landscape/water shots, not faces — wider aspect,
+// no face-detection gravity, a bit more resolution since these are meant to
+// be looked at as a real reference rather than a small avatar thumbnail.
+async function uploadSpotPhotoToCloudinary(base64) {
+  return uploadImageToCloudinary(base64, {
+    folder: 'spots',
+    transformation: 'c_fill,w_1000,h_750,f_webp,q_auto:good',
+  });
 }
 
 // Upload/replace the user's profile picture. Works for any auth provider.
@@ -722,6 +735,108 @@ function jitterCoords(lat, lon, seed) {
 
 function formatCatch(row) {
   return { id: row.id, species: row.species, lengthIn: row.length_in, released: row.released, bait: row.bait, note: row.note, lat: row.lat, lon: row.lon, tideHeightFt: row.tide_height_ft, tideDirection: row.tide_direction, windKts: row.wind_kts, windDirection: row.wind_direction, baroInHg: row.baro_in_hg, moonPct: row.moon_pct, goodBiteScore: row.good_bite_score, ptsAwarded: row.pts_awarded, imageUrl: row.image_url ?? null, isPublic: row.is_public ?? false, caughtAt: row.caught_at };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spots — personal + community fishing spots
+//
+// Requires DB migration:
+//   CREATE TABLE IF NOT EXISTS spots (
+//     id          SERIAL PRIMARY KEY,
+//     user_id     INTEGER NOT NULL REFERENCES users(id),
+//     name        TEXT NOT NULL,
+//     type        TEXT,
+//     note        TEXT,
+//     lat         DOUBLE PRECISION NOT NULL,
+//     lon         DOUBLE PRECISION NOT NULL,
+//     photo_url   TEXT,
+//     is_private  BOOLEAN DEFAULT true,
+//     created_at  TIMESTAMPTZ DEFAULT NOW()
+//   );
+//
+// Design notes (flagging these since they're judgment calls, not given):
+//   - Privacy is set per-spot at creation (matching the client's existing
+//     toggle), not a user-level setting the way share_with_community works
+//     for catches. Private spots never reach this table or this endpoint at
+//     all — they stay device-local, exactly as they do today.
+//   - Spot coordinates are NOT jittered, unlike community catches. Fuzzing
+//     the location would defeat the point of sharing a fishing spot — if
+//     that's wrong, jitterCoords() above is right there to reuse.
+//   - Like catches, creation accepts a deviceId fallback so guests can
+//     create spots, and the community read requires no auth so guests can
+//     browse it too.
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/api/spots', async (req, res) => {
+  const { name, type, note, lat, lon, isPrivate, photoBase64 } = req.body;
+  if (!name || lat == null || lon == null) return res.status(400).json({ error: 'name, lat, lon required' });
+  try {
+    const user = await getUserFromRequest(req);
+    let photoUrl = null;
+    if (photoBase64) {
+      try { photoUrl = await uploadSpotPhotoToCloudinary(photoBase64); }
+      catch (err) { console.error('[spots] Photo upload failed:', err.message); }
+    }
+    const { rows: [newSpot] } = await pool.query(
+      `INSERT INTO spots (user_id,name,type,note,lat,lon,photo_url,is_private,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) RETURNING *`,
+      [user.id, name, type ?? null, note ?? null, lat, lon, photoUrl, isPrivate ?? true]
+    );
+    res.json({ spot: formatSpot(newSpot) });
+  } catch (err) {
+    console.error('Create spot error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/spots', async (req, res) => {
+  const { page = 1, limit = 50, community } = req.query;
+  try {
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+
+    if (community === 'true') {
+      // Community feed: only spots explicitly marked shared. No auth
+      // required, matching the community catches feed, so guests can
+      // browse it too.
+      const { rows } = await pool.query(
+        `SELECT s.*, u.name AS user_name, u.anonymize_shared
+         FROM spots s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.is_private = false
+         ORDER BY s.created_at DESC LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      );
+      const spots = rows.map(row => {
+        const formatted = formatSpot(row);
+        formatted.anglerName = row.anonymize_shared ? null : (row.user_name ?? null);
+        return formatted;
+      });
+      return res.json({ spots, page: parseInt(page) });
+    }
+
+    // Default: the requesting user's own shared spots. Private spots never
+    // reach this table, so this only ever returns what that user chose to
+    // share — useful for managing/deleting shared spots across devices.
+    const user = await getUserFromRequest(req);
+    const { rows } = await pool.query(`SELECT * FROM spots WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`, [user.id, limit, offset]);
+    res.json({ spots: rows.map(formatSpot), page: parseInt(page) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/spots/:id', async (req, res) => {
+  try {
+    const user = await getUserFromRequest(req);
+    const { rows } = await pool.query(`DELETE FROM spots WHERE id=$1 AND user_id=$2 RETURNING id`, [req.params.id, user.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Spot not found' });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// photoUri (not photo_url) on purpose — matches the field name the client
+// already uses for locally-stored spot photos, so SpotDetailSheet renders
+// a community spot's photo with zero extra mapping logic.
+function formatSpot(row) {
+  return { id: row.id, name: row.name, type: row.type, note: row.note, lat: row.lat, lon: row.lon, photoUri: row.photo_url, isPrivate: row.is_private, createdAt: row.created_at };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
