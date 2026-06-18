@@ -981,7 +981,7 @@ app.get('/api/conditions', async (req, res) => {
   try {
     const [marineRes, forecastRes] = await Promise.all([
       fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=wave_height,wave_period,wave_direction&wind_speed_unit=kn&length_unit=imperial`),
-      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
+      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation_probability&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
     ]);
     const marine = await marineRes.json();
     const forecast = await forecastRes.json();
@@ -989,6 +989,24 @@ app.get('/api/conditions', async (req, res) => {
     const windKts = cur?.wind_speed_10m ?? 0;
     const windDir = degreesToCardinal(cur?.wind_direction_10m ?? 0);
     const pressHpa = cur?.surface_pressure ?? 1013;
+
+    // Hourly: 10 hours starting from "now" — Open-Meteo's hourly.time array
+    // covers several days, so find the first entry at/after current.time
+    // (both in the same timezone-adjusted reference, since both come from
+    // the same request) rather than assuming index 0 is the current hour.
+    const hourlyTimes = forecast.hourly?.time ?? [];
+    const nowIdx = Math.max(0, hourlyTimes.findIndex(t => t >= cur?.time));
+    const hourly = [];
+    for (let i = nowIdx; i < Math.min(nowIdx + 10, hourlyTimes.length); i++) {
+      hourly.push({
+        time:         forecast.hourly.time[i],
+        tempF:        Math.round(forecast.hourly.temperature_2m?.[i] ?? cur?.temperature_2m ?? 80),
+        windKts:      Math.round(forecast.hourly.wind_speed_10m?.[i] ?? 0),
+        windDirection: degreesToCardinal(forecast.hourly.wind_direction_10m?.[i] ?? 0),
+        precipChance: forecast.hourly.precipitation_probability?.[i] ?? null,
+      });
+    }
+
     const data = {
       wind: { speedKts: Math.round(windKts), direction: windDir, directionDeg: cur?.wind_direction_10m ?? 0, speedCategory: windCategory(windKts), gustKts: Math.round(windKts * 1.3) },
       pressure: { inHg: parseFloat((pressHpa * 0.02953).toFixed(2)), trend: 'stable' },
@@ -1002,6 +1020,7 @@ app.get('/api/conditions', async (req, res) => {
       sunrise: forecast.daily?.sunrise?.[0] ? new Date(forecast.daily.sunrise[0]).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '6:30 AM',
       sunset:  forecast.daily?.sunset?.[0]  ? new Date(forecast.daily.sunset[0]).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '8:00 PM',
       solunar: computeSolunar(parseFloat(lat), parseFloat(lon)),
+      hourly,
     };
     conditionsCache.set(cacheKey, { data, fetchedAt: Date.now() });
     res.json(data);
