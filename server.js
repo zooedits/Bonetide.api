@@ -840,6 +840,226 @@ function formatSpot(row) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Likes + Comments — community spots & catches
+//
+// Requires DB migration:
+//   CREATE TABLE IF NOT EXISTS likes (
+//     id          SERIAL PRIMARY KEY,
+//     user_id     INTEGER NOT NULL REFERENCES users(id),
+//     target_type TEXT NOT NULL,              -- 'spot' | 'catch'
+//     target_id   INTEGER NOT NULL,
+//     created_at  TIMESTAMPTZ DEFAULT NOW(),
+//     UNIQUE(user_id, target_type, target_id)
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_likes_target ON likes(target_type, target_id);
+//
+//   CREATE TABLE IF NOT EXISTS comments (
+//     id                SERIAL PRIMARY KEY,
+//     user_id           INTEGER NOT NULL REFERENCES users(id),
+//     target_type       TEXT NOT NULL,         -- 'spot' | 'catch'
+//     target_id         INTEGER NOT NULL,
+//     parent_comment_id INTEGER REFERENCES comments(id) ON DELETE CASCADE,
+//     body              TEXT NOT NULL,
+//     created_at        TIMESTAMPTZ DEFAULT NOW()
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_comments_target ON comments(target_type, target_id);
+//
+// Design notes:
+//   - target_type/target_id is a simple polymorphic pair rather than two
+//     separate tables (likes_spots/likes_catches) — keeps the route surface
+//     small (one set of endpoints for both spots and catches) at the cost of
+//     no DB-level foreign key into spots/catches directly. Acceptable here
+//     since both tables use plain SERIAL ids with no overlap risk in
+//     practice, and the route validates target_type against an allowlist.
+//   - Guests (deviceId only, no JWT) CAN like/comment, same as they can
+//     create spots and share catches — consistent with the rest of the API.
+//   - Commenter display name respects THAT commenter's own anonymize_shared
+//     flag (same mechanism already used for spot/catch authorship), not the
+//     flag of whoever owns the spot/catch being commented on.
+//   - Comments use parent_comment_id for one level of threading (replies to
+//     a top-level comment). Replies-to-replies are allowed at the DB level
+//     but the client only needs to render one level deep for now.
+//   - Deleting a comment deletes its replies too (ON DELETE CASCADE) rather
+//     than leaving orphaned replies under a "[deleted]" placeholder.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LIKEABLE_TARGET_TYPES = new Set(['spot', 'catch']);
+
+function assertValidTarget(targetType, targetId) {
+  if (!LIKEABLE_TARGET_TYPES.has(targetType)) throw new Error('targetType must be "spot" or "catch"');
+  if (targetId == null || isNaN(parseInt(targetId))) throw new Error('targetId required');
+}
+
+// Toggle like — liking again un-likes. Returns the new state + total count.
+app.post('/api/likes', async (req, res) => {
+  const { targetType, targetId } = req.body ?? {};
+  try {
+    assertValidTarget(targetType, targetId);
+    const user = await getUserFromRequest(req);
+    const tId = parseInt(targetId);
+
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM likes WHERE user_id=$1 AND target_type=$2 AND target_id=$3`,
+      [user.id, targetType, tId]
+    );
+
+    let likedByMe;
+    if (existing.length) {
+      await pool.query(`DELETE FROM likes WHERE id=$1`, [existing[0].id]);
+      likedByMe = false;
+    } else {
+      await pool.query(
+        `INSERT INTO likes (user_id,target_type,target_id,created_at) VALUES ($1,$2,$3,NOW())
+         ON CONFLICT (user_id,target_type,target_id) DO NOTHING`,
+        [user.id, targetType, tId]
+      );
+      likedByMe = true;
+    }
+
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM likes WHERE target_type=$1 AND target_id=$2`,
+      [targetType, tId]
+    );
+    res.json({ likedByMe, count: countRows[0].count });
+  } catch (err) {
+    res.status(err.message.includes('required') || err.message.includes('must be') ? 400 : 500).json({ error: err.message });
+  }
+});
+
+// Like state for a single target — count + whether the requesting
+// user/device has liked it. No auth required to read the count; likedByMe
+// is only meaningful if a deviceId/JWT is provided.
+app.get('/api/likes/:targetType/:targetId', async (req, res) => {
+  const { targetType, targetId } = req.params;
+  try {
+    assertValidTarget(targetType, targetId);
+    const tId = parseInt(targetId);
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM likes WHERE target_type=$1 AND target_id=$2`,
+      [targetType, tId]
+    );
+    let likedByMe = false;
+    try {
+      const user = await getUserFromRequest(req);
+      const { rows } = await pool.query(
+        `SELECT id FROM likes WHERE user_id=$1 AND target_type=$2 AND target_id=$3`,
+        [user.id, targetType, tId]
+      );
+      likedByMe = rows.length > 0;
+    } catch {
+      // No deviceId/JWT provided — fine, just can't know likedByMe.
+    }
+    res.json({ count: countRows[0].count, likedByMe });
+  } catch (err) {
+    res.status(err.message.includes('must be') ? 400 : 500).json({ error: err.message });
+  }
+});
+
+// Batch like-state lookup — avoids N requests when rendering a list of
+// markers/cards. Body: { items: [{targetType,targetId}, ...] }
+app.post('/api/likes/batch', async (req, res) => {
+  const { items } = req.body ?? {};
+  if (!Array.isArray(items) || !items.length) return res.json({ results: [] });
+  try {
+    let myUserId = null;
+    try { myUserId = (await getUserFromRequest(req)).id; } catch {}
+
+    const results = await Promise.all(items.map(async ({ targetType, targetId }) => {
+      try {
+        assertValidTarget(targetType, targetId);
+        const tId = parseInt(targetId);
+        const { rows: countRows } = await pool.query(
+          `SELECT COUNT(*)::int AS count FROM likes WHERE target_type=$1 AND target_id=$2`,
+          [targetType, tId]
+        );
+        let likedByMe = false;
+        if (myUserId != null) {
+          const { rows } = await pool.query(
+            `SELECT id FROM likes WHERE user_id=$1 AND target_type=$2 AND target_id=$3`,
+            [myUserId, targetType, tId]
+          );
+          likedByMe = rows.length > 0;
+        }
+        return { targetType, targetId: tId, count: countRows[0].count, likedByMe };
+      } catch {
+        return { targetType, targetId, count: 0, likedByMe: false };
+      }
+    }));
+    res.json({ results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/comments', async (req, res) => {
+  const { targetType, targetId, body, parentCommentId } = req.body ?? {};
+  if (!body || !body.trim()) return res.status(400).json({ error: 'body required' });
+  try {
+    assertValidTarget(targetType, targetId);
+    const user = await getUserFromRequest(req);
+    const tId = parseInt(targetId);
+    const { rows: [newComment] } = await pool.query(
+      `INSERT INTO comments (user_id,target_type,target_id,parent_comment_id,body,created_at)
+       VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING *`,
+      [user.id, targetType, tId, parentCommentId ?? null, body.trim().slice(0, 1000)]
+    );
+    const { rows: [userRow] } = await pool.query(
+      `SELECT name, anonymize_shared FROM users WHERE id=$1`, [user.id]
+    );
+    res.json({ comment: formatComment(newComment, userRow) });
+  } catch (err) {
+    console.error('Create comment error:', err);
+    res.status(err.message.includes('required') || err.message.includes('must be') ? 400 : 500).json({ error: err.message });
+  }
+});
+
+// Returns comments for a target as a flat list with parentCommentId set —
+// the client groups top-level vs. replies for threaded display.
+app.get('/api/comments/:targetType/:targetId', async (req, res) => {
+  const { targetType, targetId } = req.params;
+  try {
+    assertValidTarget(targetType, targetId);
+    const tId = parseInt(targetId);
+    const { rows } = await pool.query(
+      `SELECT c.*, u.name AS user_name, u.anonymize_shared
+       FROM comments c
+       JOIN users u ON u.id = c.user_id
+       WHERE c.target_type=$1 AND c.target_id=$2
+       ORDER BY c.created_at ASC`,
+      [targetType, tId]
+    );
+    res.json({ comments: rows.map(row => formatComment(row, row)) });
+  } catch (err) {
+    res.status(err.message.includes('must be') ? 400 : 500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/comments/:id', async (req, res) => {
+  try {
+    const user = await getUserFromRequest(req);
+    const { rows } = await pool.query(
+      `DELETE FROM comments WHERE id=$1 AND user_id=$2 RETURNING id`, [req.params.id, user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Comment not found' });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// `userRow` just needs { name, anonymize_shared } — accepts either the fresh
+// lookup after POST, or the joined row from the GET list query.
+function formatComment(row, userRow) {
+  return {
+    id: row.id,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    parentCommentId: row.parent_comment_id,
+    body: row.body,
+    authorName: userRow?.anonymize_shared ? null : (userRow?.name ?? userRow?.user_name ?? null),
+    createdAt: row.created_at,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Privacy preferences — community catch sharing + anonymization
 //
 // Requires DB migration:
