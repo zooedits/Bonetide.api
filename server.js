@@ -567,23 +567,151 @@ app.delete('/api/auth/avatar', requireAuth, async (req, res) => {
 });
 
 const REGION_SPECIES = {
-  southeast:   ['Redfish', 'Speckled Trout', 'Flounder', 'Sheepshead', 'Red Snapper', 'Cobia', 'King Mackerel'],
-  gulf:        ['Redfish', 'Speckled Trout', 'Snook', 'Tarpon', 'Red Snapper', 'Cobia'],
-  midatlantic: ['Striped Bass', 'Fluke', 'Weakfish', 'Bluefish'],
-  northeast:   ['Striped Bass', 'Fluke', 'Bluefish', 'Black Sea Bass'],
-  westcoast:   ['Pacific Halibut', 'Lingcod', 'Rockfish', 'Cabezon'],
+  southeast: [
+    // Inshore staples
+    'Redfish (Red Drum)', 'Speckled Trout (Spotted Seatrout)', 'Southern Flounder', 'Sheepshead',
+    'Black Drum', 'Florida Pompano', 'Snook', 'Tarpon', 'Ladyfish', 'Jack Crevalle',
+    'Tripletail', 'Whiting (Southern Kingfish)', 'Pigfish (Grunt)', 'Pinfish', 'Mullet',
+    'Palometa', 'Lookdown', 'Needlefish', 'Bonnethead Shark', 'Atlantic Sharpnose Shark',
+    'Atlantic Stingray', 'Cownose Ray', 'Hardhead Catfish', 'Gafftopsail Catfish',
+    'Oyster Toadfish', 'Northern Puffer (Blowfish)',
+    // Nearshore / reef
+    'Cobia', 'Spanish Mackerel', 'King Mackerel', 'Greater Amberjack', 'Lesser Amberjack',
+    'Almaco Jack', 'Horse-Eye Jack', 'Banded Rudderfish', 'African Pompano',
+    'Goliath Grouper', 'Gag Grouper', 'Black Grouper', 'Red Grouper', 'Scamp Grouper',
+    'Warsaw Grouper', 'Snowy Grouper', 'Yellowfin Grouper',
+    'Red Snapper', 'Vermilion Snapper', 'Mangrove Snapper (Gray Snapper)', 'Lane Snapper',
+    'Mutton Snapper', 'Yellowtail Snapper', 'Cubera Snapper', 'Schoolmaster Snapper', 'Dog Snapper',
+    'Hogfish', 'Gray Triggerfish', 'Atlantic Spadefish', 'White Grunt', 'Bluestriped Grunt',
+    'Ballyhoo (Halfbeak)', 'Atlantic Bumper',
+    // Sharks
+    'Bull Shark', 'Blacktip Shark', 'Spinner Shark', 'Sandbar Shark', 'Nurse Shark',
+    'Lemon Shark', 'Tiger Shark', 'Great Hammerhead', 'Bonnethead Shark',
+    // Offshore pelagic
+    'Mahi-Mahi (Dolphinfish)', 'Wahoo', 'Yellowfin Tuna', 'Blackfin Tuna', 'Little Tunny (False Albacore)',
+    'Atlantic Bonito', 'Sailfish', 'Blue Marlin', 'White Marlin',
+  ],
+  gulf: [
+    // Inshore
+    'Redfish (Red Drum)', 'Speckled Trout (Spotted Seatrout)', 'Southern Flounder', 'Sheepshead',
+    'Black Drum', 'Florida Pompano', 'Snook', 'Tarpon', 'Ladyfish', 'Jack Crevalle',
+    'Tripletail', 'Whiting', 'Pigfish', 'Pinfish', 'Mullet', 'Hardhead Catfish', 'Gafftopsail Catfish',
+    'Bonnethead Shark', 'Atlantic Stingray', 'Cownose Ray', 'Atlantic Sharpnose Shark', 'Northern Puffer',
+    // Nearshore / reef
+    'Cobia', 'Spanish Mackerel', 'King Mackerel', 'Greater Amberjack',
+    'Goliath Grouper', 'Gag Grouper', 'Red Grouper', 'Black Grouper', 'Scamp Grouper',
+    'Red Snapper', 'Vermilion Snapper', 'Mangrove Snapper', 'Lane Snapper',
+    'Mutton Snapper', 'Yellowtail Snapper', 'Cubera Snapper',
+    'Hogfish', 'Gray Triggerfish', 'Atlantic Spadefish', 'White Grunt',
+    'African Pompano', 'Permit', 'Palometa',
+    // Sharks
+    'Bull Shark', 'Blacktip Shark', 'Tiger Shark', 'Nurse Shark', 'Lemon Shark',
+    'Hammerhead Shark', 'Sandbar Shark',
+    // Offshore
+    'Mahi-Mahi', 'Wahoo', 'Yellowfin Tuna', 'Blackfin Tuna', 'Little Tunny',
+    'Sailfish', 'Blue Marlin', 'Swordfish',
+  ],
+  midatlantic: [
+    // Inshore
+    'Striped Bass (Rockfish)', 'Summer Flounder (Fluke)', 'Weakfish (Gray Trout)',
+    'Bluefish', 'Black Sea Bass', 'Tautog (Blackfish)', 'Scup (Porgy)',
+    'Red Drum (Channel Bass)', 'Spotted Seatrout', 'Sheepshead',
+    'Atlantic Croaker', 'Spot', 'White Perch', 'Porgy',
+    'Atlantic Menhaden (Bunker)', 'Pigfish', 'Needlefish', 'Lookdown',
+    'Atlantic Stingray', 'Cownose Ray', 'Sandbar Shark', 'Atlantic Sharpnose Shark',
+    'Northern Puffer (Blowfish)',
+    // Nearshore / reef
+    'Cobia', 'Spanish Mackerel', 'King Mackerel', 'Greater Amberjack',
+    'Black Sea Bass', 'Tautog', 'Cunner', 'Hogfish',
+    'Spadefish', 'Gray Triggerfish', 'Sheepshead',
+    // Sharks
+    'Sandbar Shark', 'Bull Shark', 'Blacktip Shark', 'Spinner Shark',
+    'Tiger Shark', 'Mako Shark', 'Thresher Shark', 'Blue Shark',
+    // Pelagic
+    'Bluefin Tuna', 'Yellowfin Tuna', 'Bigeye Tuna', 'Albacore Tuna',
+    'False Albacore (Little Tunny)', 'Atlantic Bonito', 'Mahi-Mahi',
+    'Wahoo', 'Sailfish', 'White Marlin', 'Blue Marlin', 'Swordfish', 'Skipjack Tuna',
+  ],
+  northeast: [
+    // Inshore
+    'Striped Bass', 'Summer Flounder (Fluke)', 'Winter Flounder', 'Weakfish',
+    'Bluefish', 'Black Sea Bass', 'Tautog (Blackfish)', 'Scup (Porgy)',
+    'Atlantic Cod', 'Haddock', 'Pollock', 'Cunner',
+    'Atlantic Croaker', 'Spot', 'White Perch', 'Atlantic Menhaden (Bunker)',
+    'Atlantic Halibut', 'Cusk', 'Atlantic Mackerel',
+    // Sharks
+    'Blue Shark', 'Mako Shark', 'Thresher Shark', 'Sandbar Shark', 'Spiny Dogfish',
+    'Tiger Shark',
+    // Pelagic
+    'Bluefin Tuna', 'Yellowfin Tuna', 'Bigeye Tuna', 'Albacore Tuna',
+    'False Albacore (Little Tunny)', 'Atlantic Bonito', 'Skipjack Tuna',
+    'Mahi-Mahi', 'Wahoo', 'Swordfish', 'Blue Marlin', 'White Marlin',
+  ],
+  westcoast: [
+    // Inshore / surf
+    'Pacific Halibut', 'California Halibut', 'Lingcod', 'Cabezon',
+    'White Seabass', 'Yellowtail (California)', 'Kelp Bass (Calico Bass)',
+    'Chinook Salmon (King Salmon)', 'Coho Salmon (Silver Salmon)',
+    'Pacific Bonito', 'White Croaker', 'Surfperch',
+    'Sturgeon', 'Leopard Shark', 'Pacific Sierra (Sierra Mackerel)',
+    // Rockfish (very common, many species)
+    'Black Rockfish', 'Vermilion Rockfish', 'Canary Rockfish', 'Blue Rockfish',
+    'Olive Rockfish', 'Copper Rockfish', 'Quillback Rockfish', 'China Rockfish',
+    'Bocaccio Rockfish', 'Widow Rockfish', 'Yelloweye Rockfish',
+    // Sharks
+    'Leopard Shark', 'Blue Shark', 'Mako Shark', 'Thresher Shark', 'Soupfin Shark',
+    // Offshore / pelagic
+    'Albacore Tuna', 'Yellowfin Tuna', 'Bluefin Tuna', 'Skipjack Tuna', 'Bigeye Tuna',
+    'Mahi-Mahi', 'Wahoo', 'Striped Marlin', 'Swordfish', 'Blue Marlin',
+  ],
+  hawaii: [
+    'Giant Trevally (Ulua)', 'Bonefish (O\'io)', 'Mahi-Mahi (Dorado)',
+    'Yellowfin Tuna (Ahi)', 'Bigeye Tuna (Ahi)', 'Skipjack Tuna (Aku)',
+    'Wahoo (Ono)', 'Blue Marlin (A\'u)', 'Striped Marlin', 'Sailfish',
+    'Opakapaka (Pink Snapper)', 'Onaga (Long-Tailed Red Snapper)', 'Uku (Green Jobfish)',
+    'Hapu\'upu\'u (Hawaiian Grouper)', 'Papio (Young Trevally)', 'Barracuda (Kaku)',
+    'Threadfin (Moi)', 'Mullet (Ama\'ama)',
+    'Humuhumunukunukuapuaa (Reef Triggerfish)', 'Blacktip Reef Shark',
+    'Whitetip Reef Shark', 'Galapagos Shark', 'Tiger Shark',
+    'Hawaiian Amberjack (Kahala)',
+  ],
 };
 
 app.post('/api/identify', async (req, res) => {
   const { deviceId, image, region = 'southeast' } = req.body;
   if (!image) return res.status(400).json({ error: 'image (base64) required' });
   const speciesList = REGION_SPECIES[region] ?? REGION_SPECIES.southeast;
-  const prompt = `You are a marine biologist assistant for Bone Tide Co., a fishing app serving ${region} anglers.
-Identify the fish in this photo. Primary species to look for: ${speciesList.join(', ')}.
-Also assess whether this image is a PHOTO OF A SCREEN, PRINTED PHOTO, OR DIGITAL IMAGE (as opposed to a real-life photo taken directly of a fish). Look for: screen glare/reflections, moiré/pixel grid patterns, monitor or phone bezels visible in frame, glass/print texture, unnatural color banding, or a flat/2D appearance inconsistent with a hand-held catch photo.
+  const prompt = `You are an expert marine biologist and fish identification specialist for Bone Tide Co., a saltwater fishing app serving ${region} anglers.
+
+Identify the fish species in this photo. The angler is fishing in the ${region} region.
+
+PRIMARY SPECIES TO LOOK FOR in this region:
+${speciesList.join(', ')}
+
+IDENTIFICATION GUIDANCE:
+- Look carefully at body shape, coloration, fin placement, mouth shape, and any distinctive markings
+- Goliath Grouper: massive size (can exceed 500 lbs), very broad flat head, small eyes set high, brown/yellowish-brown with dark irregular blotches and small black spots. Juveniles have mottled brown/yellow pattern. Do NOT confuse with other grouper species.
+- Gag Grouper vs Black Grouper: Gag has worm-like markings and white margin on tail; Black Grouper has rectangular blotches with brass spots
+- Redfish/Red Drum: bronze/copper color, one or more black tail spots, slightly underslung mouth
+- Speckled Trout: elongated silver body with distinct black spots on back and dorsal fin, two large canine teeth visible
+- Flounder/Fluke: flat body, both eyes on same side, mottled brown camouflage pattern
+- Grouper (general): stocky body, large mouth, rounded tail, often with spots or blotches
+- Snapper (general): pointed snout, forked tail, often red/pink/silver coloration, visible teeth
+- Cobia: long dark brown torpedo shape, distinctive white stripe on sides, broad flat head, small first dorsal fin
+- Tarpon: very large silver scales, upturned mouth, deeply forked tail, bony plate on chin
+- Snook: distinctive black lateral line running full length of body, protruding lower jaw
+- Sheepshead: black and white vertical stripes, human-like teeth visible even in photos
+- Jack Crevalle/Trevally: deep-bodied silver fish, black spot on gill cover, yellow fins
+- Pompano: small mouth, no visible teeth, deeply forked tail, golden/silver coloration
+- Tripletail: distinctive three-lobed tail appearance from soft dorsal, anal, and caudal fins
+
+SCREEN/PHOTO DETECTION: Also assess whether this is a PHOTO OF A SCREEN, PRINTED PHOTO, OR DIGITAL IMAGE rather than a real-life fish photo. Look for: screen glare/reflections, moiré patterns, monitor bezels, glass/print texture, pixel grid patterns, unnatural color banding, or a flat 2D appearance inconsistent with a hand-held catch photo.
+
 Respond ONLY with a valid JSON object, no markdown, no explanation:
 {"commonName":"string","latinName":"string","confidence":0.0,"inRegion":true,"habitat":"inshore","catchRelease":false,"notes":"string","isPhotoOfScreen":false,"screenCheckConfidence":0.0}
-If you cannot identify the fish with reasonable confidence, return confidence below 0.5.`;
+
+If you cannot identify the fish with reasonable confidence, return confidence below 0.5.
+If multiple species are plausible, pick the most likely one for the region and note the alternatives in the notes field.`;
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
