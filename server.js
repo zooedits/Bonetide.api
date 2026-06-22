@@ -960,6 +960,67 @@ app.delete('/api/spots/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Spot Photos — community photo gallery per spot
+//
+// Requires DB migration:
+//   CREATE TABLE IF NOT EXISTS spot_photos (
+//     id         SERIAL PRIMARY KEY,
+//     spot_id    INTEGER NOT NULL REFERENCES spots(id) ON DELETE CASCADE,
+//     user_id    INTEGER NOT NULL REFERENCES users(id),
+//     photo_url  TEXT NOT NULL,
+//     created_at TIMESTAMPTZ DEFAULT NOW()
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_spot_photos_spot ON spot_photos(spot_id);
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/spots/:id/photos', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT sp.id, sp.photo_url, sp.created_at, u.name AS user_name, u.anonymize_shared
+       FROM spot_photos sp
+       JOIN users u ON u.id = sp.user_id
+       WHERE sp.spot_id = $1
+       ORDER BY sp.created_at ASC`,
+      [req.params.id]
+    );
+    res.json({
+      photos: rows.map(r => ({
+        id: r.id,
+        photoUrl: r.photo_url,
+        authorName: r.anonymize_shared ? null : (r.user_name ?? null),
+        createdAt: r.created_at,
+      }))
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/spots/:id/photos', requireAuth, async (req, res) => {
+  const { imageBase64 } = req.body ?? {};
+  if (!imageBase64) return res.status(400).json({ error: 'imageBase64 required' });
+  try {
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows: userRows } = await pool.query(
+      `SELECT id FROM users WHERE ${column}=$1`, [req.user.id]
+    );
+    if (!userRows.length) return res.status(404).json({ error: 'User not found' });
+    const userId = userRows[0].id;
+
+    const photoUrl = await uploadSpotPhotoToCloudinary(imageBase64);
+    const { rows: [photo] } = await pool.query(
+      `INSERT INTO spot_photos (spot_id, user_id, photo_url, created_at)
+       VALUES ($1, $2, $3, NOW()) RETURNING id, photo_url, created_at`,
+      [req.params.id, userId, photoUrl]
+    );
+    res.json({ photo: { id: photo.id, photoUrl: photo.photo_url, createdAt: photo.created_at } });
+  } catch (err) {
+    console.error('[spot photos] Upload failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
 // photoUri (not photo_url) on purpose — matches the field name the client
 // already uses for locally-stored spot photos, so SpotDetailSheet renders
 // a community spot's photo with zero extra mapping logic.
@@ -1119,9 +1180,42 @@ app.post('/api/likes/batch', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Content filter — blocks slurs, hate speech, and explicit content from
+// comments. No human moderator required — server-side word list check before
+// the row is ever written to the DB.
+// ─────────────────────────────────────────────────────────────────────────────
+const BLOCKED_TERMS = [
+  // Racial slurs (partial list — catches common variants via includes())
+  'nigger','nigga','chink','spic','wetback','kike','gook','raghead','towelhead',
+  'beaner','cracker','honky','coon','jigaboo','porch monkey','jungle bunny',
+  'redskin','injun','zipperhead',
+  // Homophobic / transphobic slurs
+  'faggot','fag','dyke','tranny','shemale','homo ',
+  // Explicit sexual
+  'cunt','pussy','cock','dick','fuck','shit','bitch','asshole','motherfucker',
+  'whore','slut',
+  // Threats / violence
+  'kill yourself','kys','go die','i will kill','i will hurt','i will find you',
+];
+
+function containsBlockedContent(text) {
+  const lower = text.toLowerCase();
+  return BLOCKED_TERMS.some(term => lower.includes(term));
+}
+
 app.post('/api/comments', async (req, res) => {
   const { targetType, targetId, body, parentCommentId } = req.body ?? {};
   if (!body || !body.trim()) return res.status(400).json({ error: 'body required' });
+
+  // Content filter — reject before writing to DB
+  if (containsBlockedContent(body)) {
+    return res.status(422).json({
+      error: 'Your comment contains language that isn\'t allowed on Bone Tide Co. Please keep it respectful.',
+      blocked: true,
+    });
+  }
+
   try {
     assertValidTarget(targetType, targetId);
     const user = await getUserFromRequest(req);
