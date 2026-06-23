@@ -1021,6 +1021,58 @@ app.post('/api/spots/:id/photos', requireAuth, async (req, res) => {
 
 
 
+
+// ── Spot polls ───────────────────────────────────────────────────────────────
+
+// Submit a poll response for a spot (one per user per spot)
+app.post('/api/spots/:id/poll', async (req, res) => {
+  const { ratingOverall, ratingFish, ratingCrowd, ratingClean, ratingAccess, hasCost } = req.body ?? {};
+  const spotId = parseInt(req.params.id);
+  if (!spotId) return res.status(400).json({ error: 'invalid spot id' });
+  try {
+    const user = await getUserFromRequest(req);
+    if (!user) return res.status(401).json({ error: 'auth required' });
+    await pool.query(
+      `INSERT INTO spot_polls
+         (spot_id, user_id, rating_overall, rating_fish, rating_crowd, rating_clean, rating_access, has_cost)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (spot_id, user_id) DO UPDATE SET
+         rating_overall=$3, rating_fish=$4, rating_crowd=$5,
+         rating_clean=$6, rating_access=$7, has_cost=$8, created_at=NOW()`,
+      [spotId, user.id, ratingOverall??null, ratingFish??null, ratingCrowd??null,
+       ratingClean??null, ratingAccess??null, hasCost??null]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[poll] submit error:', err.message);
+    res.status(500).json({ error: 'Failed to save poll' });
+  }
+});
+
+// Get aggregated poll results for a spot
+app.get('/api/spots/:id/poll', async (req, res) => {
+  const spotId = parseInt(req.params.id);
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         COUNT(*)::int                             AS total,
+         ROUND(AVG(rating_overall)::numeric, 1)   AS overall,
+         ROUND(AVG(rating_fish)::numeric, 1)       AS fish,
+         ROUND(AVG(rating_crowd)::numeric, 1)      AS crowd,
+         ROUND(AVG(rating_clean)::numeric, 1)      AS clean,
+         ROUND(AVG(rating_access)::numeric, 1)     AS access,
+         COUNT(*) FILTER (WHERE has_cost='yes')::int      AS cost_yes,
+         COUNT(*) FILTER (WHERE has_cost='no')::int       AS cost_no,
+         COUNT(*) FILTER (WHERE has_cost='sometimes')::int AS cost_sometimes
+       FROM spot_polls WHERE spot_id=$1`,
+      [spotId]
+    );
+    res.json({ poll: rows[0] ?? null });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch poll' });
+  }
+});
+
 // photoUri (not photo_url) on purpose — matches the field name the client
 // already uses for locally-stored spot photos, so SpotDetailSheet renders
 // a community spot's photo with zero extra mapping logic.
@@ -1206,6 +1258,24 @@ function containsBlockedContent(text) {
 
 // Add photo_url to comments if not already present (idempotent)
 pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
+
+// ── Spot polls table ──────────────────────────────────────────────────────────
+pool.query(`
+  CREATE TABLE IF NOT EXISTS spot_polls (
+    id              SERIAL PRIMARY KEY,
+    spot_id         INTEGER NOT NULL,
+    user_id         INTEGER NOT NULL,
+    device_id       TEXT,
+    rating_overall  INTEGER CHECK (rating_overall BETWEEN 1 AND 5),
+    rating_fish     INTEGER CHECK (rating_fish BETWEEN 1 AND 5),
+    rating_crowd    INTEGER CHECK (rating_crowd BETWEEN 1 AND 5),
+    rating_clean    INTEGER CHECK (rating_clean BETWEEN 1 AND 5),
+    rating_access   INTEGER CHECK (rating_access BETWEEN 1 AND 5),
+    has_cost        TEXT CHECK (has_cost IN ('yes','no','sometimes')),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(spot_id, user_id)
+  )
+`).catch(() => {});
 
 app.post('/api/comments', async (req, res) => {
   const { targetType, targetId, body, parentCommentId, photoUrl } = req.body ?? {};
