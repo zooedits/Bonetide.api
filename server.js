@@ -375,9 +375,15 @@ app.post('/api/auth/otp/verify', async (req, res) => {
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
-    const { rows } = await pool.query(
+    let { rows } = await pool.query(
       `SELECT name, avatar, email, points_balance, birthday_month FROM users WHERE ${column}=$1`, [req.user.id]
     );
+    // Fall back to email match for merged/Apple accounts where provider column is null
+    if (!rows.length && req.user.email) {
+      ({ rows } = await pool.query(
+        `SELECT name, avatar, email, points_balance, birthday_month FROM users WHERE email=$1`, [req.user.email]
+      ));
+    }
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     res.json(rows[0]);
   } catch (err) {
@@ -543,10 +549,20 @@ app.put('/api/auth/avatar', requireAuth, async (req, res) => {
     const url = await uploadAvatarToCloudinary(imageBase64);
 
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
-    const { rows } = await pool.query(
+    // Try provider column first; fall back to matching by DB id via sub-select
+    let rows;
+    ({ rows } = await pool.query(
       `UPDATE users SET avatar=$1 WHERE ${column}=$2 RETURNING id, avatar`,
       [url, req.user.id]
-    );
+    ));
+    if (!rows.length) {
+      // Provider column may be null (e.g. Apple user merged from device account)
+      // Fall back to looking up by email or the numeric DB id stored in JWT sub
+      ({ rows } = await pool.query(
+        `UPDATE users SET avatar=$1 WHERE email=$2 RETURNING id, avatar`,
+        [url, req.user.email]
+      ));
+    }
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({ avatar: rows[0].avatar });
   } catch (err) {
