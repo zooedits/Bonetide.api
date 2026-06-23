@@ -1204,8 +1204,11 @@ function containsBlockedContent(text) {
   return BLOCKED_TERMS.some(term => lower.includes(term));
 }
 
+// Add photo_url to comments if not already present (idempotent)
+pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
+
 app.post('/api/comments', async (req, res) => {
-  const { targetType, targetId, body, parentCommentId } = req.body ?? {};
+  const { targetType, targetId, body, parentCommentId, photoUrl } = req.body ?? {};
   if (!body || !body.trim()) return res.status(400).json({ error: 'body required' });
 
   // Content filter — reject before writing to DB
@@ -1221,9 +1224,9 @@ app.post('/api/comments', async (req, res) => {
     const user = await getUserFromRequest(req);
     const tId = parseInt(targetId);
     const { rows: [newComment] } = await pool.query(
-      `INSERT INTO comments (user_id,target_type,target_id,parent_comment_id,body,created_at)
-       VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING *`,
-      [user.id, targetType, tId, parentCommentId ?? null, body.trim().slice(0, 1000)]
+      `INSERT INTO comments (user_id,target_type,target_id,parent_comment_id,body,photo_url,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW()) RETURNING *`,
+      [user.id, targetType, tId, parentCommentId ?? null, body.trim().slice(0, 1000), photoUrl ?? null]
     );
     const { rows: [userRow] } = await pool.query(
       `SELECT name, anonymize_shared FROM users WHERE id=$1`, [user.id]
@@ -1237,6 +1240,40 @@ app.post('/api/comments', async (req, res) => {
 
 // Returns comments for a target as a flat list with parentCommentId set —
 // the client groups top-level vs. replies for threaded display.
+// ── Comment photo upload ─────────────────────────────────────────────────────
+function uploadCommentPhotoToCloudinary(base64) {
+  return uploadImageToCloudinary(base64, {
+    folder: 'comments',
+    transformation: 'c_fill,w_800,h_600,f_webp,q_auto:good',
+  });
+}
+
+app.post('/api/comments/:id/photo', requireAuth, async (req, res) => {
+  const { imageBase64 } = req.body ?? {};
+  if (!imageBase64) return res.status(400).json({ error: 'imageBase64 required' });
+  try {
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows: userRows } = await pool.query(
+      `SELECT id FROM users WHERE ${column}=$1`, [req.user.id]
+    );
+    if (!userRows.length) return res.status(404).json({ error: 'User not found' });
+    const userId = userRows[0].id;
+
+    // Verify this comment belongs to this user
+    const { rows: commentRows } = await pool.query(
+      `SELECT id FROM comments WHERE id=$1 AND user_id=$2`, [req.params.id, userId]
+    );
+    if (!commentRows.length) return res.status(403).json({ error: 'Not your comment' });
+
+    const photoUrl = await uploadCommentPhotoToCloudinary(imageBase64);
+    await pool.query(`UPDATE comments SET photo_url=$1 WHERE id=$2`, [photoUrl, req.params.id]);
+    res.json({ photoUrl });
+  } catch (err) {
+    console.error('Comment photo upload error:', err);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
 app.get('/api/comments/:targetType/:targetId', async (req, res) => {
   const { targetType, targetId } = req.params;
   try {
@@ -1278,6 +1315,7 @@ function formatComment(row, userRow) {
     body: row.body,
     authorName: userRow?.anonymize_shared ? null : (userRow?.name ?? userRow?.user_name ?? null),
     createdAt: row.created_at,
+    photoUrl: row.photo_url ?? null,
   };
 }
 
