@@ -1257,6 +1257,41 @@ function containsBlockedContent(text) {
 }
 
 // Add photo_url to comments if not already present (idempotent)
+// ── Auto-create core tables if they don't exist (idempotent) ─────────────────
+pool.query(`
+  CREATE TABLE IF NOT EXISTS spot_photos (
+    id         SERIAL PRIMARY KEY,
+    spot_id    INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    photo_url  TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.error('[init] spot_photos:', e.message));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS likes (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id   INTEGER NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, target_type, target_id)
+  )
+`).catch(e => console.error('[init] likes:', e.message));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS comments (
+    id                SERIAL PRIMARY KEY,
+    user_id           INTEGER NOT NULL,
+    target_type       TEXT NOT NULL,
+    target_id         INTEGER NOT NULL,
+    parent_comment_id INTEGER REFERENCES comments(id) ON DELETE CASCADE,
+    body              TEXT NOT NULL,
+    photo_url         TEXT,
+    created_at        TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.error('[init] comments:', e.message));
+
 pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
 
 // ── Spot polls table ──────────────────────────────────────────────────────────
