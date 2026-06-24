@@ -992,20 +992,41 @@ app.delete('/api/spots/:id', async (req, res) => {
 
 app.get('/api/spots/:id/photos', async (req, res) => {
   try {
+    const spotId = parseInt(req.params.id);
+    // Get photos with like counts per photo
     const { rows } = await pool.query(
-      `SELECT sp.id, sp.photo_url, sp.created_at, u.name AS user_name, u.anonymize_shared
+      `SELECT sp.id, sp.photo_url, sp.created_at, sp.user_id,
+              u.name AS user_name, u.avatar AS user_avatar, u.anonymize_shared,
+              COUNT(l.id)::int AS like_count
        FROM spot_photos sp
        JOIN users u ON u.id = sp.user_id
+       LEFT JOIN likes l ON l.target_type='spot_photo' AND l.target_id=sp.id
        WHERE sp.spot_id = $1
-       ORDER BY sp.created_at ASC`,
-      [req.params.id]
+       GROUP BY sp.id, u.name, u.avatar, u.anonymize_shared
+       ORDER BY sp.created_at DESC`,
+      [spotId]
     );
+    // Check if requesting user has liked each photo
+    const viewer = await getUserFromRequest(req).catch(() => null);
+    let likedSet = new Set();
+    if (viewer && rows.length) {
+      const photoIds = rows.map(r => r.id);
+      const { rows: liked } = await pool.query(
+        `SELECT target_id FROM likes WHERE user_id=$1 AND target_type='spot_photo' AND target_id=ANY($2)`,
+        [viewer.id, photoIds]
+      );
+      likedSet = new Set(liked.map(r => r.target_id));
+    }
     res.json({
       photos: rows.map(r => ({
         id: r.id,
         photoUrl: r.photo_url,
         authorName: r.anonymize_shared ? null : (r.user_name ?? null),
+        authorAvatar: r.anonymize_shared ? null : (r.user_avatar ?? null),
+        authorId: r.user_id,
         createdAt: r.created_at,
+        likeCount: r.like_count ?? 0,
+        likedByMe: likedSet.has(r.id),
       }))
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
