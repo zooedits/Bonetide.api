@@ -967,6 +967,18 @@ app.get('/api/spots', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET single spot by ID (used for deep-link from photo library)
+app.get('/api/spots/:id', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, type, note, lat, lon, photo_url AS "photoUri", is_private, created_at
+       FROM spots WHERE id=$1`, [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Spot not found' });
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.delete('/api/spots/:id', async (req, res) => {
   try {
     const user = await getUserFromRequest(req);
