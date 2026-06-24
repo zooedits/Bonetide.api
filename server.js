@@ -1161,7 +1161,7 @@ function formatSpot(row) {
 //     than leaving orphaned replies under a "[deleted]" placeholder.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const LIKEABLE_TARGET_TYPES = new Set(['spot', 'catch']);
+const LIKEABLE_TARGET_TYPES = new Set(['spot', 'catch', 'spot_photo', 'comment']);
 
 function assertValidTarget(targetType, targetId) {
   if (!LIKEABLE_TARGET_TYPES.has(targetType)) throw new Error('targetType must be "spot" or "catch"');
@@ -1421,15 +1421,33 @@ app.get('/api/comments/:targetType/:targetId', async (req, res) => {
   try {
     assertValidTarget(targetType, targetId);
     const tId = parseInt(targetId);
+    const viewer = await getUserFromRequest(req).catch(() => null);
     const { rows } = await pool.query(
-      `SELECT c.*, u.name AS user_name, u.anonymize_shared
+      `SELECT c.*, u.name AS user_name, u.avatar AS user_avatar, u.anonymize_shared,
+              COUNT(l.id)::int AS like_count
        FROM comments c
        JOIN users u ON u.id = c.user_id
+       LEFT JOIN likes l ON l.target_type='comment' AND l.target_id=c.id
        WHERE c.target_type=$1 AND c.target_id=$2
+       GROUP BY c.id, u.name, u.avatar, u.anonymize_shared
        ORDER BY c.created_at ASC`,
       [targetType, tId]
     );
-    res.json({ comments: rows.map(row => formatComment(row, row)) });
+    let likedSet = new Set();
+    if (viewer && rows.length) {
+      const cids = rows.map(r => r.id);
+      const { rows: liked } = await pool.query(
+        `SELECT target_id FROM likes WHERE user_id=$1 AND target_type='comment' AND target_id=ANY($2)`,
+        [viewer.id, cids]
+      );
+      likedSet = new Set(liked.map(r => r.target_id));
+    }
+    res.json({ comments: rows.map(row => ({
+      ...formatComment(row, row),
+      likeCount: row.like_count ?? 0,
+      likedByMe: likedSet.has(row.id),
+      authorAvatar: row.anonymize_shared ? null : (row.user_avatar ?? null),
+    })) });
   } catch (err) {
     res.status(err.message.includes('must be') ? 400 : 500).json({ error: err.message });
   }
