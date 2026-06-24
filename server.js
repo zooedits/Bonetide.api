@@ -536,7 +536,7 @@ async function uploadAvatarToCloudinary(base64) {
 async function uploadSpotPhotoToCloudinary(base64) {
   return uploadImageToCloudinary(base64, {
     folder: 'spots',
-    transformation: 'c_fill,w_1000,h_750,f_webp,q_auto:good',
+    transformation: 'c_limit,w_1200,f_webp,q_auto:good',
   });
 }
 
@@ -1365,7 +1365,7 @@ app.post('/api/comments', async (req, res) => {
 function uploadCommentPhotoToCloudinary(base64) {
   return uploadImageToCloudinary(base64, {
     folder: 'comments',
-    transformation: 'c_fill,w_800,h_600,f_webp,q_auto:good',
+    transformation: 'c_limit,w_1000,f_webp,q_auto:good',
   });
 }
 
