@@ -2194,3 +2194,98 @@ app.get('/api/products', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Bone Tide Co. API running on port ${PORT}`));
+// ── User Media Library ────────────────────────────────────────────────────────
+
+// GET /api/me/photos/spots — all spot photos uploaded by this user
+app.get('/api/me/photos/spots', requireAuth, async (req, res) => {
+  try {
+    const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows: [u] } = await pool.query(`SELECT id FROM users WHERE ${col}=$1`, [req.user.id]);
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    const { rows } = await pool.query(`
+      SELECT sp.id, sp.photo_url, sp.created_at, sp.spot_id,
+             s.name AS spot_name,
+             COUNT(l.id)::int AS likes
+      FROM spot_photos sp
+      JOIN spots s ON s.id = sp.spot_id
+      LEFT JOIN likes l ON l.target_type = 'spot' AND l.target_id = sp.spot_id
+      WHERE sp.user_id = $1
+      GROUP BY sp.id, s.name
+      ORDER BY sp.created_at DESC`, [u.id]);
+    res.json({ photos: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/me/photos/spots/:id — delete a spot photo
+app.delete('/api/me/photos/spots/:id', requireAuth, async (req, res) => {
+  try {
+    const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows: [u] } = await pool.query(`SELECT id FROM users WHERE ${col}=$1`, [req.user.id]);
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    const { rows } = await pool.query(
+      `DELETE FROM spot_photos WHERE id=$1 AND user_id=$2 RETURNING id`, [req.params.id, u.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Photo not found' });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/me/photos/catches — all catch photos uploaded by this user
+app.get('/api/me/photos/catches', requireAuth, async (req, res) => {
+  try {
+    const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows: [u] } = await pool.query(`SELECT id FROM users WHERE ${col}=$1`, [req.user.id]);
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    const { rows } = await pool.query(`
+      SELECT id, image_url AS photo_url, species, created_at AS caught_at, length_in
+      FROM catches
+      WHERE user_id=$1 AND image_url IS NOT NULL AND image_url != ''
+      ORDER BY caught_at DESC`, [u.id]);
+    res.json({ photos: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/me/photos/catches/:id — remove photo from a catch (not delete the catch)
+app.delete('/api/me/photos/catches/:id', requireAuth, async (req, res) => {
+  try {
+    const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows: [u] } = await pool.query(`SELECT id FROM users WHERE ${col}=$1`, [req.user.id]);
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    const { rows } = await pool.query(
+      `UPDATE catches SET image_url=NULL WHERE id=$1 AND user_id=$2 RETURNING id`, [req.params.id, u.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Catch not found' });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/me/photos/comments — all comment photos uploaded by this user
+app.get('/api/me/photos/comments', requireAuth, async (req, res) => {
+  try {
+    const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows: [u] } = await pool.query(`SELECT id FROM users WHERE ${col}=$1`, [req.user.id]);
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    const { rows } = await pool.query(`
+      SELECT c.id, c.photo_url, c.body, c.created_at, c.target_type, c.target_id,
+             CASE WHEN c.target_type='spot' THEN s.name ELSE NULL END AS spot_name
+      FROM comments c
+      LEFT JOIN spots s ON s.id = c.target_id AND c.target_type = 'spot'
+      WHERE c.user_id=$1 AND c.photo_url IS NOT NULL AND c.photo_url != ''
+      ORDER BY c.created_at DESC`, [u.id]);
+    res.json({ photos: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/me/photos/comments/:id — remove photo from a comment
+app.delete('/api/me/photos/comments/:id', requireAuth, async (req, res) => {
+  try {
+    const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows: [u] } = await pool.query(`SELECT id FROM users WHERE ${col}=$1`, [req.user.id]);
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    const { rows } = await pool.query(
+      `UPDATE comments SET photo_url=NULL WHERE id=$1 AND user_id=$2 RETURNING id`, [req.params.id, u.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Comment not found' });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
