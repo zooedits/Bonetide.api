@@ -1050,10 +1050,20 @@ app.post('/api/spots/:id/photos', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     const { rows: userRows } = await pool.query(
-      `SELECT id FROM users WHERE ${column}=$1`, [req.user.id]
+      `SELECT id, name, anonymize_shared FROM users WHERE ${column}=$1`, [req.user.id]
     );
     if (!userRows.length) return res.status(404).json({ error: 'User not found' });
-    const userId = userRows[0].id;
+    const me = userRows[0];
+
+    // Photos are never anonymous — require a display name and a non-anonymized
+    // profile so every photo is attributable to a real angler.
+    if (!me.name || !me.name.trim()) {
+      return res.status(403).json({ code: 'NAME_REQUIRED', error: 'Add a display name before sharing photos.' });
+    }
+    if (me.anonymize_shared) {
+      return res.status(403).json({ code: 'ANON_BLOCKED', error: 'Photos can’t be shared anonymously. Turn off Anonymous Sharing to post a photo.' });
+    }
+    const userId = me.id;
 
     const photoUrl = await uploadSpotPhotoToCloudinary(imageBase64);
     const { rows: [photo] } = await pool.query(
