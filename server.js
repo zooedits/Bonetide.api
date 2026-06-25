@@ -1033,8 +1033,8 @@ app.get('/api/spots/:id/photos', async (req, res) => {
       photos: rows.map(r => ({
         id: r.id,
         photoUrl: r.photo_url,
-        authorName: r.anonymize_shared ? null : (r.user_name ?? null),
-        authorAvatar: r.anonymize_shared ? null : (r.user_avatar ?? null),
+        authorName: r.user_name ?? null,
+        authorAvatar: r.user_avatar ?? null,
         authorId: r.user_id,
         createdAt: r.created_at,
         likeCount: r.like_count ?? 0,
@@ -1050,18 +1050,15 @@ app.post('/api/spots/:id/photos', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     const { rows: userRows } = await pool.query(
-      `SELECT id, name, anonymize_shared FROM users WHERE ${column}=$1`, [req.user.id]
+      `SELECT id, name FROM users WHERE ${column}=$1`, [req.user.id]
     );
     if (!userRows.length) return res.status(404).json({ error: 'User not found' });
     const me = userRows[0];
 
-    // Photos are never anonymous — require a display name and a non-anonymized
-    // profile so every photo is attributable to a real angler.
+    // Photos are always attributed — a display name is required so the upload
+    // shows who caught it. (There is no anonymous option for photos.)
     if (!me.name || !me.name.trim()) {
       return res.status(403).json({ code: 'NAME_REQUIRED', error: 'Add a display name before sharing photos.' });
-    }
-    if (me.anonymize_shared) {
-      return res.status(403).json({ code: 'ANON_BLOCKED', error: 'Photos can’t be shared anonymously. Turn off Anonymous Sharing to post a photo.' });
     }
     const userId = me.id;
 
