@@ -294,6 +294,44 @@ function generateOtpCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Email via Resend. Sends for real when RESEND_API_KEY is set AND the sender
+// domain (bonetideco.com) is verified in the Resend dashboard. If the key is
+// missing or a send fails, callers fall back to logging so nothing is ever
+// silently lost (and OTP login still works during setup).
+//   Required env vars on Railway:
+//     RESEND_API_KEY   — from resend.com/api-keys
+//     EMAIL_FROM       — e.g. "Bone Tide Co. <support@bonetideco.com>"
+//                        (defaults below; domain must be verified in Resend)
+//     SUPPORT_EMAIL    — where appeals/alerts go (defaults to support@…)
+// ─────────────────────────────────────────────────────────────────────────────
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_FROM     = process.env.EMAIL_FROM    || 'Bone Tide Co. <support@bonetideco.com>';
+const SUPPORT_EMAIL  = process.env.SUPPORT_EMAIL || 'support@bonetideco.com';
+
+async function sendEmail({ to, subject, html, text }) {
+  if (!RESEND_API_KEY) {
+    console.log(`[email:dev] (no RESEND_API_KEY) to=${to} subject="${subject}"`);
+    return { sent: false, dev: true };
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: EMAIL_FROM, to, subject, html, text }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error('[email] Resend error:', data?.message ?? res.status);
+      return { sent: false, error: data?.message ?? `HTTP ${res.status}` };
+    }
+    return { sent: true, id: data.id };
+  } catch (err) {
+    console.error('[email] send failed:', err.message);
+    return { sent: false, error: err.message };
+  }
+}
+
 app.post('/api/auth/otp/send', async (req, res) => {
   try {
     const { email, phone } = req.body ?? {};
@@ -305,8 +343,15 @@ app.post('/api/auth/otp/send', async (req, res) => {
     otpCodes.set(key, { code, expiresAt: Date.now() + 10 * 60 * 1000 });
 
     if (email) {
-      // TODO: send via email provider (Resend/Postmark/SendGrid)
-      console.log(`[otp] Email code for ${email}: ${code}`);
+      const r = await sendEmail({
+        to: email,
+        subject: 'Your Bone Tide Co. sign-in code',
+        text: `Your Bone Tide Co. sign-in code is ${code}. It expires in 10 minutes.`,
+        html: `<p>Your Bone Tide Co. sign-in code is <strong style="font-size:22px;letter-spacing:2px">${code}</strong>.</p><p style="color:#666">It expires in 10 minutes.</p>`,
+      });
+      // If the provider isn't ready (no key / domain not verified yet), log the
+      // code so login still works during setup.
+      if (!r.sent) console.log(`[otp] Email not sent (${r.error ?? 'dev mode'}) — code for ${email}: ${code}`);
     } else {
       // TODO: send via Twilio
       console.log(`[otp] SMS code for ${phone}: ${code}`);
@@ -920,9 +965,33 @@ app.get('/api/catches', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Deterministic small jitter based on catch id so a given catch's pin doesn't
-// move between refreshes, but exact coordinates are never exposed publicly.
-function jitterCoords(lat, lon, seed) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Points appeals — angler disputes a 0-point catch. Saved to the appeals queue
+// for admin review, and (best-effort) emails support so it's not missed.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/appeals', async (req, res) => {
+  const { catchId, reason, message } = req.body ?? {};
+  try {
+    const user = await getUserFromRequest(req);
+    const { rows: [appeal] } = await pool.query(
+      `INSERT INTO appeals (user_id, catch_id, reason, message)
+       VALUES ($1,$2,$3,$4) RETURNING id, status, created_at`,
+      [user.id, catchId ?? null, reason ?? null, (message ?? '').slice(0, 1000)]
+    );
+    // Best-effort notify — won't block the response or fail the appeal.
+    sendEmail({
+      to: SUPPORT_EMAIL,
+      subject: `New points appeal · user ${user.id}`,
+      text: `User ${user.id} is appealing a declined catch.\n`
+          + `Catch ID: ${catchId ?? 'n/a'}\nDecline reason: ${reason ?? 'n/a'}\n`
+          + `Their message: ${message || '(none)'}\n\nReview it in the admin panel.`,
+    }).catch(() => {});
+    res.json({ appeal });
+  } catch (err) {
+    console.error('Appeal error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
   const hash = crypto.createHash('md5').update(String(seed)).digest();
   // Two pseudo-random values in [-1, 1] from the hash bytes
   const r1 = (hash[0] / 255) * 2 - 1;
@@ -973,6 +1042,16 @@ function formatCatch(row) {
 app.post('/api/spots', async (req, res) => {
   const { name, type, note, lat, lon, isPrivate, photoBase64 } = req.body;
   if (!name || lat == null || lon == null) return res.status(400).json({ error: 'name, lat, lon required' });
+
+  // Content filter on shareable text (spot name + note) before writing.
+  const spotBlocked = blockedCategory(name) || blockedCategory(note ?? '');
+  if (spotBlocked) {
+    return res.status(422).json({
+      error: "That spot's name or note contains language that isn't allowed on Bone Tide Co. Please keep it respectful.",
+      blocked: true,
+      category: spotBlocked,
+    });
+  }
   try {
     const user = await getUserFromRequest(req);
     let photoUrl = null;
@@ -1352,23 +1431,60 @@ app.post('/api/likes/batch', async (req, res) => {
 // comments. No human moderator required — server-side word list check before
 // the row is ever written to the DB.
 // ─────────────────────────────────────────────────────────────────────────────
-const BLOCKED_TERMS = [
-  // Racial slurs (partial list — catches common variants via includes())
+const HATE_TERMS = [
+  // Racial / ethnic slurs — matched aggressively (de-obfuscated, substring),
+  // since these effectively never appear inside legitimate words.
   'nigger','nigga','chink','spic','wetback','kike','gook','raghead','towelhead',
-  'beaner','cracker','honky','coon','jigaboo','porch monkey','jungle bunny',
-  'redskin','injun','zipperhead',
+  'beaner','jigaboo','porchmonkey','junglebunny','zipperhead',
   // Homophobic / transphobic slurs
-  'faggot','fag','dyke','tranny','shemale','homo ',
-  // Explicit sexual
-  'cunt','pussy','cock','dick','fuck','shit','bitch','asshole','motherfucker',
-  'whore','slut',
-  // Threats / violence
+  'faggot','dyke','tranny','shemale',
+];
+
+const PROFANITY_TERMS = [
+  // Strong profanity — matched on WORD BOUNDARIES so normal words are safe
+  // (e.g. "cock" won't flag woodcock/peacock/cockpit; "dick" won't flag
+  // Dickson; "crack" stays fine). Light leet-normalization still catches
+  // sh1t / a$$hole / b!tch.
+  'fuck','motherfucker','shit','bitch','asshole','cunt','pussy','cock',
+  'dick','whore','slut','fag',
+];
+
+const THREAT_TERMS = [
   'kill yourself','kys','go die','i will kill','i will hurt','i will find you',
 ];
 
+// Strip to letters only + fold common leetspeak — used for the aggressive
+// hate-term pass so spacing/punctuation/number swaps can't sneak a slur through.
+function deobfuscate(text) {
+  return text.toLowerCase()
+    .replace(/[@4]/g, 'a').replace(/0/g, 'o').replace(/[1!|]/g, 'i')
+    .replace(/3/g, 'e').replace(/[$5]/g, 's').replace(/7/g, 't')
+    .replace(/[^a-z]/g, '');
+}
+
+// Lighter normalization that keeps word boundaries intact, for the
+// word-boundary profanity pass.
+function lightNormalize(text) {
+  return text.toLowerCase()
+    .replace(/[@4]/g, 'a').replace(/0/g, 'o').replace(/[1!|]/g, 'i')
+    .replace(/3/g, 'e').replace(/[$5]/g, 's').replace(/7/g, 't');
+}
+
+// Returns the category that tripped ('hate' | 'profanity' | 'threat') or null.
+function blockedCategory(text) {
+  if (!text) return null;
+  const lower  = text.toLowerCase();
+  const deob   = deobfuscate(text);
+  const light  = lightNormalize(text);
+
+  if (HATE_TERMS.some(t => deob.includes(t.replace(/[^a-z]/g, '')))) return 'hate';
+  if (THREAT_TERMS.some(t => lower.includes(t))) return 'threat';
+  if (PROFANITY_TERMS.some(t => new RegExp(`\\b${t}\\b`).test(light))) return 'profanity';
+  return null;
+}
+
 function containsBlockedContent(text) {
-  const lower = text.toLowerCase();
-  return BLOCKED_TERMS.some(term => lower.includes(term));
+  return blockedCategory(text) !== null;
 }
 
 // Add photo_url to comments if not already present (idempotent)
@@ -1382,6 +1498,21 @@ pool.query(`
     created_at TIMESTAMPTZ DEFAULT NOW()
   )
 `).catch(e => console.error('[init] spot_photos:', e.message));
+
+// Points-decline appeals queue. Anglers appeal a 0-point catch; admins review
+// in the moderation panel. Email notification is best-effort (see sendEmail).
+pool.query(`
+  CREATE TABLE IF NOT EXISTS appeals (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL,
+    catch_id    INTEGER,
+    reason      TEXT,
+    message     TEXT,
+    status      TEXT NOT NULL DEFAULT 'open',
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ
+  )
+`).catch(e => console.error('[init] appeals:', e.message));
 
 pool.query(`
   CREATE TABLE IF NOT EXISTS likes (
@@ -1433,10 +1564,12 @@ app.post('/api/comments', async (req, res) => {
   if (!body || !body.trim()) return res.status(400).json({ error: 'body required' });
 
   // Content filter — reject before writing to DB
-  if (containsBlockedContent(body)) {
+  const commentBlocked = blockedCategory(body);
+  if (commentBlocked) {
     return res.status(422).json({
       error: 'Your comment contains language that isn\'t allowed on Bone Tide Co. Please keep it respectful.',
       blocked: true,
+      category: commentBlocked,
     });
   }
 
