@@ -539,7 +539,12 @@ async function uploadImageToCloudinary(base64, { folder, transformation }) {
   });
   const data = await res.json();
   if (!data.secure_url) throw new Error(data.error?.message ?? 'Image upload failed');
-  return data.secure_url.replace('/upload/', `/upload/${transformation}/`);
+  // When no transformation is requested, return the plain secure_url so callers
+  // (e.g. the catch-photo flow) can apply their own delivery transform via a
+  // single /upload/ replace without chaining onto a baked-in transform.
+  return transformation
+    ? data.secure_url.replace('/upload/', `/upload/${transformation}/`)
+    : data.secure_url;
 }
 
 async function uploadAvatarToCloudinary(base64) {
@@ -558,6 +563,13 @@ async function uploadSpotPhotoToCloudinary(base64) {
     folder: 'spots',
     transformation: 'c_limit,w_1200,f_webp,q_auto:good',
   });
+}
+
+// Catch photos: store the original (capped) without baking a transform into the
+// URL, so the app's thumbUrl() can apply its own square crop via a single
+// /upload/ replace. Returns a plain Cloudinary secure_url containing /upload/.
+async function uploadCatchPhotoToCloudinary(base64) {
+  return uploadImageToCloudinary(base64, { folder: 'catches', transformation: null });
 }
 
 // Upload/replace the user's profile picture. Works for any auth provider.
@@ -785,6 +797,23 @@ If multiple species are plausible, pick the most likely one for the region and n
 const DAILY_CAP = 1200, PTS_PER_CATCH = 10;
 const BOOST_DAILY_CAP = 2000; // raised cap on the user's activated birthday boost day
 const usedScanTokens = new Set(); // in-memory single-use tracking (resets on deploy/restart)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Catch photo upload — the app's uploadCatchPhoto() posts { imageBase64 } here
+// and expects { url } back. Without this route the upload 404s, the app
+// swallows the error, and every catch is saved with image_url=null (🐟 tiles).
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/upload-image', async (req, res) => {
+  try {
+    const { imageBase64 } = req.body ?? {};
+    if (!imageBase64) return res.status(400).json({ error: 'imageBase64 required' });
+    const url = await uploadCatchPhotoToCloudinary(imageBase64);
+    res.json({ url });
+  } catch (err) {
+    console.error('[upload-image] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.post('/api/catches', async (req, res) => {
   const { species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken, imageUrl, isPublic } = req.body;
@@ -1380,7 +1409,6 @@ pool.query(`
 
 pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS birthday_boost_at TIMESTAMPTZ`).catch(() => {});
-pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS forecast_opt_out BOOLEAN DEFAULT false`).catch(() => {});
 
 // ── Spot polls table ──────────────────────────────────────────────────────────
 pool.query(`
@@ -1542,35 +1570,32 @@ app.get('/api/privacy-prefs', async (req, res) => {
   try {
     const user = await getUserFromRequest(req);
     const { rows } = await pool.query(
-      `SELECT share_with_community, anonymize_shared, forecast_opt_out FROM users WHERE id=$1`, [user.id]
+      `SELECT share_with_community, anonymize_shared FROM users WHERE id=$1`, [user.id]
     );
     const row = rows[0] ?? {};
     res.json({
       shareWithCommunity: row.share_with_community ?? false,
       anonymizeShared:    row.anonymize_shared ?? true,
-      forecastOptOut:     row.forecast_opt_out ?? false,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/privacy-prefs', async (req, res) => {
-  const { shareWithCommunity, anonymizeShared, forecastOptOut } = req.body;
+  const { shareWithCommunity, anonymizeShared } = req.body;
   try {
     const user = await getUserFromRequest(req);
     const { rows } = await pool.query(
       `UPDATE users SET
          share_with_community = COALESCE($1, share_with_community),
-         anonymize_shared      = COALESCE($2, anonymize_shared),
-         forecast_opt_out      = COALESCE($3, forecast_opt_out)
-       WHERE id=$4
-       RETURNING share_with_community, anonymize_shared, forecast_opt_out`,
-      [shareWithCommunity ?? null, anonymizeShared ?? null, forecastOptOut ?? null, user.id]
+         anonymize_shared      = COALESCE($2, anonymize_shared)
+       WHERE id=$3
+       RETURNING share_with_community, anonymize_shared`,
+      [shareWithCommunity ?? null, anonymizeShared ?? null, user.id]
     );
     const row = rows[0] ?? {};
     res.json({
       shareWithCommunity: row.share_with_community ?? false,
       anonymizeShared:    row.anonymize_shared ?? true,
-      forecastOptOut:     row.forecast_opt_out ?? false,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
