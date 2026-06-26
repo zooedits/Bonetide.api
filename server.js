@@ -421,7 +421,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     let { rows } = await pool.query(
-      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at,
+      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin,
               COALESCE((
                 SELECT SUM(pt.delta) FROM points_transactions pt
                 WHERE pt.user_id = u.id AND pt.reason = 'catch'
@@ -434,7 +434,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     // Fall back to email match for merged/Apple accounts where provider column is null
     if (!rows.length && req.user.email) {
       ({ rows } = await pool.query(
-        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at,
+        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin,
                 COALESCE((
                   SELECT SUM(pt.delta) FROM points_transactions pt
                   WHERE pt.user_id = u.id AND pt.reason = 'catch'
@@ -865,6 +865,8 @@ app.post('/api/catches', async (req, res) => {
   if (!species) return res.status(400).json({ error: 'species required' });
   try {
     const user = await getUserFromRequest(req);
+    const banChk = await pool.query(`SELECT is_banned FROM users WHERE id=$1`, [user.id]);
+    if (banChk.rows[0]?.is_banned) return res.status(403).json({ error: 'Your account is suspended.' });
     const today = new Date().toISOString().slice(0, 10);
     const { rows: todayRows } = await pool.query(`SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2`, [user.id, today]);
     const todayPts = parseInt(todayRows[0].total);
@@ -1050,6 +1052,7 @@ app.post('/api/spots', async (req, res) => {
   // Content filter on shareable text (spot name + note) before writing.
   const spotBlocked = blockedCategory(name) || blockedCategory(note ?? '');
   if (spotBlocked) {
+    logModeration(req, 'spot', spotBlocked, `${name} ${note ?? ''}`);
     return res.status(422).json({
       error: "That spot's name or note contains language that isn't allowed on Bone Tide Co. Please keep it respectful.",
       blocked: true,
@@ -1058,6 +1061,8 @@ app.post('/api/spots', async (req, res) => {
   }
   try {
     const user = await getUserFromRequest(req);
+    const banChk = await pool.query(`SELECT is_banned FROM users WHERE id=$1`, [user.id]);
+    if (banChk.rows[0]?.is_banned) return res.status(403).json({ error: 'Your account is suspended.' });
     let photoUrl = null;
     if (photoBase64) {
       try { photoUrl = await uploadSpotPhotoToCloudinary(photoBase64); }
@@ -1570,6 +1575,7 @@ app.post('/api/comments', async (req, res) => {
   // Content filter — reject before writing to DB
   const commentBlocked = blockedCategory(body);
   if (commentBlocked) {
+    logModeration(req, 'comment', commentBlocked, body);
     return res.status(422).json({
       error: 'Your comment contains language that isn\'t allowed on Bone Tide Co. Please keep it respectful.',
       blocked: true,
@@ -1580,6 +1586,8 @@ app.post('/api/comments', async (req, res) => {
   try {
     assertValidTarget(targetType, targetId);
     const user = await getUserFromRequest(req);
+    const banChk = await pool.query(`SELECT is_banned FROM users WHERE id=$1`, [user.id]);
+    if (banChk.rows[0]?.is_banned) return res.status(403).json({ error: 'Your account is suspended.' });
     const tId = parseInt(targetId);
     const { rows: [newComment] } = await pool.query(
       `INSERT INTO comments (user_id,target_type,target_id,parent_comment_id,body,photo_url,created_at)
@@ -2448,6 +2456,193 @@ app.get('/api/products', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ADMIN / MODERATION (Chunk B)
+// Make yourself admin once with:  UPDATE users SET is_admin = true WHERE id = <your_id>;
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Idempotent migrations
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin  BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_admin:', e.message));
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_banned:', e.message));
+pool.query(`
+  CREATE TABLE IF NOT EXISTS moderation_log (
+    id         SERIAL PRIMARY KEY,
+    user_id    INTEGER,
+    surface    TEXT,
+    category   TEXT,
+    content    TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.error('[init] moderation_log:', e.message));
+
+// Admin guard — verifies JWT AND that the user has is_admin=true in the DB.
+async function requireAdmin(req, res, next) {
+  const header = req.headers['authorization'] ?? '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const column = PROVIDER_COLUMN[decoded.provider] ?? 'google_id';
+    const { rows } = await pool.query(`SELECT id, is_admin FROM users WHERE ${column}=$1 LIMIT 1`, [decoded.id]);
+    if (!rows.length || !rows[0].is_admin) return res.status(403).json({ error: 'Admin only' });
+    req.adminUser = rows[0];
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// Records a blocked post into the flagged-word log. Best-effort, never throws.
+async function logModeration(req, surface, category, text) {
+  let userId = null;
+  try { const u = await getUserFromRequest(req); userId = u.id; } catch {}
+  pool.query(
+    `INSERT INTO moderation_log (user_id, surface, category, content) VALUES ($1,$2,$3,$4)`,
+    [userId, surface, category, (text ?? '').slice(0, 500)]
+  ).catch(e => console.error('[modlog]', e.message));
+}
+
+// ── List community content ───────────────────────────────────────────────────
+app.get('/api/admin/catches', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit ?? 50), 200);
+    const { rows } = await pool.query(
+      `SELECT c.id, c.species, c.length_in, c.image_url, c.note, c.is_public, c.caught_at,
+              u.id AS user_id, u.name AS user_name
+       FROM catches c JOIN users u ON u.id=c.user_id
+       WHERE c.is_public = true
+       ORDER BY c.caught_at DESC LIMIT $1`, [limit]
+    );
+    res.json({ catches: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/spots', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit ?? 50), 200);
+    const { rows } = await pool.query(
+      `SELECT s.id, s.name, s.type, s.note, s.photo_url, s.created_at,
+              u.id AS user_id, u.name AS user_name
+       FROM spots s JOIN users u ON u.id=s.user_id
+       WHERE s.is_private = false
+       ORDER BY s.created_at DESC LIMIT $1`, [limit]
+    );
+    res.json({ spots: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/comments', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit ?? 100), 300);
+    const { rows } = await pool.query(
+      `SELECT cm.id, cm.body, cm.target_type, cm.target_id, cm.created_at,
+              u.id AS user_id, u.name AS user_name
+       FROM comments cm JOIN users u ON u.id=cm.user_id
+       ORDER BY cm.created_at DESC LIMIT $1`, [limit]
+    );
+    res.json({ comments: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/photos', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit ?? 60), 200);
+    const { rows } = await pool.query(
+      `SELECT p.id, p.spot_id, p.photo_url, p.created_at,
+              u.id AS user_id, u.name AS user_name
+       FROM spot_photos p JOIN users u ON u.id=p.user_id
+       ORDER BY p.created_at DESC LIMIT $1`, [limit]
+    );
+    res.json({ photos: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Delete any community content ─────────────────────────────────────────────
+app.delete('/api/admin/catches/:id', requireAdmin, async (req, res) => {
+  try { await pool.query(`DELETE FROM catches WHERE id=$1`, [req.params.id]); res.json({ deleted: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.delete('/api/admin/spots/:id', requireAdmin, async (req, res) => {
+  try { await pool.query(`DELETE FROM spots WHERE id=$1`, [req.params.id]); res.json({ deleted: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.delete('/api/admin/comments/:id', requireAdmin, async (req, res) => {
+  try { await pool.query(`DELETE FROM comments WHERE id=$1`, [req.params.id]); res.json({ deleted: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.delete('/api/admin/photos/:id', requireAdmin, async (req, res) => {
+  try { await pool.query(`DELETE FROM spot_photos WHERE id=$1`, [req.params.id]); res.json({ deleted: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Appeals queue ─────────────────────────────────────────────────────────────
+app.get('/api/admin/appeals', requireAdmin, async (req, res) => {
+  try {
+    const status = req.query.status ?? 'open';
+    const { rows } = await pool.query(
+      `SELECT a.id, a.user_id, a.catch_id, a.reason, a.message, a.status, a.created_at, a.resolved_at,
+              u.name AS user_name,
+              c.species, c.length_in, c.image_url
+       FROM appeals a
+       JOIN users u ON u.id=a.user_id
+       LEFT JOIN catches c ON c.id=a.catch_id
+       WHERE ($1='all' OR a.status=$1)
+       ORDER BY a.created_at DESC LIMIT 200`, [status]
+    );
+    res.json({ appeals: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/appeals/:id/resolve', requireAdmin, async (req, res) => {
+  const { decision } = req.body ?? {};   // 'granted' | 'denied'
+  if (!['granted', 'denied'].includes(decision)) return res.status(400).json({ error: 'decision must be granted or denied' });
+  try {
+    const { rows: [appeal] } = await pool.query(
+      `UPDATE appeals SET status=$1, resolved_at=NOW() WHERE id=$2 RETURNING *`, [decision, req.params.id]
+    );
+    if (!appeal) return res.status(404).json({ error: 'Appeal not found' });
+
+    // Granting an appeal awards the standard per-catch points to the angler.
+    let awarded = 0;
+    if (decision === 'granted') {
+      awarded = PTS_PER_CATCH;
+      await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [awarded, appeal.user_id]);
+      await pool.query(
+        `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'appeal',$3,NOW())`,
+        [appeal.user_id, awarded, String(appeal.catch_id ?? appeal.id)]
+      );
+      if (appeal.catch_id) await pool.query(`UPDATE catches SET pts_awarded=$1 WHERE id=$2`, [awarded, appeal.catch_id]);
+    }
+    res.json({ resolved: true, decision, awarded });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Flagged-word log ──────────────────────────────────────────────────────────
+app.get('/api/admin/flagged', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT m.id, m.surface, m.category, m.content, m.created_at,
+              u.name AS user_name, u.id AS user_id
+       FROM moderation_log m LEFT JOIN users u ON u.id=m.user_id
+       ORDER BY m.created_at DESC LIMIT 200`
+    );
+    res.json({ flagged: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Ban / unban ───────────────────────────────────────────────────────────────
+app.post('/api/admin/users/:id/ban', requireAdmin, async (req, res) => {
+  const banned = req.body?.banned !== false;  // default true; pass { banned: false } to unban
+  try {
+    const { rows } = await pool.query(
+      `UPDATE users SET is_banned=$1 WHERE id=$2 RETURNING id, is_banned`, [banned, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => console.log(`Bone Tide Co. API running on port ${PORT}`));
 // ── User Media Library ────────────────────────────────────────────────────────
 
