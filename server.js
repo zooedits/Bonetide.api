@@ -992,6 +992,10 @@ app.post('/api/appeals', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Deterministic small jitter based on catch id so a given catch's pin doesn't
+// move between refreshes, but exact coordinates are never exposed publicly.
+function jitterCoords(lat, lon, seed) {
   const hash = crypto.createHash('md5').update(String(seed)).digest();
   // Two pseudo-random values in [-1, 1] from the hash bytes
   const r1 = (hash[0] / 255) * 2 - 1;
