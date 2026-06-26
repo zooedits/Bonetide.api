@@ -490,7 +490,7 @@ app.post('/api/auth/birthday-boost/activate', requireAuth, async (req, res) => {
       `SELECT birthday_month,
               EXTRACT(MONTH FROM CURRENT_DATE)::int AS cur_month,
               (birthday_boost_at IS NOT NULL
-                AND EXTRACT(YEAR FROM birthday_boost_at) = EXTRACT(YEAR FROM CURRENT_DATE)) AS used_this_year,
+                AND birthday_boost_at > NOW() - INTERVAL '300 days') AS used_recently,
               birthday_boost_at
          FROM users WHERE ${column}=$1`, [req.user.id]
     );
@@ -503,8 +503,8 @@ app.post('/api/auth/birthday-boost/activate', requireAuth, async (req, res) => {
     if (u.birthday_month !== u.cur_month) {
       return res.status(400).json({ code: 'NOT_BIRTHDAY_MONTH', error: 'Double Points day can only be used during your birthday month.' });
     }
-    if (u.used_this_year) {
-      return res.status(409).json({ code: 'ALREADY_USED', error: 'You’ve already used your Double Points day this year.', activatedAt: u.birthday_boost_at });
+    if (u.used_recently) {
+      return res.status(409).json({ code: 'ALREADY_USED', error: 'You’ve already used your Double Points day — it unlocks again about a year after your last one.', activatedAt: u.birthday_boost_at });
     }
 
     const { rows: [updated] } = await pool.query(
