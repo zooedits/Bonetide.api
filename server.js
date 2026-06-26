@@ -376,12 +376,28 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     let { rows } = await pool.query(
-      `SELECT name, avatar, email, points_balance, birthday_month FROM users WHERE ${column}=$1`, [req.user.id]
+      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at,
+              COALESCE((
+                SELECT SUM(pt.delta) FROM points_transactions pt
+                WHERE pt.user_id = u.id AND pt.reason = 'catch'
+                  AND u.birthday_boost_at IS NOT NULL
+                  AND pt.created_at >= u.birthday_boost_at
+                  AND pt.created_at < u.birthday_boost_at + INTERVAL '24 hours'
+              ), 0) AS birthday_boost_earned
+         FROM users u WHERE u.${column}=$1`, [req.user.id]
     );
     // Fall back to email match for merged/Apple accounts where provider column is null
     if (!rows.length && req.user.email) {
       ({ rows } = await pool.query(
-        `SELECT name, avatar, email, points_balance, birthday_month FROM users WHERE email=$1`, [req.user.email]
+        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at,
+                COALESCE((
+                  SELECT SUM(pt.delta) FROM points_transactions pt
+                  WHERE pt.user_id = u.id AND pt.reason = 'catch'
+                    AND u.birthday_boost_at IS NOT NULL
+                    AND pt.created_at >= u.birthday_boost_at
+                    AND pt.created_at < u.birthday_boost_at + INTERVAL '24 hours'
+                ), 0) AS birthday_boost_earned
+           FROM users u WHERE u.email=$1`, [req.user.email]
       ));
     }
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
@@ -416,47 +432,51 @@ app.put('/api/auth/birthday-month', requireAuth, async (req, res) => {
   }
 });
 
-// Claim the birthday-month points bonus. Idempotent per calendar year — safe
-// to call on every app open; only awards once per year when the current
-// month matches the user's stored birthday_month.
+// Birthday "Double Points" day — the user activates a single 24-hour boost
+// window during their birthday month. For 24h from the tap, catches pay 2× and
+// the daily cap is lifted to BOOST_DAILY_CAP. One activation per birthday year.
 //
 // Requires DB migration:
-//   ALTER TABLE users ADD COLUMN birthday_bonus_year smallint;
-const BIRTHDAY_BONUS_PTS = 100;
-
-app.post('/api/auth/birthday-bonus/claim', requireAuth, async (req, res) => {
+//   ALTER TABLE users ADD COLUMN birthday_boost_at timestamptz;
+app.post('/api/auth/birthday-boost/activate', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     const { rows } = await pool.query(
-      `SELECT id, birthday_month, birthday_bonus_year FROM users WHERE ${column}=$1`, [req.user.id]
+      `SELECT birthday_month,
+              EXTRACT(MONTH FROM CURRENT_DATE)::int AS cur_month,
+              (birthday_boost_at IS NOT NULL
+                AND EXTRACT(YEAR FROM birthday_boost_at) = EXTRACT(YEAR FROM CURRENT_DATE)) AS used_this_year,
+              birthday_boost_at
+         FROM users WHERE ${column}=$1`, [req.user.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
-    const userRow = rows[0];
+    const u = rows[0];
 
-    const now = new Date();
-    const currentMonth = now.getMonth() + 1;
-    const currentYear  = now.getFullYear();
-
-    if (userRow.birthday_month !== currentMonth) {
-      return res.json({ awarded: false });
+    if (!u.birthday_month) {
+      return res.status(400).json({ code: 'NO_BIRTHDAY', error: 'Set your birthday month first.' });
     }
-    if (userRow.birthday_bonus_year === currentYear) {
-      return res.json({ awarded: false }); // already claimed this year
+    if (u.birthday_month !== u.cur_month) {
+      return res.status(400).json({ code: 'NOT_BIRTHDAY_MONTH', error: 'Double Points day can only be used during your birthday month.' });
+    }
+    if (u.used_this_year) {
+      return res.status(409).json({ code: 'ALREADY_USED', error: 'You’ve already used your Double Points day this year.', activatedAt: u.birthday_boost_at });
     }
 
-    await pool.query(
-      `UPDATE users SET points_balance=points_balance+$1, birthday_bonus_year=$2 WHERE id=$3`,
-      [BIRTHDAY_BONUS_PTS, currentYear, userRow.id]
+    const { rows: [updated] } = await pool.query(
+      `UPDATE users SET birthday_boost_at = NOW() WHERE ${column}=$1 RETURNING birthday_boost_at`,
+      [req.user.id]
     );
-    await pool.query(
-      `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'birthday_bonus',$3,NOW())`,
-      [userRow.id, BIRTHDAY_BONUS_PTS, currentYear.toString()]
-    );
-
-    res.json({ awarded: true, points: BIRTHDAY_BONUS_PTS });
+    res.json({ activated: true, activatedAt: updated.birthday_boost_at, dailyCap: BOOST_DAILY_CAP });
   } catch (err) {
+    console.error('Birthday boost activate error:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Retired flat birthday bonus — kept as a harmless no-op so older clients that
+// still POST here don't error. (Replaced by the activatable Double Points day.)
+app.post('/api/auth/birthday-bonus/claim', requireAuth, async (req, res) => {
+  res.json({ awarded: false });
 });
 
 // Set/update the user's display name. Used by the universal "What should we
@@ -762,7 +782,8 @@ If multiple species are plausible, pick the most likely one for the region and n
   }
 });
 
-const DAILY_CAP = 30, PTS_PER_CATCH = 10;
+const DAILY_CAP = 1200, PTS_PER_CATCH = 10;
+const BOOST_DAILY_CAP = 2000; // raised cap on the user's activated birthday boost day
 const usedScanTokens = new Set(); // in-memory single-use tracking (resets on deploy/restart)
 
 app.post('/api/catches', async (req, res) => {
@@ -773,7 +794,16 @@ app.post('/api/catches', async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     const { rows: todayRows } = await pool.query(`SELECT COALESCE(SUM(pts_awarded), 0) AS total FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2`, [user.id, today]);
     const todayPts = parseInt(todayRows[0].total);
-    const ptsLeft = Math.max(0, DAILY_CAP - todayPts);
+
+    // Birthday Double Points day: if today is the user's activated boost day,
+    // lift the daily cap and pay 2× per catch.
+    const { rows: [boostRow] } = await pool.query(
+      `SELECT (birthday_boost_at IS NOT NULL AND NOW() < birthday_boost_at + INTERVAL '24 hours') AS active FROM users WHERE id=$1`, [user.id]
+    );
+    const boostActive = !!boostRow?.active;
+    const dailyCap = boostActive ? BOOST_DAILY_CAP : DAILY_CAP;
+    const perCatch = boostActive ? PTS_PER_CATCH * 2 : PTS_PER_CATCH;
+    const ptsLeft = Math.max(0, dailyCap - todayPts);
 
     // Verify the scan token issued by /api/identify. Points are only awarded
     // if the token is valid, unexpired, unused, the species matches what was
@@ -805,7 +835,7 @@ app.post('/api/catches', async (req, res) => {
 
     if (scanRejectReason) console.log(`Catch logged without points (user ${user.id}): ${scanRejectReason}`);
 
-    const ptsAwarded = scanInfo && ptsLeft > 0 ? Math.min(PTS_PER_CATCH, ptsLeft) : 0;
+    const ptsAwarded = scanInfo && ptsLeft > 0 ? Math.min(perCatch, ptsLeft) : 0;
     const { rows: [newCatch] } = await pool.query(
       `INSERT INTO catches (user_id,species,length_in,released,bait,note,lat,lon,tide_height_ft,tide_direction,wind_kts,wind_direction,baro_in_hg,moon_pct,good_bite_score,pts_awarded,image_url,is_public,caught_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) RETURNING *`,
@@ -815,7 +845,7 @@ app.post('/api/catches', async (req, res) => {
       await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [ptsAwarded, user.id]);
       await pool.query(`INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'catch',$3,NOW())`, [user.id, ptsAwarded, newCatch.id.toString()]);
     }
-    res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap: DAILY_CAP, pointsRejectReason: scanRejectReason });
+    res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap, boostActive, pointsRejectReason: scanRejectReason });
   } catch (err) {
     console.error('Log catch error:', err);
     res.status(500).json({ error: err.message });
@@ -1349,6 +1379,8 @@ pool.query(`
 `).catch(e => console.error('[init] comments:', e.message));
 
 pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS birthday_boost_at TIMESTAMPTZ`).catch(() => {});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS forecast_opt_out BOOLEAN DEFAULT false`).catch(() => {});
 
 // ── Spot polls table ──────────────────────────────────────────────────────────
 pool.query(`
@@ -1510,32 +1542,35 @@ app.get('/api/privacy-prefs', async (req, res) => {
   try {
     const user = await getUserFromRequest(req);
     const { rows } = await pool.query(
-      `SELECT share_with_community, anonymize_shared FROM users WHERE id=$1`, [user.id]
+      `SELECT share_with_community, anonymize_shared, forecast_opt_out FROM users WHERE id=$1`, [user.id]
     );
     const row = rows[0] ?? {};
     res.json({
       shareWithCommunity: row.share_with_community ?? false,
       anonymizeShared:    row.anonymize_shared ?? true,
+      forecastOptOut:     row.forecast_opt_out ?? false,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/privacy-prefs', async (req, res) => {
-  const { shareWithCommunity, anonymizeShared } = req.body;
+  const { shareWithCommunity, anonymizeShared, forecastOptOut } = req.body;
   try {
     const user = await getUserFromRequest(req);
     const { rows } = await pool.query(
       `UPDATE users SET
          share_with_community = COALESCE($1, share_with_community),
-         anonymize_shared      = COALESCE($2, anonymize_shared)
-       WHERE id=$3
-       RETURNING share_with_community, anonymize_shared`,
-      [shareWithCommunity ?? null, anonymizeShared ?? null, user.id]
+         anonymize_shared      = COALESCE($2, anonymize_shared),
+         forecast_opt_out      = COALESCE($3, forecast_opt_out)
+       WHERE id=$4
+       RETURNING share_with_community, anonymize_shared, forecast_opt_out`,
+      [shareWithCommunity ?? null, anonymizeShared ?? null, forecastOptOut ?? null, user.id]
     );
     const row = rows[0] ?? {};
     res.json({
       shareWithCommunity: row.share_with_community ?? false,
       anonymizeShared:    row.anonymize_shared ?? true,
+      forecastOptOut:     row.forecast_opt_out ?? false,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
