@@ -2465,6 +2465,13 @@ const PORT = process.env.PORT || 3000;
 // Idempotent migrations
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin  BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_admin:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_banned:', e.message));
+
+// Bone Tide Club (RevenueCat) columns. The extension added these via a one-off
+// psql command; declaring them here too makes the schema reproducible and is a
+// no-op if they already exist.
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS rc_user_id      TEXT`).catch(e => console.error('[init] rc_user_id:', e.message));
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_club         BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_club:', e.message));
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_expires_at TIMESTAMPTZ`).catch(e => console.error('[init] club_expires_at:', e.message));
 pool.query(`
   CREATE TABLE IF NOT EXISTS moderation_log (
     id         SERIAL PRIMARY KEY,
@@ -2741,108 +2748,140 @@ app.delete('/api/me/photos/comments/:id', requireAuth, async (req, res) => {
 });
 
 
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BONE TIDE CLUB — RevenueCat subscription webhook + status + gating
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// IDENTITY MATCHING (the important part):
+// The app calls Purchases.logIn(appUserId) where appUserId is the user's
+// provider id — google_id / apple_id / auth_id — which is exactly what's stored
+// on the users row. So the webhook matches incoming app_user_id against those
+// columns (and rc_user_id, which we back-fill on first match). No reliance on
+// device_id, which is a different value and would never match.
+//
+// ACCESS = club_expires_at in the future. Modeling it on the expiry timestamp
+// (rather than flipping a boolean on every event) makes cancellations correct:
+// a user who cancels keeps Club until their paid period ends; EXPIRATION is what
+// actually ends access. Billing grace periods are handled the same way.
+//
+// AUTH: RevenueCat sends the Authorization header you set in the dashboard
+// (Project → Integrations → Webhooks). Set it to exactly RC_WEBHOOK_SECRET.
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/revenuecat/webhook — RevenueCat subscription events
-// Sets is_club flag on users table based on subscription status
-// ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/revenuecat/webhook',
-           express.raw({ type: 'application/json' }),
-           async (req, res) => {
-                 // Verify authorization header matches RC_WEBHOOK_SECRET
-             const authHeader = req.headers['authorization'] ?? '';
-                 const secret = process.env.RC_WEBHOOK_SECRET ?? '';
-                 if (!secret || authHeader !== secret) {
-                         return res.status(401).json({ error: 'Unauthorized' });
-                 }
+app.post('/api/revenuecat/webhook', async (req, res) => {
+  const secret = process.env.RC_WEBHOOK_SECRET ?? '';
+  let authHeader = req.headers['authorization'] ?? '';
+  if (authHeader.startsWith('Bearer ')) authHeader = authHeader.slice(7);
+  if (!secret || authHeader !== secret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
 
-             let body;
-                 try {
-                         body = typeof req.body === 'object' && req.body !== null && !Buffer.isBuffer(req.body) ? req.body : JSON.parse(req.body.toString());
-                 } catch {
-                         return res.status(400).json({ error: 'Invalid JSON' });
-                 }
+  const event       = req.body?.event ?? {};
+  const type        = event.type ?? '';
+  const appUserId   = event.app_user_id ?? event.original_app_user_id ?? null;
+  const expiresAtMs = event.expiration_at_ms ?? null;
 
-             const event = body.event ?? {};
-                 const type = event.type ?? '';
-                 const appUserId = event.app_user_id ?? event.original_app_user_id ?? '';
-                 const expiresAtMs = event.expiration_at_ms ?? null;
+  if (!appUserId) return res.status(200).json({ received: true, skipped: 'no app_user_id' });
 
-             // Events that grant club access
-             const GRANT_EVENTS = [
-                     'INITIAL_PURCHASE', 'RENEWAL', 'UNCANCELLATION',
-                     'PRODUCT_CHANGE', 'TRANSFER', 'SUBSCRIBER_ALIAS',
-                     'NON_SUBSCRIPTION_PURCHASE',
-                   ];
-                 // Events that revoke club access
-             const REVOKE_EVENTS = [
-                     'CANCELLATION', 'EXPIRATION', 'BILLING_ISSUE',
-                   ];
+  const GRANT  = new Set(['INITIAL_PURCHASE','RENEWAL','UNCANCELLATION','PRODUCT_CHANGE','TRANSFER','NON_SUBSCRIPTION_PURCHASE']);
+  const REVOKE = new Set(['EXPIRATION']);
 
-             try {
-                     if (GRANT_EVENTS.includes(type)) {
-                               const expiresAt = expiresAtMs ? new Date(expiresAtMs).toISOString() : null;
-                               await pool.query(
-                                           `UPDATE users
-                                                      SET is_club = true,
-                                                                     club_expires_at = $1,
-                                                                                    rc_user_id = $2
-                                                                                               WHERE device_id = $3 OR rc_user_id = $3`,
-                                           [expiresAt, appUserId, appUserId]
-                                         );
-                     } else if (REVOKE_EVENTS.includes(type)) {
-                               await pool.query(
-                                           `UPDATE users
-                                                      SET is_club = false,
-                                                                     club_expires_at = $1
-                                                                                WHERE device_id = $2 OR rc_user_id = $2`,
-                                           [expiresAtMs ? new Date(expiresAtMs).toISOString() : null, appUserId]
-                                         );
-                     }
-             } catch (err) {
-                     console.error('RevenueCat webhook DB error:', err.message);
-                     // Still return 200 so RC doesn't retry indefinitely
-             }
+  // Prefer the expiry timestamp as the source of truth; fall back to event type
+  // when no expiry is present in the payload.
+  let isClub;
+  if (expiresAtMs != null) {
+    isClub = Number(expiresAtMs) > Date.now();
+  } else if (GRANT.has(type)) {
+    isClub = true;
+  } else if (REVOKE.has(type)) {
+    isClub = false;
+  } else {
+    // CANCELLATION / BILLING_ISSUE with no expiry — leave state untouched;
+    // the member keeps access until EXPIRATION fires.
+    return res.status(200).json({ received: true, skipped: type });
+  }
 
-             res.status(200).json({ received: true });
-           }
-         );
+  const expiresAtIso = expiresAtMs != null ? new Date(Number(expiresAtMs)).toISOString() : null;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/me/club-status — client can check their club status
-// ─────────────────────────────────────────────────────────────────────────────
-app.get('/api/me/club-status', requireAuth, async (req, res) => {
-    try {
-          const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
-          const { rows: [u] } = await pool.query(
-                  `SELECT is_club, club_expires_at FROM users WHERE ${col}=$1 LIMIT 1`,
-                  [req.user.id]
-                );
-          if (!u) return res.status(404).json({ error: 'User not found' });
-          res.json({
-                  isClub: u.is_club ?? false,
-                  clubExpiresAt: u.club_expires_at ?? null,
-          });
-    } catch (err) {
-          res.status(500).json({ error: err.message });
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE users
+          SET is_club = $1,
+              club_expires_at = $2,
+              rc_user_id = $3
+        WHERE rc_user_id = $3
+           OR google_id  = $3
+           OR apple_id   = $3
+           OR auth_id    = $3
+           OR (email IS NOT NULL AND email = $3)`,
+      [isClub, expiresAtIso, appUserId]
+    );
+    if (rowCount) {
+      console.log(`[revenuecat] ${type}: set is_club=${isClub} for app_user_id=${appUserId}`);
+    } else {
+      console.warn(`[revenuecat] no user matched app_user_id=${appUserId} (type=${type})`);
     }
+  } catch (err) {
+    console.error('[revenuecat] webhook DB error:', err.message);
+    // Still 200 so RevenueCat doesn't retry forever; the error is logged.
+  }
+  res.status(200).json({ received: true });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Middleware: requireClub — gates routes to club members only
-// ─────────────────────────────────────────────────────────────────────────────
-async function requireClub(req, res, next) {
-    try {
-          const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
-          const { rows: [u] } = await pool.query(
-                  `SELECT is_club, club_expires_at FROM users WHERE ${col}=$1 LIMIT 1`,
-                  [req.user.id]
-                );
-          const now = new Date();
-          const isActive = u?.is_club &&
-                  (!u.club_expires_at || new Date(u.club_expires_at) > now);
-          if (!isActive) return res.status(403).json({ error: 'Club membership required' });
-          next();
-    } catch (err) {
-          res.status(500).json({ error: err.message });
+// Client check of their own Club status (the app mostly reads this from the
+// RevenueCat SDK directly, but this is handy as a server-of-record fallback).
+app.get('/api/me/club-status', requireAuth, async (req, res) => {
+  try {
+    const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    let { rows } = await pool.query(
+      `SELECT is_club, club_expires_at FROM users WHERE ${col}=$1 LIMIT 1`, [req.user.id]
+    );
+    if (!rows.length && req.user.email) {
+      ({ rows } = await pool.query(
+        `SELECT is_club, club_expires_at FROM users WHERE email=$1 LIMIT 1`, [req.user.email]
+      ));
     }
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    const u = rows[0];
+    const active = !!u.is_club && (!u.club_expires_at || new Date(u.club_expires_at) > new Date());
+    res.json({ isClub: active, clubExpiresAt: u.club_expires_at ?? null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Authoritatively map this account to the RevenueCat app_user_id the client
+// logged in with. Optional belt-and-suspenders: the webhook already matches on
+// the provider-id columns, but calling this right after Purchases.logIn()
+// guarantees rc_user_id is set even before the first purchase.
+app.post('/api/me/link-revenuecat', requireAuth, async (req, res) => {
+  const { rcUserId } = req.body ?? {};
+  if (!rcUserId) return res.status(400).json({ error: 'rcUserId required' });
+  try {
+    const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rowCount } = await pool.query(
+      `UPDATE users SET rc_user_id=$1 WHERE ${col}=$2`, [String(rcUserId), req.user.id]
+    );
+    if (!rowCount && req.user.email) {
+      await pool.query(`UPDATE users SET rc_user_id=$1 WHERE email=$2`, [String(rcUserId), req.user.email]);
+    }
+    res.json({ linked: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Gate any route behind active Club membership. Chain AFTER requireAuth.
+async function requireClub(req, res, next) {
+  try {
+    const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows: [u] } = await pool.query(
+      `SELECT is_club, club_expires_at FROM users WHERE ${col}=$1 LIMIT 1`, [req.user.id]
+    );
+    const active = u?.is_club && (!u.club_expires_at || new Date(u.club_expires_at) > new Date());
+    if (!active) return res.status(403).json({ error: 'Club membership required' });
+    next();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 }
