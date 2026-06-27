@@ -2739,3 +2739,110 @@ app.delete('/api/me/photos/comments/:id', requireAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/revenuecat/webhook — RevenueCat subscription events
+// Sets is_club flag on users table based on subscription status
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/revenuecat/webhook',
+           express.raw({ type: 'application/json' }),
+           async (req, res) => {
+                 // Verify authorization header matches RC_WEBHOOK_SECRET
+             const authHeader = req.headers['authorization'] ?? '';
+                 const secret = process.env.RC_WEBHOOK_SECRET ?? '';
+                 if (!secret || authHeader !== secret) {
+                         return res.status(401).json({ error: 'Unauthorized' });
+                 }
+
+             let body;
+                 try {
+                         body = JSON.parse(req.body.toString());
+                 } catch {
+                         return res.status(400).json({ error: 'Invalid JSON' });
+                 }
+
+             const event = body.event ?? {};
+                 const type = event.type ?? '';
+                 const appUserId = event.app_user_id ?? event.original_app_user_id ?? '';
+                 const expiresAtMs = event.expiration_at_ms ?? null;
+
+             // Events that grant club access
+             const GRANT_EVENTS = [
+                     'INITIAL_PURCHASE', 'RENEWAL', 'UNCANCELLATION',
+                     'PRODUCT_CHANGE', 'TRANSFER', 'SUBSCRIBER_ALIAS',
+                     'NON_SUBSCRIPTION_PURCHASE',
+                   ];
+                 // Events that revoke club access
+             const REVOKE_EVENTS = [
+                     'CANCELLATION', 'EXPIRATION', 'BILLING_ISSUE',
+                   ];
+
+             try {
+                     if (GRANT_EVENTS.includes(type)) {
+                               const expiresAt = expiresAtMs ? new Date(expiresAtMs).toISOString() : null;
+                               await pool.query(
+                                           `UPDATE users
+                                                      SET is_club = true,
+                                                                     club_expires_at = $1,
+                                                                                    rc_user_id = $2
+                                                                                               WHERE device_id = $3 OR rc_user_id = $3`,
+                                           [expiresAt, appUserId, appUserId]
+                                         );
+                     } else if (REVOKE_EVENTS.includes(type)) {
+                               await pool.query(
+                                           `UPDATE users
+                                                      SET is_club = false,
+                                                                     club_expires_at = $1
+                                                                                WHERE device_id = $2 OR rc_user_id = $2`,
+                                           [expiresAtMs ? new Date(expiresAtMs).toISOString() : null, appUserId]
+                                         );
+                     }
+             } catch (err) {
+                     console.error('RevenueCat webhook DB error:', err.message);
+                     // Still return 200 so RC doesn't retry indefinitely
+             }
+
+             res.status(200).json({ received: true });
+           }
+         );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/me/club-status — client can check their club status
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/me/club-status', requireAuth, async (req, res) => {
+    try {
+          const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+          const { rows: [u] } = await pool.query(
+                  `SELECT is_club, club_expires_at FROM users WHERE ${col}=$1 LIMIT 1`,
+                  [req.user.id]
+                );
+          if (!u) return res.status(404).json({ error: 'User not found' });
+          res.json({
+                  isClub: u.is_club ?? false,
+                  clubExpiresAt: u.club_expires_at ?? null,
+          });
+    } catch (err) {
+          res.status(500).json({ error: err.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Middleware: requireClub — gates routes to club members only
+// ─────────────────────────────────────────────────────────────────────────────
+async function requireClub(req, res, next) {
+    try {
+          const col = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+          const { rows: [u] } = await pool.query(
+                  `SELECT is_club, club_expires_at FROM users WHERE ${col}=$1 LIMIT 1`,
+                  [req.user.id]
+                );
+          const now = new Date();
+          const isActive = u?.is_club &&
+                  (!u.club_expires_at || new Date(u.club_expires_at) > now);
+          if (!isActive) return res.status(403).json({ error: 'Club membership required' });
+          next();
+    } catch (err) {
+          res.status(500).json({ error: err.message });
+    }
+}
