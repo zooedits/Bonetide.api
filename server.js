@@ -2757,7 +2757,7 @@ app.post('/api/revenuecat/webhook',
 
              let body;
                  try {
-                         body = JSON.parse(req.body.toString());
+                         body = typeof req.body === 'object' && req.body !== null && !Buffer.isBuffer(req.body) ? req.body : JSON.parse(req.body.toString());
                  } catch {
                          return res.status(400).json({ error: 'Invalid JSON' });
                  }
