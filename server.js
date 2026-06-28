@@ -943,7 +943,7 @@ app.get('/api/catches', async (req, res) => {
         `SELECT c.*, u.name AS user_name, u.anonymize_shared
          FROM catches c
          JOIN users u ON u.id = c.user_id
-         WHERE u.share_with_community = true
+         WHERE u.share_with_community = true AND c.is_public = true
          ORDER BY c.caught_at DESC LIMIT $1 OFFSET $2`,
         [limit, offset]
       );
@@ -964,6 +964,39 @@ app.get('/api/catches', async (req, res) => {
     const user = await getUserFromRequest(req);
     const { rows } = await pool.query(`SELECT * FROM catches WHERE user_id=$1 ORDER BY caught_at DESC LIMIT $2 OFFSET $3`, [user.id, limit, offset]);
     res.json({ catches: rows.map(formatCatch), page: parseInt(page) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Delete one of the requesting user's own catches. Ownership is enforced by the
+// user_id match, so a user can only ever delete their own. Likes/comments left
+// on the catch in the community feed are cleaned up best-effort.
+app.delete('/api/catches/:id', async (req, res) => {
+  try {
+    const user = await getUserFromRequest(req);
+    const { rows } = await pool.query(
+      `DELETE FROM catches WHERE id=$1 AND user_id=$2 RETURNING id`,
+      [req.params.id, user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Catch not found' });
+    pool.query(`DELETE FROM likes    WHERE target_type='catch' AND target_id=$1`, [req.params.id]).catch(() => {});
+    pool.query(`DELETE FROM comments WHERE target_type='catch' AND target_id=$1`, [req.params.id]).catch(() => {});
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Toggle a catch's community visibility. Setting is_public=false quietly drops
+// it from the community feed (which filters on is_public=true) — no error, the
+// post simply stops appearing. Re-enabling re-shares it.
+app.patch('/api/catches/:id/privacy', async (req, res) => {
+  try {
+    const user = await getUserFromRequest(req);
+    const isPublic = req.body?.isPublic === true;
+    const { rows } = await pool.query(
+      `UPDATE catches SET is_public=$1 WHERE id=$2 AND user_id=$3 RETURNING id, is_public`,
+      [isPublic, req.params.id, user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Catch not found' });
+    res.json({ id: rows[0].id, isPublic: rows[0].is_public });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
