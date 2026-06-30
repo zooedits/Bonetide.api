@@ -15,7 +15,7 @@ function issueJwt(user) {
   // `id` is the provider-specific identifier (google sub, apple sub, or
   // email/phone for OTP users). `provider` tells getUserFromRequest which
   // column to look the user up by.
-  return jwt.sign({ id: user.id, email: user.email, provider: user.provider }, JWT_SECRET, { expiresIn: '90d' });
+  return jwt.sign({ id: user.id, email: user.email, provider: user.provider }, JWT_SECRET, { expiresIn: '365d' });
 }
 
 const PROVIDER_COLUMN = {
