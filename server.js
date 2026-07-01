@@ -2458,21 +2458,186 @@ function computeMoonPhase(date) {
   return { illumPct, phaseName, emoji, fraction };
 }
 
+// ── Solunar engine ──────────────────────────────────────────────────────────
+// Real lunar-position based solunar periods. Majors occur at lunar transit
+// (moon directly overhead / underfoot); minors at moonrise / moonset. Positions
+// use Schlyter's low-precision lunar theory + the main perturbation terms
+// (accurate to a few minutes — plenty for a fishing app). No external libs.
+const _D2R = Math.PI / 180;
+const _sind = d => Math.sin(d * _D2R);
+const _cosd = d => Math.cos(d * _D2R);
+const _asind = x => Math.asin(x) / _D2R;
+const _atan2d = (y, x) => Math.atan2(y, x) / _D2R;
+const _rev = d => ((d % 360) + 360) % 360;
+
+// Days since the J2000-ish epoch Schlyter uses (2000-01-01 00:00 UT minus offset).
+function _dayNumber(date) {
+  const Y = date.getUTCFullYear(), M = date.getUTCMonth() + 1, D = date.getUTCDate();
+  const UT = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600;
+  let d = 367 * Y - Math.floor(7 * (Y + Math.floor((M + 9) / 12)) / 4)
+        + Math.floor(275 * M / 9) + D - 730530;
+  return d + UT / 24;
+}
+
+// Geocentric equatorial coords of the Moon (RA/Dec in degrees) + sun mean long.
+function _moonEquatorial(date) {
+  const d = _dayNumber(date);
+  // Moon orbital elements
+  const N = _rev(125.1228 - 0.0529538083 * d);   // ascending node
+  const i = 5.1454;                              // inclination
+  const w = _rev(318.0634 + 0.1643573223 * d);   // arg. of perigee
+  const a = 60.2666;                             // mean distance (Earth radii)
+  const e = 0.054900;                            // eccentricity
+  const M = _rev(115.3654 + 13.0649929509 * d);  // mean anomaly
+
+  // Eccentric anomaly (Newton iteration)
+  let E = M + (180 / Math.PI) * e * _sind(M) * (1 + e * _cosd(M));
+  for (let k = 0; k < 6; k++) {
+    E = E - (E - (180 / Math.PI) * e * _sind(E) - M) / (1 - e * _cosd(E));
+  }
+  const x = a * (_cosd(E) - e);
+  const y = a * Math.sqrt(1 - e * e) * _sind(E);
+  const r = Math.sqrt(x * x + y * y);
+  const v = _rev(_atan2d(y, x));
+  const vw = v + w;
+
+  // Position in the ecliptic
+  let xeclip = r * (_cosd(N) * _cosd(vw) - _sind(N) * _sind(vw) * _cosd(i));
+  let yeclip = r * (_sind(N) * _cosd(vw) + _cosd(N) * _sind(vw) * _cosd(i));
+  let zeclip = r * _sind(vw) * _sind(i);
+  let lonecl = _rev(_atan2d(yeclip, xeclip));
+  let latecl = _atan2d(zeclip, Math.sqrt(xeclip * xeclip + yeclip * yeclip));
+
+  // Perturbation arguments (need sun + moon mean elements)
+  const Ws = 282.9404 + 4.70935e-5 * d;
+  const Ms = _rev(356.0470 + 0.9856002585 * d);
+  const Ls = _rev(Ws + Ms);
+  const Lm = _rev(N + w + M);
+  const Dm = _rev(Lm - Ls);
+  const F  = _rev(Lm - N);
+
+  // Main perturbations in ecliptic longitude (degrees)
+  lonecl += -1.274 * _sind(M - 2 * Dm)          // Evection
+          +  0.658 * _sind(2 * Dm)              // Variation
+          -  0.186 * _sind(Ms)                  // Yearly equation
+          -  0.059 * _sind(2 * M - 2 * Dm)
+          -  0.057 * _sind(M - 2 * Dm + Ms)
+          +  0.053 * _sind(M + 2 * Dm)
+          +  0.046 * _sind(2 * Dm - Ms)
+          +  0.041 * _sind(M - Ms)
+          -  0.035 * _sind(Dm)                  // Parallactic equation
+          -  0.031 * _sind(M + Ms)
+          -  0.015 * _sind(2 * F - 2 * Dm)
+          +  0.011 * _sind(M - 4 * Dm);
+  // Main perturbations in latitude (degrees)
+  latecl += -0.173 * _sind(F - 2 * Dm)
+          -  0.055 * _sind(M - F - 2 * Dm)
+          -  0.046 * _sind(M + F - 2 * Dm)
+          +  0.033 * _sind(F + 2 * Dm)
+          +  0.017 * _sind(2 * M + F);
+
+  // Ecliptic → equatorial
+  const ecl = 23.4393 - 3.563e-7 * d;
+  const xe = _cosd(lonecl) * _cosd(latecl);
+  const ye = _sind(lonecl) * _cosd(latecl);
+  const ze = _sind(latecl);
+  const xq = xe;
+  const yq = ye * _cosd(ecl) - ze * _sind(ecl);
+  const zq = ye * _sind(ecl) + ze * _cosd(ecl);
+  const ra  = _rev(_atan2d(yq, xq));
+  const dec = _atan2d(zq, Math.sqrt(xq * xq + yq * yq));
+  return { ra, dec, Ls };
+}
+
+// Moon altitude (degrees) above the horizon at a given time & location.
+function _moonAltitude(date, lat, lon) {
+  const { ra, dec, Ls } = _moonEquatorial(date);
+  const UT = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600;
+  const GMST0 = _rev(Ls + 180) / 15;            // hours
+  const LST = GMST0 + UT + lon / 15;            // local sidereal time (hours)
+  const HA = _rev(LST * 15 - ra);               // hour angle (degrees)
+  return _asind(_sind(lat) * _sind(dec) + _cosd(lat) * _cosd(dec) * _cosd(HA));
+}
+
+// Linear interpolation for the moment altitude crosses a target level.
+function _crossTime(t1, a1, t2, a2, target) {
+  const f = (target - a1) / (a2 - a1);
+  return t1 + f * (t2 - t1);
+}
+
 function computeSolunar(lat, lon) {
   const now = new Date();
-  const hourOfDay = now.getHours() + now.getMinutes() / 60;
   const moon = computeMoonPhase(now);
-  const majorHours = [6.5, 18.5];
-  const nearMajor = majorHours.some(h => Math.abs(hourOfDay - h) < 1.5);
-  const atMajor   = majorHours.some(h => Math.abs(hourOfDay - h) < 0.5);
+
+  // Sample altitude from 12h before to 24h after now, every 10 minutes.
+  const stepMs = 10 * 60 * 1000;
+  const startMs = now.getTime() - 12 * 3600 * 1000;
+  const samples = Math.round(36 * 3600 * 1000 / stepMs);
+  const HORIZON = -0.83; // moon center at rise/set (refraction + semidiameter)
+
+  const events = []; // { type:'major'|'minor', peak:ms }
+  let pT = null, pA = null, ppA = null;
+  for (let k = 0; k <= samples; k++) {
+    const t = startMs + k * stepMs;
+    const alt = _moonAltitude(new Date(t), lat, lon);
+    if (pA != null) {
+      // Rise / set → minors
+      if (pA < HORIZON && alt >= HORIZON) events.push({ type: 'minor', peak: _crossTime(pT, pA, t, alt, HORIZON) });
+      if (pA >= HORIZON && alt < HORIZON) events.push({ type: 'minor', peak: _crossTime(pT, pA, t, alt, HORIZON) });
+    }
+    if (ppA != null) {
+      // Altitude local max = upper transit (overhead), local min = lower transit
+      // (underfoot). Both are majors.
+      if (pA > ppA && pA >= alt) events.push({ type: 'major', peak: pT });
+      if (pA < ppA && pA <= alt) events.push({ type: 'major', peak: pT });
+    }
+    ppA = pA; pA = alt; pT = t;
+  }
+
+  // Build windows: majors ±1h (2h total), minors ±0.5h (1h total).
+  const periods = events.map(e => ({
+    type: e.type,
+    peak: Math.round(e.peak),
+    start: Math.round(e.peak - (e.type === 'major' ? 60 : 30) * 60 * 1000),
+    end:   Math.round(e.peak + (e.type === 'major' ? 60 : 30) * 60 * 1000),
+  })).sort((p, q) => p.start - q.start);
+
+  // Current state relative to now.
+  const nowMs = now.getTime();
+  let window = 'between';
+  const inMajor = periods.some(p => p.type === 'major' && nowMs >= p.start && nowMs <= p.end);
+  const inMinor = periods.some(p => p.type === 'minor' && nowMs >= p.start && nowMs <= p.end);
+  if (inMajor) window = 'major_peak';
+  else if (inMinor) window = 'minor_peak';
+  else {
+    // "Near" = a peak begins within the next 60 minutes.
+    const soon = periods
+      .filter(p => p.start > nowMs && p.start - nowMs <= 60 * 60 * 1000)
+      .sort((a, b) => a.start - b.start)[0];
+    if (soon) window = soon.type === 'major' ? 'major_near' : 'minor_near';
+  }
+
+  // Next upcoming period (for a "next window" hint on the client).
+  const next = periods.find(p => p.end >= nowMs) || null;
+
+  // Positions across the user's local day for an optional day-bar (xPct 0–1).
+  const localHour = ms => (((new Date(ms).getUTCHours() + new Date(ms).getUTCMinutes() / 60) + lon / 15) % 24 + 24) % 24;
+  const majorWindows = periods
+    .filter(p => p.type === 'major')
+    .map(p => ({ label: 'MAJ', xPct: +(localHour(p.peak) / 24).toFixed(4) }));
+
+  const hourOfDay = now.getUTCHours() + lon / 15;
   return {
-    window: atMajor ? 'major_peak' : nearMajor ? 'major_near' : 'between',
+    window,                                    // major_peak | major_near | minor_peak | minor_near | between
+    isMajor: window.startsWith('major'),
+    periods,                                   // [{ type, start, end, peak }] epoch ms
+    next: next ? { type: next.type, at: next.peak, start: next.start, end: next.end } : null,
     moonPhase: moon.phaseName.toLowerCase().includes('full') ? 'full' : moon.phaseName.toLowerCase().includes('new') ? 'new' : 'other',
     moonPhaseName: moon.phaseName,
     moonPhaseEmoji: moon.emoji,
     moonPct: moon.illumPct,
-    lightWindow: hourOfDay < 7.5 ? 'dawn' : hourOfDay > 19.5 ? 'dusk' : 'other',
-    majorWindows: [{ label: 'MAJ', xPct: 0.28 }, { label: 'MAJ', xPct: 0.78 }],
+    lightWindow: ((hourOfDay % 24) + 24) % 24 < 7.5 ? 'dawn' : ((hourOfDay % 24) + 24) % 24 > 19.5 ? 'dusk' : 'other',
+    majorWindows,
   };
 }
 
