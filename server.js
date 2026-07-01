@@ -421,7 +421,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     let { rows } = await pool.query(
-      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin,
+      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge,
               COALESCE((
                 SELECT SUM(pt.delta) FROM points_transactions pt
                 WHERE pt.user_id = u.id AND pt.reason = 'catch'
@@ -434,7 +434,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     // Fall back to email match for merged/Apple accounts where provider column is null
     if (!rows.length && req.user.email) {
       ({ rows } = await pool.query(
-        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin,
+        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge,
                 COALESCE((
                   SELECT SUM(pt.delta) FROM points_transactions pt
                   WHERE pt.user_id = u.id AND pt.reason = 'catch'
@@ -447,6 +447,34 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     }
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Set/update the member's Club badge (which rope shows around their avatar).
+// Cosmetic only — it's gated on Club membership at render time, so requireAuth
+// is sufficient. Keep CLUB_BADGE_IDS in sync with CLUB_BADGES in Avatar.js.
+const CLUB_BADGE_IDS = ['anchor', 'crest', 'wheel', 'shark', 'compass', 'lighthouse'];
+app.put('/api/auth/club-badge', requireAuth, async (req, res) => {
+  try {
+    const { badge } = req.body ?? {};
+    if (!CLUB_BADGE_IDS.includes(badge)) {
+      return res.status(400).json({ error: 'invalid badge' });
+    }
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    let { rows } = await pool.query(
+      `UPDATE users SET club_badge=$1 WHERE ${column}=$2 RETURNING club_badge`,
+      [badge, req.user.id]
+    );
+    if (!rows.length && req.user.email) {
+      ({ rows } = await pool.query(
+        `UPDATE users SET club_badge=$1 WHERE email=$2 RETURNING club_badge`,
+        [badge, req.user.email]
+      ));
+    }
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ clubBadge: rows[0].club_badge });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1189,12 +1217,13 @@ app.get('/api/spots/:id/photos', async (req, res) => {
     const { rows } = await pool.query(
       `SELECT sp.id, sp.photo_url, sp.created_at, sp.user_id,
               u.name AS user_name, u.avatar AS user_avatar, u.anonymize_shared,
+              u.is_club AS author_is_club, u.club_badge AS author_badge,
               COUNT(l.id)::int AS like_count
        FROM spot_photos sp
        JOIN users u ON u.id = sp.user_id
        LEFT JOIN likes l ON l.target_type='spot_photo' AND l.target_id=sp.id
        WHERE sp.spot_id = $1
-       GROUP BY sp.id, u.name, u.avatar, u.anonymize_shared
+       GROUP BY sp.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge
        ORDER BY sp.created_at DESC`,
       [spotId]
     );
@@ -1215,6 +1244,8 @@ app.get('/api/spots/:id/photos', async (req, res) => {
         photoUrl: r.photo_url,
         authorName: r.user_name ?? null,
         authorAvatar: r.user_avatar ?? null,
+        authorIsClub: !!r.author_is_club,
+        authorBadge: r.author_badge ?? null,
         authorId: r.user_id,
         createdAt: r.created_at,
         likeCount: r.like_count ?? 0,
@@ -1628,9 +1659,12 @@ app.post('/api/comments', async (req, res) => {
       [user.id, targetType, tId, parentCommentId ?? null, body.trim().slice(0, 1000), photoUrl ?? null]
     );
     const { rows: [userRow] } = await pool.query(
-      `SELECT name, anonymize_shared FROM users WHERE id=$1`, [user.id]
+      `SELECT name, avatar, anonymize_shared, is_club, club_badge FROM users WHERE id=$1`, [user.id]
     );
-    res.json({ comment: formatComment(newComment, userRow) });
+    res.json({ comment: {
+      ...formatComment(newComment, userRow),
+      authorAvatar: userRow?.anonymize_shared ? null : (userRow?.avatar ?? null),
+    } });
   } catch (err) {
     console.error('Create comment error:', err);
     res.status(err.message.includes('required') || err.message.includes('must be') ? 400 : 500).json({ error: err.message });
@@ -1681,12 +1715,13 @@ app.get('/api/comments/:targetType/:targetId', async (req, res) => {
     const viewer = await getUserFromRequest(req).catch(() => null);
     const { rows } = await pool.query(
       `SELECT c.*, u.name AS user_name, u.avatar AS user_avatar, u.anonymize_shared,
+              u.is_club, u.club_badge,
               COUNT(l.id)::int AS like_count
        FROM comments c
        JOIN users u ON u.id = c.user_id
        LEFT JOIN likes l ON l.target_type='comment' AND l.target_id=c.id
        WHERE c.target_type=$1 AND c.target_id=$2
-       GROUP BY c.id, u.name, u.avatar, u.anonymize_shared
+       GROUP BY c.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge
        ORDER BY c.created_at ASC`,
       [targetType, tId]
     );
@@ -1731,6 +1766,8 @@ function formatComment(row, userRow) {
     parentCommentId: row.parent_comment_id,
     body: row.body,
     authorName: userRow?.anonymize_shared ? null : (userRow?.name ?? userRow?.user_name ?? null),
+    authorIsClub: userRow?.anonymize_shared ? false : !!userRow?.is_club,
+    authorBadge: userRow?.anonymize_shared ? null : (userRow?.club_badge ?? null),
     createdAt: row.created_at,
     photoUrl: row.photo_url ?? null,
   };
@@ -2505,6 +2542,7 @@ pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS rc_user_id      TEXT`).catch(e => console.error('[init] rc_user_id:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_club         BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_club:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_expires_at TIMESTAMPTZ`).catch(e => console.error('[init] club_expires_at:', e.message));
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_badge      TEXT`).catch(e => console.error('[init] club_badge:', e.message));
 pool.query(`
   CREATE TABLE IF NOT EXISTS moderation_log (
     id         SERIAL PRIMARY KEY,
