@@ -2632,6 +2632,7 @@ pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_club         BOOLEAN D
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_expires_at TIMESTAMPTZ`).catch(e => console.error('[init] club_expires_at:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_badge      TEXT`).catch(e => console.error('[init] club_badge:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS public_profile  BOOLEAN DEFAULT false`).catch(e => console.error('[init] public_profile:', e.message));
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo         BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_demo:', e.message));
 pool.query(`
   CREATE TABLE IF NOT EXISTS moderation_log (
     id         SERIAL PRIMARY KEY,
@@ -2671,6 +2672,119 @@ async function logModeration(req, surface, category, text) {
 }
 
 // ── List community content ───────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// DEV DEMO DATA — REMOVE BEFORE PUBLIC LAUNCH.
+// Admin-only. Seeds a few fake anglers (tagged users.is_demo=true) with public
+// profiles, catches, cross-comments and likes so profiles + feed can be tested.
+// KILLSWITCH: DELETE /api/admin/demo/seed removes EVERY demo row in one call
+// (all tagged via is_demo). To strip completely: delete this block, the
+// is_demo column line, and the Settings "Developer" card.
+// ─────────────────────────────────────────────────────────────────────────────
+const DEMO_ANGLERS = [
+  { name: 'Marlin Mike',  avatar: 'https://i.pravatar.cc/300?img=12', isClub: true,  badge: 'anchor' },
+  { name: 'Reel Rosa',    avatar: 'https://i.pravatar.cc/300?img=45', isClub: true,  badge: 'wheel'  },
+  { name: 'Captain Dave', avatar: 'https://i.pravatar.cc/300?img=68', isClub: false, badge: null     },
+];
+const DEMO_SPECIES  = ['Redfish','Snook','Speckled Trout','Tarpon','Flounder','Sheepshead','Black Drum','Mangrove Snapper','Jack Crevalle','Spanish Mackerel'];
+const DEMO_COMMENTS = ['What a slob!','Nice one 🔥','Where were they biting?','Solid catch','That’s a stud','Gorgeous fish','Beautiful markings','Great day on the water'];
+
+async function teardownDemoData() {
+  const { rows } = await pool.query(`SELECT id FROM users WHERE is_demo = true`);
+  const ids = rows.map(r => r.id);
+  if (!ids.length) return 0;
+  const { rows: catchRows } = await pool.query(`SELECT id FROM catches WHERE user_id = ANY($1)`, [ids]);
+  const catchIds = catchRows.map(r => r.id);
+  if (catchIds.length) {
+    await pool.query(`DELETE FROM comments WHERE target_type='catch' AND target_id = ANY($1)`, [catchIds]);
+    await pool.query(`DELETE FROM likes    WHERE target_type='catch' AND target_id = ANY($1)`, [catchIds]);
+  }
+  await pool.query(`DELETE FROM comments WHERE user_id = ANY($1)`, [ids]);
+  await pool.query(`DELETE FROM likes    WHERE user_id = ANY($1)`, [ids]);
+  await pool.query(`DELETE FROM catches  WHERE user_id = ANY($1)`, [ids]);
+  await pool.query(`DELETE FROM users    WHERE id = ANY($1)`, [ids]);
+  return ids.length;
+}
+
+app.post('/api/admin/demo/seed', requireAdmin, async (req, res) => {
+  try {
+    await teardownDemoData(); // reset first so re-seeding is idempotent
+
+    const created = [];
+    for (let i = 0; i < DEMO_ANGLERS.length; i++) {
+      const a = DEMO_ANGLERS[i];
+      const { rows: [u] } = await pool.query(
+        `INSERT INTO users (device_id, email, name, avatar, is_demo, public_profile, share_with_community, anonymize_shared, is_club, club_badge, points_balance, created_at)
+         VALUES ($1,$2,$3,$4,true,true,true,false,$5,$6,$7,NOW())
+         RETURNING id, name`,
+        [`demo-device-${i}`, `demo${i}@bonetide.test`, a.name, a.avatar, a.isClub, a.badge, 500 + i * 150]
+      );
+      created.push({ id: u.id, name: u.name });
+    }
+
+    const allCatches = [];
+    for (let ui = 0; ui < created.length; ui++) {
+      const uid = created[ui].id;
+      for (let c = 0; c < 5; c++) {
+        const species  = DEMO_SPECIES[(ui * 5 + c) % DEMO_SPECIES.length];
+        const daysAgo  = (c * 9) + ui * 3 + 1;
+        const caughtAt = new Date(Date.now() - daysAgo * 86400000);
+        const len      = 14 + ((ui * 7 + c * 3) % 26);
+        const lat      = 29.02 + Math.sin(ui + c) * 0.05;
+        const lon      = -80.92 + Math.cos(ui + c) * 0.05;
+        const img      = `https://picsum.photos/seed/btc-${uid}-${c}/800/600`;
+        const { rows: [nc] } = await pool.query(
+          `INSERT INTO catches (user_id, species, length_in, released, lat, lon, pts_awarded, image_url, is_public, caught_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,$9) RETURNING id`,
+          [uid, species, len, c % 2 === 0, lat, lon, 25, img, caughtAt]
+        );
+        allCatches.push({ id: nc.id, owner: uid });
+      }
+    }
+
+    // Each catch gets a comment (and sometimes a like) from a different demo angler.
+    for (let ci = 0; ci < allCatches.length; ci++) {
+      const cat = allCatches[ci];
+      const ownerIdx = created.findIndex(x => x.id === cat.owner);
+      const commenter = created[(ownerIdx + 1) % created.length];
+      if (commenter.id === cat.owner) continue;
+      await pool.query(
+        `INSERT INTO comments (user_id, target_type, target_id, body, created_at) VALUES ($1,'catch',$2,$3,NOW())`,
+        [commenter.id, cat.id, DEMO_COMMENTS[ci % DEMO_COMMENTS.length]]
+      );
+      if (ci % 2 === 0) {
+        await pool.query(
+          `INSERT INTO likes (user_id, target_type, target_id, created_at) VALUES ($1,'catch',$2,NOW())
+           ON CONFLICT (user_id,target_type,target_id) DO NOTHING`,
+          [commenter.id, cat.id]
+        );
+      }
+    }
+
+    res.json({ ok: true, anglers: created, catches: allCatches.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/demo/seed', requireAdmin, async (req, res) => {
+  try {
+    const removed = await teardownDemoData();
+    res.json({ ok: true, removedUsers: removed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/demo/anglers', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT id, name FROM users WHERE is_demo = true ORDER BY id`);
+    res.json({ anglers: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// ─────────────────────── END DEV DEMO DATA ──────────────────────────────────
+
 app.get('/api/admin/catches', requireAdmin, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit ?? 50), 200);
