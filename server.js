@@ -421,7 +421,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     let { rows } = await pool.query(
-      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge,
+      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.public_profile,
               COALESCE((
                 SELECT SUM(pt.delta) FROM points_transactions pt
                 WHERE pt.user_id = u.id AND pt.reason = 'catch'
@@ -434,7 +434,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     // Fall back to email match for merged/Apple accounts where provider column is null
     if (!rows.length && req.user.email) {
       ({ rows } = await pool.query(
-        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge,
+        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.public_profile,
                 COALESCE((
                   SELECT SUM(pt.delta) FROM points_transactions pt
                   WHERE pt.user_id = u.id AND pt.reason = 'catch'
@@ -475,6 +475,30 @@ app.put('/api/auth/club-badge', requireAuth, async (req, res) => {
     }
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({ clubBadge: rows[0].club_badge });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Opt in/out of a public angler profile (default OFF). When false, GET
+// /api/anglers/:id returns 404 for this user. Distinct from share_with_community
+// (feed attribution) — a browsable profile is a separate, explicit consent.
+app.put('/api/auth/public-profile', requireAuth, async (req, res) => {
+  try {
+    const enabled = !!(req.body?.enabled);
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    let { rows } = await pool.query(
+      `UPDATE users SET public_profile=$1 WHERE ${column}=$2 RETURNING public_profile`,
+      [enabled, req.user.id]
+    );
+    if (!rows.length && req.user.email) {
+      ({ rows } = await pool.query(
+        `UPDATE users SET public_profile=$1 WHERE email=$2 RETURNING public_profile`,
+        [enabled, req.user.email]
+      ));
+    }
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ publicProfile: rows[0].public_profile });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1077,6 +1101,68 @@ function formatCatch(row) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Public angler profile — opt-in only (public_profile=true). Guest-readable like
+// the other community reads. Returns identity + shared catches with exact coords
+// omitted (so activity patterns can't be mined). 404 when not opted in.
+app.get('/api/anglers/:id', async (req, res) => {
+  try {
+    const { rows: [u] } = await pool.query(
+      `SELECT id, name, avatar, is_club, club_badge, public_profile FROM users WHERE id=$1`,
+      [req.params.id]
+    );
+    if (!u || !u.public_profile) return res.status(404).json({ error: 'Profile not available' });
+
+    const { rows: catchRows } = await pool.query(
+      `SELECT * FROM catches WHERE user_id=$1 AND is_public=true ORDER BY caught_at DESC LIMIT 60`,
+      [u.id]
+    );
+    const catches = catchRows.map(r => {
+      const f = formatCatch(r);
+      f.lat = null; f.lon = null; // never expose location on a profile
+      return f;
+    });
+    const { rows: [agg] } = await pool.query(
+      `SELECT COUNT(*)::int AS count, MIN(caught_at) AS since
+       FROM catches WHERE user_id=$1 AND is_public=true`,
+      [u.id]
+    );
+
+    res.json({
+      angler: {
+        id: u.id,
+        name: u.name ?? null,
+        avatar: u.avatar ?? null,
+        isClub: !!u.is_club,
+        clubBadge: u.club_badge ?? null,
+        publicCatchCount: agg?.count ?? 0,
+        since: agg?.since ?? null,
+      },
+      catches,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Report a user or a piece of content. Writes to moderation_log for admin review.
+app.post('/api/report', requireAuth, async (req, res) => {
+  try {
+    const { targetType, targetId, reason } = req.body ?? {};
+    if (!targetType || targetId == null) {
+      return res.status(400).json({ error: 'targetType and targetId are required' });
+    }
+    await pool.query(
+      `INSERT INTO moderation_log (user_id, surface, category, content)
+       VALUES ($1, $2, $3, $4)`,
+      [req.user.id, `report:${targetType}`, 'user_report',
+       JSON.stringify({ targetType, targetId, reason: reason ?? null, reporterId: req.user.id })]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Spots — personal + community fishing spots
 //
 // Requires DB migration:
@@ -1218,12 +1304,13 @@ app.get('/api/spots/:id/photos', async (req, res) => {
       `SELECT sp.id, sp.photo_url, sp.created_at, sp.user_id,
               u.name AS user_name, u.avatar AS user_avatar, u.anonymize_shared,
               u.is_club AS author_is_club, u.club_badge AS author_badge,
+              u.public_profile AS author_public_profile,
               COUNT(l.id)::int AS like_count
        FROM spot_photos sp
        JOIN users u ON u.id = sp.user_id
        LEFT JOIN likes l ON l.target_type='spot_photo' AND l.target_id=sp.id
        WHERE sp.spot_id = $1
-       GROUP BY sp.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge
+       GROUP BY sp.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge, u.public_profile
        ORDER BY sp.created_at DESC`,
       [spotId]
     );
@@ -1246,6 +1333,7 @@ app.get('/api/spots/:id/photos', async (req, res) => {
         authorAvatar: r.user_avatar ?? null,
         authorIsClub: !!r.author_is_club,
         authorBadge: r.author_badge ?? null,
+        authorPublicProfile: !!r.author_public_profile,
         authorId: r.user_id,
         createdAt: r.created_at,
         likeCount: r.like_count ?? 0,
@@ -2543,6 +2631,7 @@ pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS rc_user_id      TEXT`).ca
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_club         BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_club:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_expires_at TIMESTAMPTZ`).catch(e => console.error('[init] club_expires_at:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_badge      TEXT`).catch(e => console.error('[init] club_badge:', e.message));
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS public_profile  BOOLEAN DEFAULT false`).catch(e => console.error('[init] public_profile:', e.message));
 pool.query(`
   CREATE TABLE IF NOT EXISTS moderation_log (
     id         SERIAL PRIMARY KEY,
