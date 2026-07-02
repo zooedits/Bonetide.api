@@ -2852,6 +2852,14 @@ const DEMO_ANGLERS = [
 ];
 const DEMO_SPECIES  = ['Redfish','Snook','Speckled Trout','Tarpon','Flounder','Sheepshead','Black Drum','Mangrove Snapper','Jack Crevalle','Spanish Mackerel'];
 const DEMO_COMMENTS = ['What a slob!','Nice one 🔥','Where were they biting?','Solid catch','That’s a stud','Gorgeous fish','Beautiful markings','Great day on the water'];
+const DEMO_SPOTS = [
+  { name: 'Sandbar Point',     type: 'flat',   note: 'Low incoming tide stacks bait on the edges here.' },
+  { name: 'North Jetty Rocks', type: 'jetty',  note: 'Structure loaded with sheepshead in the cooler months.' },
+  { name: 'Old Trestle',       type: 'bridge', note: 'Work the shadow line at night — snook sit right on it.' },
+  { name: 'Cut Inlet',         type: 'inlets', note: 'Falling tide funnels everything through the cut.' },
+  { name: 'Grass Flat South',  type: 'flat',   note: 'Wade early and sight-cast tailing reds on the flood.' },
+];
+const DEMO_SPOT_COMMENTS = ['Fished here last week — solid.','Adding this to my list 🙏','Great spot at dawn','Nailed a few here','Underrated honestly','Tide really matters here'];
 
 async function teardownDemoData() {
   const { rows } = await pool.query(`SELECT id FROM users WHERE is_demo = true`);
@@ -2862,6 +2870,21 @@ async function teardownDemoData() {
   if (catchIds.length) {
     await pool.query(`DELETE FROM comments WHERE target_type='catch' AND target_id = ANY($1)`, [catchIds]);
     await pool.query(`DELETE FROM likes    WHERE target_type='catch' AND target_id = ANY($1)`, [catchIds]);
+  }
+  // Demo spots + their photos, comments, and likes (incl. any engagement a real
+  // user may have added to a demo spot/photo, to avoid orphaned rows).
+  const { rows: spotRows } = await pool.query(`SELECT id FROM spots WHERE user_id = ANY($1)`, [ids]);
+  const spotIds = spotRows.map(r => r.id);
+  if (spotIds.length) {
+    const { rows: photoRows } = await pool.query(`SELECT id FROM spot_photos WHERE spot_id = ANY($1)`, [spotIds]);
+    const photoIds = photoRows.map(r => r.id);
+    if (photoIds.length) {
+      await pool.query(`DELETE FROM likes WHERE target_type='spot_photo' AND target_id = ANY($1)`, [photoIds]);
+    }
+    await pool.query(`DELETE FROM spot_photos WHERE spot_id = ANY($1)`, [spotIds]);
+    await pool.query(`DELETE FROM comments WHERE target_type='spot' AND target_id = ANY($1)`, [spotIds]);
+    await pool.query(`DELETE FROM likes    WHERE target_type='spot' AND target_id = ANY($1)`, [spotIds]);
+    await pool.query(`DELETE FROM spots    WHERE id = ANY($1)`, [spotIds]);
   }
   await pool.query(`DELETE FROM comments WHERE user_id = ANY($1)`, [ids]);
   await pool.query(`DELETE FROM likes    WHERE user_id = ANY($1)`, [ids]);
@@ -2925,7 +2948,49 @@ app.post('/api/admin/demo/seed', requireAdmin, async (req, res) => {
       }
     }
 
-    res.json({ ok: true, anglers: created, catches: allCatches.length });
+    // Community spots (is_private=false) with extra photos.
+    const allSpots = [];
+    for (let ui = 0; ui < created.length; ui++) {
+      const uid = created[ui].id;
+      const nSpots = ui === created.length - 1 ? 1 : 2; // 2 + 2 + 1 = 5 spots
+      for (let sIdx = 0; sIdx < nSpots; sIdx++) {
+        const d   = DEMO_SPOTS[(ui * 2 + sIdx) % DEMO_SPOTS.length];
+        const lat = 29.05 + Math.sin(ui * 2 + sIdx) * 0.06;
+        const lon = -80.95 + Math.cos(ui * 2 + sIdx) * 0.06;
+        const { rows: [ns] } = await pool.query(
+          `INSERT INTO spots (user_id,name,type,note,lat,lon,photo_url,is_private,created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,false,NOW()) RETURNING id`,
+          [uid, d.name, d.type, d.note, lat, lon, `https://picsum.photos/seed/btc-spot-${uid}-${sIdx}/800/600`]
+        );
+        allSpots.push({ id: ns.id, owner: uid });
+        // 1–2 extra photos per spot
+        for (let p = 0; p <= (sIdx % 2); p++) {
+          await pool.query(
+            `INSERT INTO spot_photos (spot_id, user_id, photo_url, created_at) VALUES ($1,$2,$3,NOW())`,
+            [ns.id, uid, `https://picsum.photos/seed/btc-spotphoto-${ns.id}-${p}/800/600`]
+          );
+        }
+      }
+    }
+
+    // A comment + like on each spot from a different demo angler.
+    for (let si = 0; si < allSpots.length; si++) {
+      const sp = allSpots[si];
+      const ownerIdx = created.findIndex(x => x.id === sp.owner);
+      const commenter = created[(ownerIdx + 1) % created.length];
+      if (commenter.id === sp.owner) continue;
+      await pool.query(
+        `INSERT INTO comments (user_id, target_type, target_id, body, created_at) VALUES ($1,'spot',$2,$3,NOW())`,
+        [commenter.id, sp.id, DEMO_SPOT_COMMENTS[si % DEMO_SPOT_COMMENTS.length]]
+      );
+      await pool.query(
+        `INSERT INTO likes (user_id, target_type, target_id, created_at) VALUES ($1,'spot',$2,NOW())
+         ON CONFLICT (user_id,target_type,target_id) DO NOTHING`,
+        [commenter.id, sp.id]
+      );
+    }
+
+    res.json({ ok: true, anglers: created, catches: allCatches.length, spots: allSpots.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
