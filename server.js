@@ -2012,14 +2012,14 @@ app.get('/api/conditions', async (req, res) => {
     const windDir = degreesToCardinal(cur?.wind_direction_10m ?? 0);
     const pressHpa = cur?.surface_pressure ?? 1013;
 
-    // Hourly: 10 hours starting from "now" — Open-Meteo's hourly.time array
+    // Hourly: 24 hours starting from "now" — Open-Meteo's hourly.time array
     // covers several days, so find the first entry at/after current.time
     // (both in the same timezone-adjusted reference, since both come from
     // the same request) rather than assuming index 0 is the current hour.
     const hourlyTimes = forecast.hourly?.time ?? [];
     const nowIdx = Math.max(0, hourlyTimes.findIndex(t => t >= cur?.time));
     const hourly = [];
-    for (let i = nowIdx; i < Math.min(nowIdx + 10, hourlyTimes.length); i++) {
+    for (let i = nowIdx; i < Math.min(nowIdx + 24, hourlyTimes.length); i++) {
       hourly.push({
         time:         forecast.hourly.time[i],
         tempF:        Math.round(forecast.hourly.temperature_2m?.[i] ?? cur?.temperature_2m ?? 80),
