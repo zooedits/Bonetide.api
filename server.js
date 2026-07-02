@@ -2659,25 +2659,47 @@ function getTierKey(pts) {
 }
 
 app.post('/api/redeem', async (req, res) => {
-  const { deviceId, shopifyProductId, productTitle, pointsCost } = req.body;
-  if (!deviceId || !pointsCost) return res.status(400).json({ error: 'deviceId and pointsCost required' });
+  // Amount-based redemption: the app sends `bones` (how many to spend).
+  // Legacy app versions send `pointsCost` for a specific product — still honored.
+  const { deviceId, shopifyProductId, productTitle, pointsCost, bones } = req.body;
+  const requested = bones ?? pointsCost;
+  if (!deviceId || !requested) return res.status(400).json({ error: 'deviceId and bones amount required' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const { rows: [user] } = await client.query('SELECT id, points_balance FROM users WHERE device_id=$1 FOR UPDATE', [deviceId]);
     if (!user) throw new Error('User not found');
-    const { rows: existing } = await client.query(`SELECT id FROM points_holds WHERE user_id=$1 AND shopify_product_id=$2 AND status='pending' AND expires_at > NOW()`, [user.id, shopifyProductId]);
-    if (existing.length) throw new Error('You already have a pending redemption for this item.');
-    const safePoints = Math.floor(pointsCost / 500) * 500;
-    if (safePoints < 500) throw new Error('Minimum redemption is 500 points ($4.00).');
+
+    // Snap to clean 500-bone ($4) steps.
+    const safePoints = Math.floor(requested / 500) * 500;
+    const MIN_POINTS = 500;    // $4.00
+    const MAX_POINTS = 12500;  // $100.00 cap per code
+    if (safePoints < MIN_POINTS) throw new Error('Minimum redemption is 500 bones ($4.00).');
+    if (safePoints > MAX_POINTS) throw new Error('Maximum redemption is 12,500 bones ($100.00) per code.');
+
+    // Available = balance minus bones already tied up in un-confirmed holds.
+    // (Holds only deduct from the balance when an order is confirmed, so we must
+    // subtract pending holds here or a user could mint multiple codes off the
+    // same balance.)
+    const { rows: [{ pending }] } = await client.query(
+      `SELECT COALESCE(SUM(points_held),0)::int AS pending
+         FROM points_holds
+        WHERE user_id=$1 AND status='pending' AND expires_at > NOW()`,
+      [user.id]
+    );
+    const available = user.points_balance - pending;
+    if (available < safePoints) {
+      throw new Error(`Insufficient bones. You have ${available.toLocaleString()} available${pending ? ` (${pending.toLocaleString()} held in pending codes)` : ''}, need ${safePoints.toLocaleString()}.`);
+    }
+
     const dollarValue = (safePoints / 125).toFixed(2);
-    if (user.points_balance < safePoints) throw new Error(`Insufficient points. You have ${user.points_balance.toLocaleString()} pts, need ${safePoints.toLocaleString()} pts.`);
     const codeStr = `BTC-${deviceId.slice(-6).toUpperCase()}-${Date.now()}`;
+    const title = productTitle || `$${dollarValue} off`;
     const priceRule = await shopifyAdminPost('/price_rules.json', { price_rule: { title: codeStr, target_type: 'line_item', target_selection: 'all', allocation_method: 'across', value_type: 'fixed_amount', value: `-${dollarValue}`, customer_selection: 'all', usage_limit: 1, once_per_customer: true, starts_at: new Date().toISOString(), ends_at: new Date(Date.now() + 48*3600*1000).toISOString() } });
     const discountCode = await shopifyAdminPost(`/price_rules/${priceRule.price_rule.id}/discount_codes.json`, { discount_code: { code: codeStr } });
-    await client.query(`INSERT INTO points_holds (user_id,points_held,shopify_product_id,product_title,discount_code,discount_code_id,status,expires_at) VALUES ($1,$2,$3,$4,$5,$6,'pending',NOW()+INTERVAL '48 hours')`, [user.id, safePoints, shopifyProductId, productTitle, discountCode.discount_code.code, discountCode.discount_code.id.toString()]);
+    await client.query(`INSERT INTO points_holds (user_id,points_held,shopify_product_id,product_title,discount_code,discount_code_id,status,expires_at) VALUES ($1,$2,$3,$4,$5,$6,'pending',NOW()+INTERVAL '48 hours')`, [user.id, safePoints, shopifyProductId ?? null, title, discountCode.discount_code.code, discountCode.discount_code.id.toString()]);
     await client.query('COMMIT');
-    res.json({ discountCode: discountCode.discount_code.code, pointsDeducted: safePoints, dollarValue: parseFloat(dollarValue), newBalance: user.points_balance, expiresIn: '48 hours', message: 'Apply this code at checkout on bonetideco.com. Points deducted when your order is confirmed.' });
+    res.json({ discountCode: discountCode.discount_code.code, pointsDeducted: safePoints, dollarValue: parseFloat(dollarValue), newBalance: available - safePoints, expiresIn: '48 hours', message: 'Apply this code at checkout on bonetideco.com. Bones are deducted when your order is confirmed.' });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Redeem error:', err);
