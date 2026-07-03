@@ -951,6 +951,103 @@ app.post('/api/upload-image', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Season-scoped milestone awarding
+// Mirrors pointsEngine.js getSeasonInfo(): CALENDAR QUARTERS, key `${year}-Q${q}`.
+// Milestone keys are `${base}_${seasonKey}` so completions reset every quarter.
+// Bonus points are awarded ON TOP of the daily cap. This whole path is guarded —
+// a failure here must NEVER break the catch request.
+// ─────────────────────────────────────────────────────────────────────────────
+function getSeasonInfo(date = new Date()) {
+  const year    = date.getFullYear();
+  const quarter = Math.floor(date.getMonth() / 3) + 1;
+  return {
+    year,
+    quarter,
+    key:   `${year}-Q${quarter}`,
+    start: new Date(year, (quarter - 1) * 3, 1),
+    end:   new Date(year, quarter * 3, 1),
+  };
+}
+
+// base key -> { label, points }. Must stay in sync with pointsEngine MILESTONE_DEFS.
+const MILESTONE_DEFS = {
+  first_catch:     { label: 'First catch of the season', points: 50 },
+  species_sampler: { label: 'Species sampler',           points: 50 },
+  inshore_slam:    { label: 'Inshore slam',              points: 150 },
+};
+
+// Check + award any newly-earned milestones after a catch. Only counts catches
+// that have a photo (image_url), matching the "with a live photo" requirement.
+// Returns [{ key, label, points }] for anything just earned (for the app to celebrate).
+async function awardMilestones(userId, currentSpecies, currentHasPhoto) {
+  const earned = [];
+  try {
+    const season = getSeasonInfo();
+    const keyFor = (base) => `${base}_${season.key}`;
+    const allKeys = Object.keys(MILESTONE_DEFS).map(keyFor);
+
+    // Which of this season's milestones does the user already have?
+    const { rows: haveRows } = await pool.query(
+      `SELECT key FROM milestones WHERE user_id=$1 AND key = ANY($2)`,
+      [userId, allKeys]
+    );
+    const have = new Set(haveRows.map(r => r.key));
+
+    const toAward = []; // base keys satisfied and not yet awarded
+
+    // first_catch — first photo catch of the season (absent key + this catch has a photo)
+    if (!have.has(keyFor('first_catch')) && currentHasPhoto) {
+      toAward.push('first_catch');
+    }
+
+    // species_sampler — 3+ distinct species (with photos) this season
+    if (!have.has(keyFor('species_sampler'))) {
+      const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT species)::int AS n FROM catches
+         WHERE user_id=$1 AND image_url IS NOT NULL
+           AND caught_at >= $2 AND caught_at < $3`,
+        [userId, season.start, season.end]
+      );
+      if ((rows[0]?.n ?? 0) >= 3) toAward.push('species_sampler');
+    }
+
+    // inshore_slam — redfish AND speckled trout (with photos) the same calendar day
+    if (!have.has(keyFor('inshore_slam'))) {
+      const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT species)::int AS n FROM catches
+         WHERE user_id=$1 AND image_url IS NOT NULL
+           AND DATE(caught_at)=CURRENT_DATE AND species = ANY($2)`,
+        [userId, ['redfish', 'speckled_trout']]
+      );
+      if ((rows[0]?.n ?? 0) >= 2) toAward.push('inshore_slam');
+    }
+
+    for (const base of toAward) {
+      const key = keyFor(base);
+      const def = MILESTONE_DEFS[base];
+      // Insert only columns we've confirmed exist (user_id, key). If your table
+      // needs more columns, this logs and skips — catches stay safe either way.
+      try {
+        await pool.query(`INSERT INTO milestones (user_id, key) VALUES ($1,$2)`, [userId, key]);
+      } catch (e) {
+        console.error(`[milestone] insert failed for ${key} (check milestones table schema):`, e.message);
+        continue; // don't award points if we couldn't record the milestone
+      }
+      // Bonus points ON TOP of the daily cap.
+      await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [def.points, userId]);
+      await pool.query(
+        `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'milestone',$3,NOW())`,
+        [userId, def.points, key]
+      );
+      earned.push({ key, label: def.label, points: def.points });
+    }
+  } catch (e) {
+    console.error('[milestone] awardMilestones error (non-fatal):', e.message);
+  }
+  return earned;
+}
+
 app.post('/api/catches', async (req, res) => {
   const { species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken, imageUrl, isPublic } = req.body;
   if (!species) return res.status(400).json({ error: 'species required' });
@@ -1012,7 +1109,11 @@ app.post('/api/catches', async (req, res) => {
       await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [ptsAwarded, user.id]);
       await pool.query(`INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'catch',$3,NOW())`, [user.id, ptsAwarded, newCatch.id.toString()]);
     }
-    res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap, boostActive, pointsRejectReason: scanRejectReason });
+
+    // Season milestones — bonus points on top of the daily cap. Fully guarded.
+    const milestonesJustEarned = await awardMilestones(user.id, species, !!imageUrl);
+
+    res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap, boostActive, pointsRejectReason: scanRejectReason, milestonesJustEarned });
   } catch (err) {
     console.error('Log catch error:', err);
     res.status(500).json({ error: err.message });
