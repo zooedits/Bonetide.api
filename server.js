@@ -171,6 +171,67 @@ async function mergeDeviceUser(deviceId, targetUser, idColumn) {
   }
 }
 
+// Resolve the canonical user for a login, LINKING by verified email so the same
+// person is one account no matter which method they use (Google / Apple / email
+// OTP). Order of resolution:
+//   1. Already linked via this provider  → use it (refresh email/avatar).
+//   2. An account exists with this verified email → link this provider onto it
+//      (collapses what would otherwise be a duplicate account).
+//   3. Nobody matches → create a fresh account.
+// Only ever called with verified emails (Google/Apple verify; OTP proves the
+// code). Never link on an unverified email — that would allow account takeover.
+async function resolveVerifiedUser({ email, providerColumn, providerId, avatar = null, phone = null }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Already linked via this provider?
+    let { rows } = await client.query(
+      `SELECT id, points_balance, name, email FROM users WHERE ${providerColumn}=$1 LIMIT 1`,
+      [providerId]
+    );
+    if (rows.length) {
+      await client.query(
+        `UPDATE users SET email=COALESCE($2, email), avatar=COALESCE($3, avatar) WHERE id=$1`,
+        [rows[0].id, email, avatar]
+      );
+      await client.query('COMMIT');
+      return rows[0];
+    }
+
+    // 2. Existing account with the same verified email → link this provider on.
+    if (email) {
+      ({ rows } = await client.query(
+        `SELECT id, points_balance, name, email FROM users WHERE LOWER(email)=LOWER($1) ORDER BY id ASC LIMIT 1`,
+        [email]
+      ));
+      if (rows.length) {
+        await client.query(
+          `UPDATE users SET ${providerColumn}=$2, avatar=COALESCE($3, avatar) WHERE id=$1`,
+          [rows[0].id, providerId, avatar]
+        );
+        await client.query('COMMIT');
+        console.log(`[auth] Linked ${providerColumn} onto existing account ${rows[0].id} via email`);
+        return rows[0];
+      }
+    }
+
+    // 3. Brand-new account.
+    const { rows: created } = await client.query(
+      `INSERT INTO users (${providerColumn}, email, phone, avatar, points_balance, created_at)
+       VALUES ($1, $2, $3, $4, 0, NOW()) RETURNING id, points_balance, name, email`,
+      [providerId, email ?? null, phone ?? null, avatar ?? null]
+    );
+    await client.query('COMMIT');
+    return created[0];
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 app.post('/api/auth/google', async (req, res) => {
   try {
     const { idToken, deviceId } = req.body ?? {};
@@ -180,19 +241,11 @@ app.post('/api/auth/google', async (req, res) => {
     if (!payload.email_verified) return res.status(403).json({ error: 'Google account email not verified' });
     const user = { id: payload.sub, email: payload.email, name: '', avatar: payload.picture ?? null, provider: 'google' };
 
-    // Upsert Google user — never write `name` here; the app prompts every
-    // user for a display name regardless of auth provider.
-    await pool.query(
-      `INSERT INTO users (google_id, email, avatar, points_balance, created_at)
-       VALUES ($1, $2, $3, 0, NOW())
-       ON CONFLICT (google_id) DO UPDATE SET email=EXCLUDED.email, avatar=EXCLUDED.avatar`,
-      [user.id, user.email, user.avatar]
-    );
-
-    // Get the Google user's DB row
-    const { rows: [googleUser] } = await pool.query(
-      'SELECT id, points_balance, name FROM users WHERE google_id=$1', [user.id]
-    );
+    // Link by verified email so Google + email-OTP with the same address are one
+    // account. Never writes `name` — the app always prompts for a display name.
+    const googleUser = await resolveVerifiedUser({
+      email: user.email, providerColumn: 'google_id', providerId: user.id, avatar: user.avatar,
+    });
 
     await mergeDeviceUser(deviceId, googleUser, 'google_id');
 
@@ -250,18 +303,12 @@ app.post('/api/auth/apple', async (req, res) => {
 
     const user = { id: payload.sub, email, name: '', avatar: null, provider: 'apple' };
 
-    // Upsert Apple user — never write `name` here; the app prompts every
-    // user for a display name regardless of auth provider.
-    await pool.query(
-      `INSERT INTO users (apple_id, email, points_balance, created_at)
-       VALUES ($1, $2, 0, NOW())
-       ON CONFLICT (apple_id) DO UPDATE SET email=COALESCE(EXCLUDED.email, users.email)`,
-      [user.id, user.email]
-    );
-
-    const { rows: [appleUser] } = await pool.query(
-      'SELECT id, points_balance, name FROM users WHERE apple_id=$1', [user.id]
-    );
+    // Link by verified email when Apple provides one (first sign-in, or if the
+    // user didn't hide it). If Apple withholds the email, this falls back to
+    // apple_id-only identity — the known Apple limitation.
+    const appleUser = await resolveVerifiedUser({
+      email, providerColumn: 'apple_id', providerId: user.id,
+    });
 
     await mergeDeviceUser(deviceId, appleUser, 'apple_id');
 
@@ -380,23 +427,15 @@ app.post('/api/auth/otp/verify', async (req, res) => {
     }
     otpCodes.delete(key); // single-use
 
-    // Look up existing user by auth_id (normalized email/phone)
-    const { rows: existingRows } = await pool.query(
-      'SELECT id, points_balance, name FROM users WHERE auth_id=$1', [key]
-    );
-
-    let userRow;
-    if (existingRows.length) {
-      userRow = existingRows[0];
-    } else {
-      const insertCols = email ? `auth_id, email` : `auth_id, phone`;
-      const { rows: [created] } = await pool.query(
-        `INSERT INTO users (${insertCols}, points_balance, created_at)
-         VALUES ($1, $2, 0, NOW()) RETURNING id, points_balance, name`,
-        [key, contact.trim()]
-      );
-      userRow = created;
-    }
+    // Resolve/link by verified email (email OTP) so it collapses with a Google/
+    // Apple account on the same address. Phone OTP has no email to link on, so it
+    // stays its own identity keyed by auth_id.
+    const userRow = await resolveVerifiedUser({
+      email: email ? contact.trim() : null,
+      providerColumn: 'auth_id',
+      providerId: key,
+      phone: email ? null : contact.trim(),
+    });
 
     const user = {
       id: key,
