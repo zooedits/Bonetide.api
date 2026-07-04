@@ -1401,6 +1401,151 @@ app.get('/api/spots', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/feed — nearby mixed feed of public catches + public spots.
+// Reuses the community rules (catches: share_with_community + is_public; spots:
+// is_private=false). Catch coords are jittered for privacy; distance is measured
+// from the jittered point (≈mile accuracy — which is the whole idea). Spots are
+// intentionally shared with location, so their exact coords are used.
+//
+// Query: ?lat=&lon=&radius=100&limit=25&before=<ISO ts>&type=all|catches|spots
+// - lat/lon optional: without them we skip distance filtering and just return the
+//   most recent community activity (feed still works with location off).
+// - `before` is a cursor: pass the createdAt of your last item to page older.
+// ─────────────────────────────────────────────────────────────────────────────
+function haversineMiles(lat1, lon1, lat2, lon2) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const R = 3958.8; // miles
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+app.get('/api/feed', async (req, res) => {
+  try {
+    const lat    = parseFloat(req.query.lat);
+    const lon    = parseFloat(req.query.lon);
+    const hasLoc = Number.isFinite(lat) && Number.isFinite(lon);
+    const radius = Math.min(500, Math.max(1, parseFloat(req.query.radius) || 100));
+    const limit  = Math.min(50, Math.max(1, parseInt(req.query.limit) || 25));
+    const before = req.query.before && !isNaN(Date.parse(req.query.before)) ? new Date(req.query.before) : null;
+    const type   = ['catches', 'spots'].includes(req.query.type) ? req.query.type : 'all';
+
+    // Bounding box keeps the SQL cheap before precise haversine in JS.
+    const latPad = radius / 69;
+    const lonPad = radius / (69 * Math.max(0.15, Math.cos((lat || 0) * Math.PI / 180)));
+    // Fetch a buffer (×3) since distance filtering will drop some rows.
+    const fetchN = limit * 3;
+
+    // ── Public catches ──
+    let catchRows = [];
+    if (type !== 'spots') {
+      const p = [];
+      let where = `u.share_with_community = true AND c.is_public = true AND c.lat IS NOT NULL AND c.lon IS NOT NULL`;
+      if (hasLoc) {
+        p.push(lat - latPad, lat + latPad, lon - lonPad, lon + lonPad);
+        where += ` AND c.lat BETWEEN $${p.length-3} AND $${p.length-2} AND c.lon BETWEEN $${p.length-1} AND $${p.length}`;
+      }
+      if (before) { p.push(before.toISOString()); where += ` AND c.caught_at < $${p.length}`; }
+      p.push(fetchN);
+      const { rows } = await pool.query(
+        `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.lat, c.lon, c.caught_at,
+                u.id AS user_id, u.name AS user_name, u.avatar AS user_avatar, u.is_club, u.club_badge,
+                u.anonymize_shared, u.public_profile,
+                (SELECT COUNT(*) FROM likes    WHERE target_type='catch' AND target_id=c.id) AS like_count,
+                (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
+         FROM catches c JOIN users u ON u.id = c.user_id
+         WHERE ${where}
+         ORDER BY c.caught_at DESC LIMIT $${p.length}`,
+        p
+      );
+      catchRows = rows;
+    }
+
+    // ── Public spots ──
+    let spotRows = [];
+    if (type !== 'catches') {
+      const p = [];
+      let where = `s.is_private = false AND s.lat IS NOT NULL AND s.lon IS NOT NULL`;
+      if (hasLoc) {
+        p.push(lat - latPad, lat + latPad, lon - lonPad, lon + lonPad);
+        where += ` AND s.lat BETWEEN $${p.length-3} AND $${p.length-2} AND s.lon BETWEEN $${p.length-1} AND $${p.length}`;
+      }
+      if (before) { p.push(before.toISOString()); where += ` AND s.created_at < $${p.length}`; }
+      p.push(fetchN);
+      const { rows } = await pool.query(
+        `SELECT s.id, s.name, s.type, s.note, s.photo_url, s.lat, s.lon, s.created_at,
+                u.id AS user_id, u.name AS user_name, u.avatar AS user_avatar, u.is_club, u.club_badge,
+                u.anonymize_shared, u.public_profile,
+                (SELECT COUNT(*) FROM likes    WHERE target_type='spot' AND target_id=s.id) AS like_count,
+                (SELECT COUNT(*) FROM comments WHERE target_type='spot' AND target_id=s.id) AS comment_count
+         FROM spots s JOIN users u ON u.id = s.user_id
+         WHERE ${where}
+         ORDER BY s.created_at DESC LIMIT $${p.length}`,
+        p
+      );
+      spotRows = rows;
+    }
+
+    const angler = (row) => ({
+      userId:        row.anonymize_shared ? null : row.user_id,
+      name:          row.anonymize_shared ? null : (row.user_name ?? null),
+      avatar:        row.anonymize_shared ? null : (row.user_avatar ?? null),
+      isClub:        !!row.is_club,
+      badge:         row.club_badge ?? null,
+      publicProfile: !!row.public_profile && !row.anonymize_shared,
+    });
+
+    const items = [];
+
+    for (const row of catchRows) {
+      let dLat = row.lat, dLon = row.lon, dist = null;
+      if (row.lat != null && row.lon != null) {
+        const j = jitterCoords(row.lat, row.lon, row.id);
+        dLat = j.lat; dLon = j.lon;
+        if (hasLoc) dist = haversineMiles(lat, lon, dLat, dLon);
+      }
+      if (hasLoc && dist != null && dist > radius) continue;
+      items.push({
+        type: 'catch', id: row.id, createdAt: row.caught_at,
+        species: row.species, lengthIn: row.length_in, released: row.released,
+        imageUrl: row.image_url ?? null, lat: dLat, lon: dLon,
+        distanceMi: dist == null ? null : Math.round(dist),
+        likeCount: parseInt(row.like_count) || 0,
+        commentCount: parseInt(row.comment_count) || 0,
+        angler: angler(row),
+      });
+    }
+
+    for (const row of spotRows) {
+      let dist = null;
+      if (hasLoc && row.lat != null && row.lon != null) dist = haversineMiles(lat, lon, row.lat, row.lon);
+      if (hasLoc && dist != null && dist > radius) continue;
+      items.push({
+        type: 'spot', id: row.id, createdAt: row.created_at,
+        name: row.name, spotType: row.type ?? null, note: row.note ?? null,
+        imageUrl: row.photo_url ?? null, lat: row.lat, lon: row.lon,
+        distanceMi: dist == null ? null : Math.round(dist),
+        likeCount: parseInt(row.like_count) || 0,
+        commentCount: parseInt(row.comment_count) || 0,
+        angler: angler(row),
+      });
+    }
+
+    // Newest first, then page down.
+    items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const paged = items.slice(0, limit);
+    const nextCursor = paged.length === limit ? paged[paged.length - 1].createdAt : null;
+
+    res.json({ items: paged, nextCursor, hasLocation: hasLoc, radius });
+  } catch (err) {
+    console.error('Feed error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET single spot by ID (used for deep-link from photo library)
 app.get('/api/spots/:id', async (req, res) => {
   try {
