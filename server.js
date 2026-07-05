@@ -3279,7 +3279,7 @@ async function runRegsBotForState(stateCode) {
   try {
     const res = await fetch(src.url, { headers: { 'user-agent': 'BoneTideRegsBot/1.0' } });
     const pageText = stripHtml(await res.text());
-    const hash = require('crypto').createHash('sha256').update(pageText).digest('hex');
+    const hash = crypto.createHash('sha256').update(pageText).digest('hex');
 
     const prev = (await pool.query(`SELECT last_hash FROM reg_source_checks WHERE state_code=$1`, [stateCode])).rows[0];
     const changed = !prev || prev.last_hash !== hash;
