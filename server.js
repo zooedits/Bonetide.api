@@ -18,6 +18,24 @@ function issueJwt(user) {
   return jwt.sign({ id: user.id, email: user.email, provider: user.provider }, JWT_SECRET, { expiresIn: '365d' });
 }
 
+// Attach the account's DB flags (admin / club / etc.) onto the client `user`
+// object so the app is correct the INSTANT you log in — previously these were
+// missing from the login response, so the Admin tab (and Club perks) only
+// appeared after the next cold-start profile refresh.
+async function attachAccountFlags(user, dbUserId) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT is_admin, is_club, club_badge, public_profile FROM users WHERE id=$1`, [dbUserId]
+    );
+    const f = rows[0] || {};
+    user.isAdmin = !!f.is_admin;
+    user.isClub = !!f.is_club;
+    user.clubBadge = f.club_badge ?? null;
+    user.publicProfile = !!f.public_profile;
+  } catch { /* non-fatal — client will still refresh on next cold start */ }
+  return user;
+}
+
 const PROVIDER_COLUMN = {
   google: 'google_id',
   apple:  'apple_id',
@@ -263,6 +281,7 @@ app.post('/api/auth/google', async (req, res) => {
     await mergeDeviceUser(deviceId, googleUser, 'google_id');
 
     user.name = googleUser.name ?? '';
+    await attachAccountFlags(user, googleUser.id);
     return res.json({ token: issueJwt(user), user, needsName: !user.name });
   } catch (err) {
     console.error('[auth] Google verification failed:', err.message);
@@ -326,6 +345,7 @@ app.post('/api/auth/apple', async (req, res) => {
     await mergeDeviceUser(deviceId, appleUser, 'apple_id');
 
     user.name = appleUser.name ?? '';
+    await attachAccountFlags(user, appleUser.id);
     return res.json({ token: issueJwt(user), user, needsName: !user.name });
   } catch (err) {
     console.error('[auth] Apple verification failed:', err.message);
@@ -460,6 +480,7 @@ app.post('/api/auth/otp/verify', async (req, res) => {
 
     await mergeDeviceUser(deviceId, userRow, 'auth_id');
 
+    await attachAccountFlags(user, userRow.id);
     return res.json({ token: issueJwt(user), user, needsName: !user.name });
   } catch (err) {
     console.error('[auth] OTP verify failed:', err.message);
