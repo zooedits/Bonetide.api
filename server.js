@@ -146,8 +146,14 @@ app.get('/api/radar-tile', async (req, res) => {
 //   ALTER TABLE users ADD COLUMN phone    text;
 async function mergeDeviceUser(deviceId, targetUser, idColumn) {
   if (!deviceId) return;
+  // Only merge a TRUE guest — an account with NO login of any kind. An account
+  // already authenticated with a DIFFERENT provider must never be treated as a
+  // mergeable guest, or signing in with a second method would cannibalize a real
+  // account (that's how the admin account got lost).
   const { rows: deviceUsers } = await pool.query(
-    `SELECT id, points_balance FROM users WHERE device_id=$1 AND ${idColumn} IS NULL`, [deviceId]
+    `SELECT id, points_balance FROM users
+      WHERE device_id=$1 AND google_id IS NULL AND apple_id IS NULL AND auth_id IS NULL`,
+    [deviceId]
   );
   if (!deviceUsers.length) return;
   const deviceUser = deviceUsers[0];
@@ -158,11 +164,18 @@ async function mergeDeviceUser(deviceId, targetUser, idColumn) {
     await client.query('BEGIN');
     await client.query('UPDATE catches SET user_id=$1 WHERE user_id=$2', [targetUser.id, deviceUser.id]);
     await client.query('UPDATE points_transactions SET user_id=$1 WHERE user_id=$2', [targetUser.id, deviceUser.id]);
+    await client.query('UPDATE spots SET user_id=$1 WHERE user_id=$2', [targetUser.id, deviceUser.id]);
+    await client.query('UPDATE comments SET user_id=$1 WHERE user_id=$2', [targetUser.id, deviceUser.id]);
+    await client.query('DELETE FROM likes WHERE user_id=$1', [deviceUser.id]); // guest likes dropped (avoid unique clash)
     await client.query('UPDATE users SET points_balance=points_balance+$1 WHERE id=$2', [deviceUser.points_balance, targetUser.id]);
-    await client.query('UPDATE users SET device_id=$1 WHERE id=$2', [deviceId, targetUser.id]);
+    // Delete the guest row FIRST so its device_id is released, THEN move the
+    // device onto the target. Doing it the other way makes two rows briefly hold
+    // the same device_id and UNIQUE(device_id) throws (the dup-account crash).
     await client.query('DELETE FROM users WHERE id=$1', [deviceUser.id]);
+    await client.query('UPDATE users SET device_id=NULL WHERE device_id=$1 AND id<>$2', [deviceId, targetUser.id]);
+    await client.query('UPDATE users SET device_id=$1 WHERE id=$2', [deviceId, targetUser.id]);
     await client.query('COMMIT');
-    console.log(`[auth] Merged device user ${deviceUser.id} into user ${targetUser.id}`);
+    console.log(`[auth] Merged guest ${deviceUser.id} into user ${targetUser.id}`);
   } catch (mergeErr) {
     await client.query('ROLLBACK');
     console.error('[auth] Merge failed (non-fatal):', mergeErr.message);
