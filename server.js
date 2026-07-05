@@ -1401,151 +1401,6 @@ app.get('/api/spots', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/feed — nearby mixed feed of public catches + public spots.
-// Reuses the community rules (catches: share_with_community + is_public; spots:
-// is_private=false). Catch coords are jittered for privacy; distance is measured
-// from the jittered point (≈mile accuracy — which is the whole idea). Spots are
-// intentionally shared with location, so their exact coords are used.
-//
-// Query: ?lat=&lon=&radius=100&limit=25&before=<ISO ts>&type=all|catches|spots
-// - lat/lon optional: without them we skip distance filtering and just return the
-//   most recent community activity (feed still works with location off).
-// - `before` is a cursor: pass the createdAt of your last item to page older.
-// ─────────────────────────────────────────────────────────────────────────────
-function haversineMiles(lat1, lon1, lat2, lon2) {
-  const toRad = (d) => (d * Math.PI) / 180;
-  const R = 3958.8; // miles
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
-}
-
-app.get('/api/feed', async (req, res) => {
-  try {
-    const lat    = parseFloat(req.query.lat);
-    const lon    = parseFloat(req.query.lon);
-    const hasLoc = Number.isFinite(lat) && Number.isFinite(lon);
-    const radius = Math.min(500, Math.max(1, parseFloat(req.query.radius) || 100));
-    const limit  = Math.min(50, Math.max(1, parseInt(req.query.limit) || 25));
-    const before = req.query.before && !isNaN(Date.parse(req.query.before)) ? new Date(req.query.before) : null;
-    const type   = ['catches', 'spots'].includes(req.query.type) ? req.query.type : 'all';
-
-    // Bounding box keeps the SQL cheap before precise haversine in JS.
-    const latPad = radius / 69;
-    const lonPad = radius / (69 * Math.max(0.15, Math.cos((lat || 0) * Math.PI / 180)));
-    // Fetch a buffer (×3) since distance filtering will drop some rows.
-    const fetchN = limit * 3;
-
-    // ── Public catches ──
-    let catchRows = [];
-    if (type !== 'spots') {
-      const p = [];
-      let where = `u.share_with_community = true AND c.is_public = true AND c.lat IS NOT NULL AND c.lon IS NOT NULL`;
-      if (hasLoc) {
-        p.push(lat - latPad, lat + latPad, lon - lonPad, lon + lonPad);
-        where += ` AND c.lat BETWEEN $${p.length-3} AND $${p.length-2} AND c.lon BETWEEN $${p.length-1} AND $${p.length}`;
-      }
-      if (before) { p.push(before.toISOString()); where += ` AND c.caught_at < $${p.length}`; }
-      p.push(fetchN);
-      const { rows } = await pool.query(
-        `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.lat, c.lon, c.caught_at,
-                u.id AS user_id, u.name AS user_name, u.avatar AS user_avatar, u.is_club, u.club_badge,
-                u.anonymize_shared, u.public_profile,
-                (SELECT COUNT(*) FROM likes    WHERE target_type='catch' AND target_id=c.id) AS like_count,
-                (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
-         FROM catches c JOIN users u ON u.id = c.user_id
-         WHERE ${where}
-         ORDER BY c.caught_at DESC LIMIT $${p.length}`,
-        p
-      );
-      catchRows = rows;
-    }
-
-    // ── Public spots ──
-    let spotRows = [];
-    if (type !== 'catches') {
-      const p = [];
-      let where = `s.is_private = false AND s.lat IS NOT NULL AND s.lon IS NOT NULL`;
-      if (hasLoc) {
-        p.push(lat - latPad, lat + latPad, lon - lonPad, lon + lonPad);
-        where += ` AND s.lat BETWEEN $${p.length-3} AND $${p.length-2} AND s.lon BETWEEN $${p.length-1} AND $${p.length}`;
-      }
-      if (before) { p.push(before.toISOString()); where += ` AND s.created_at < $${p.length}`; }
-      p.push(fetchN);
-      const { rows } = await pool.query(
-        `SELECT s.id, s.name, s.type, s.note, s.photo_url, s.lat, s.lon, s.created_at,
-                u.id AS user_id, u.name AS user_name, u.avatar AS user_avatar, u.is_club, u.club_badge,
-                u.anonymize_shared, u.public_profile,
-                (SELECT COUNT(*) FROM likes    WHERE target_type='spot' AND target_id=s.id) AS like_count,
-                (SELECT COUNT(*) FROM comments WHERE target_type='spot' AND target_id=s.id) AS comment_count
-         FROM spots s JOIN users u ON u.id = s.user_id
-         WHERE ${where}
-         ORDER BY s.created_at DESC LIMIT $${p.length}`,
-        p
-      );
-      spotRows = rows;
-    }
-
-    const angler = (row) => ({
-      userId:        row.anonymize_shared ? null : row.user_id,
-      name:          row.anonymize_shared ? null : (row.user_name ?? null),
-      avatar:        row.anonymize_shared ? null : (row.user_avatar ?? null),
-      isClub:        !!row.is_club,
-      badge:         row.club_badge ?? null,
-      publicProfile: !!row.public_profile && !row.anonymize_shared,
-    });
-
-    const items = [];
-
-    for (const row of catchRows) {
-      let dLat = row.lat, dLon = row.lon, dist = null;
-      if (row.lat != null && row.lon != null) {
-        const j = jitterCoords(row.lat, row.lon, row.id);
-        dLat = j.lat; dLon = j.lon;
-        if (hasLoc) dist = haversineMiles(lat, lon, dLat, dLon);
-      }
-      if (hasLoc && dist != null && dist > radius) continue;
-      items.push({
-        type: 'catch', id: row.id, createdAt: row.caught_at,
-        species: row.species, lengthIn: row.length_in, released: row.released,
-        imageUrl: row.image_url ?? null, lat: dLat, lon: dLon,
-        distanceMi: dist == null ? null : Math.round(dist),
-        likeCount: parseInt(row.like_count) || 0,
-        commentCount: parseInt(row.comment_count) || 0,
-        angler: angler(row),
-      });
-    }
-
-    for (const row of spotRows) {
-      let dist = null;
-      if (hasLoc && row.lat != null && row.lon != null) dist = haversineMiles(lat, lon, row.lat, row.lon);
-      if (hasLoc && dist != null && dist > radius) continue;
-      items.push({
-        type: 'spot', id: row.id, createdAt: row.created_at,
-        name: row.name, spotType: row.type ?? null, note: row.note ?? null,
-        imageUrl: row.photo_url ?? null, lat: row.lat, lon: row.lon,
-        distanceMi: dist == null ? null : Math.round(dist),
-        likeCount: parseInt(row.like_count) || 0,
-        commentCount: parseInt(row.comment_count) || 0,
-        angler: angler(row),
-      });
-    }
-
-    // Newest first, then page down.
-    items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    const paged = items.slice(0, limit);
-    const nextCursor = paged.length === limit ? paged[paged.length - 1].createdAt : null;
-
-    res.json({ items: paged, nextCursor, hasLocation: hasLoc, radius });
-  } catch (err) {
-    console.error('Feed error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // GET single spot by ID (used for deep-link from photo library)
 app.get('/api/spots/:id', async (req, res) => {
   try {
@@ -2004,6 +1859,113 @@ pool.query(`
     UNIQUE(spot_id, user_id)
   )
 `).catch(() => {});
+
+// ── Fishing regulations (server-hosted, human-verified) ──────────────────────
+// Numbers are ONLY ever entered/approved by a human. Each row carries a
+// verified_date + review_by; once past review_by the app stops trusting it and
+// falls back to the official link-out (auto-downgrade) — so the app can never
+// confidently show a stale number.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS regulations (
+    id            SERIAL PRIMARY KEY,
+    state_code    TEXT NOT NULL,
+    species       TEXT NOT NULL,
+    region        TEXT NOT NULL DEFAULT '',  -- '' = statewide; some states manage by zone
+    min_size_in   NUMERIC,                   -- min total length, inches (null = none)
+    max_size_in   NUMERIC,                   -- slot max, inches (null = no max)
+    bag_limit     INTEGER,                   -- daily creel per angler (null = unspecified)
+    season        TEXT,                      -- e.g. 'All year' or 'May 1 - Feb 28'
+    gamefish      BOOLEAN DEFAULT false,
+    catch_release BOOLEAN DEFAULT false,     -- true = release only, no harvest
+    notes         TEXT,
+    source_url    TEXT,
+    verified_date DATE,
+    review_by     DATE,
+    updated_at    TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(state_code, species, region)
+  )
+`).catch(e => console.error('[init] regulations:', e.message));
+
+// "What to add next" — species+state anglers log that we have no data for yet,
+// ranked by demand. This is how coverage grows without guessing.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS reg_gaps (
+    id          SERIAL PRIMARY KEY,
+    state_code  TEXT NOT NULL,
+    species     TEXT NOT NULL,
+    hits        INTEGER DEFAULT 1,
+    last_seen   TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(state_code, species)
+  )
+`).catch(e => console.error('[init] reg_gaps:', e.message));
+
+// Official state sources for the "Check my state's regulations" link-out.
+// Add a state here when you turn it on. Unlisted states get a safe search fallback.
+const STATE_REG_SOURCES = {
+  GA: { name: 'Georgia DNR — Coastal Resources', url: 'https://coastalgadnr.org/limits' },
+  FL: { name: 'Florida FWC — Saltwater Recreational', url: 'https://myfwc.com/fishing/saltwater/recreational/' },
+};
+function stateSource(stateCode) {
+  const sc = (stateCode || '').toUpperCase();
+  return STATE_REG_SOURCES[sc] || {
+    name: `${sc || 'Your state'} fishing regulations`,
+    url: `https://www.google.com/search?q=${encodeURIComponent((sc ? sc + ' ' : '') + 'saltwater fishing size and bag limits official')}`,
+  };
+}
+
+// GET /api/regs?state=GA&species=redfish[&region=]
+// Verified numbers if we have a current row; else flags link-out (and logs the
+// gap). Stale rows (past review_by) auto-downgrade to link-out. Always fails safe.
+app.get('/api/regs', async (req, res) => {
+  const state = (req.query.state || '').toUpperCase();
+  try {
+    const species = (req.query.species || '').toLowerCase();
+    const region  = req.query.region || '';
+    const source  = stateSource(state);
+    if (!state || !species) return res.json({ hasData: false, reason: 'missing_params', source });
+
+    const { rows } = await pool.query(
+      `SELECT * FROM regulations
+       WHERE state_code=$1 AND species=$2 AND region IN ($3, '')
+       ORDER BY (region = $3) DESC, verified_date DESC NULLS LAST
+       LIMIT 1`,
+      [state, species, region]
+    );
+
+    if (!rows.length) {
+      await pool.query(
+        `INSERT INTO reg_gaps (state_code, species) VALUES ($1,$2)
+         ON CONFLICT (state_code, species) DO UPDATE SET hits = reg_gaps.hits + 1, last_seen = NOW()`,
+        [state, species]
+      ).catch(() => {});
+      return res.json({ hasData: false, reason: 'no_data', source });
+    }
+
+    const r = rows[0];
+    if (r.review_by && new Date(r.review_by) < new Date()) {
+      return res.json({ hasData: false, reason: 'stale', staleSince: r.review_by, source: { name: source.name, url: r.source_url || source.url } });
+    }
+
+    res.json({
+      hasData: true,
+      reg: {
+        state, species, region: r.region || null,
+        minSizeIn: r.min_size_in != null ? Number(r.min_size_in) : null,
+        maxSizeIn: r.max_size_in != null ? Number(r.max_size_in) : null,
+        bagLimit: r.bag_limit ?? null,
+        season: r.season ?? null,
+        gamefish: !!r.gamefish,
+        catchRelease: !!r.catch_release,
+        notes: r.notes ?? null,
+        verifiedDate: r.verified_date,
+      },
+      source: { name: source.name, url: r.source_url || source.url },
+    });
+  } catch (err) {
+    console.error('Regs error:', err);
+    res.json({ hasData: false, reason: 'error', source: stateSource(state) }); // fail safe → link-out
+  }
+});
 
 app.post('/api/comments', async (req, res) => {
   const { targetType, targetId, body, parentCommentId, photoUrl } = req.body ?? {};
@@ -3199,6 +3161,43 @@ async function teardownDemoData() {
   await pool.query(`DELETE FROM users    WHERE id = ANY($1)`, [ids]);
   return ids.length;
 }
+
+// ── Regulations admin: seed/update a verified row + view the demand gap list ──
+// Used to hand-seed GA/FL now, and later by the approval dashboard + bot.
+app.post('/api/admin/regs', requireAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const state = (b.state || b.stateCode || '').toUpperCase();
+    const species = (b.species || '').toLowerCase();
+    if (!state || !species) return res.status(400).json({ error: 'state and species required' });
+    const region = b.region || '';
+    await pool.query(
+      `INSERT INTO regulations
+         (state_code, species, region, min_size_in, max_size_in, bag_limit, season,
+          gamefish, catch_release, notes, source_url, verified_date, review_by, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+       ON CONFLICT (state_code, species, region) DO UPDATE SET
+         min_size_in=$4, max_size_in=$5, bag_limit=$6, season=$7, gamefish=$8,
+         catch_release=$9, notes=$10, source_url=$11, verified_date=$12, review_by=$13, updated_at=NOW()`,
+      [state, species, region,
+       b.minSizeIn ?? null, b.maxSizeIn ?? null, b.bagLimit ?? null, b.season ?? null,
+       !!b.gamefish, !!b.catchRelease, b.notes ?? null, b.sourceUrl ?? null,
+       b.verifiedDate ?? null, b.reviewBy ?? null]
+    );
+    // Clear the gap now that we have data for it.
+    await pool.query(`DELETE FROM reg_gaps WHERE state_code=$1 AND species=$2`, [state, species]).catch(() => {});
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/regs/gaps', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT state_code, species, hits, last_seen FROM reg_gaps ORDER BY hits DESC, last_seen DESC LIMIT 300`
+    );
+    res.json({ gaps: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 app.post('/api/admin/demo/seed', requireAdmin, async (req, res) => {
   try {
