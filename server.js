@@ -1899,6 +1899,36 @@ pool.query(`
   )
 `).catch(e => console.error('[init] reg_gaps:', e.message));
 
+// ── Phase 3: scrub-bot tables ────────────────────────────────────────────────
+// Proposed changes the daily bot drafts from official sources. NOTHING here is
+// live — an admin approves (writes to `regulations`) or rejects each one.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS reg_proposals (
+    id            SERIAL PRIMARY KEY,
+    state_code    TEXT NOT NULL,
+    species       TEXT NOT NULL,
+    region        TEXT NOT NULL DEFAULT '',
+    proposed      JSONB NOT NULL,          -- {minSizeIn,maxSizeIn,bagLimit,season,gamefish,catchRelease,notes}
+    current       JSONB,                   -- snapshot of the live row at draft time (for the diff)
+    source_url    TEXT,
+    source_excerpt TEXT,                   -- the text the bot read it from (for you to verify)
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at   TIMESTAMPTZ
+  )
+`).catch(e => console.error('[init] reg_proposals:', e.message));
+
+// Tracks the last content hash per state so the bot only works when a page
+// actually changed (most days = no change = no cost).
+pool.query(`
+  CREATE TABLE IF NOT EXISTS reg_source_checks (
+    state_code   TEXT PRIMARY KEY,
+    last_hash    TEXT,
+    last_checked TIMESTAMPTZ,
+    last_status  TEXT
+  )
+`).catch(e => console.error('[init] reg_source_checks:', e.message));
+
 // Official state sources for the "Check my state's regulations" link-out.
 // Add a state here when you turn it on. Unlisted states get a safe search fallback.
 const STATE_REG_SOURCES = {
@@ -3197,6 +3227,160 @@ app.get('/api/admin/regs/gaps', requireAdmin, async (req, res) => {
     );
     res.json({ gaps: rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 3: daily regulations scrub bot.
+// Fetches each turned-on state's official page, hashes it, and ONLY when it
+// changed asks Claude to extract the tracked species' limits into a structured
+// draft. Drafts land in reg_proposals for admin approval — the bot NEVER writes
+// live data. Runs once a day (dependency-free scheduler) + a manual /run trigger.
+// ─────────────────────────────────────────────────────────────────────────────
+const BOT_SPECIES = [
+  'redfish', 'speckled_trout', 'flounder', 'sheepshead', 'black_drum',
+  'snook', 'tripletail', 'pompano', 'spanish_mackerel', 'king_mackerel',
+  'cobia', 'tarpon', 'gag_grouper', 'red_snapper', 'mangrove_snapper',
+];
+
+function stripHtml(html) {
+  return String(html || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ').trim();
+}
+
+async function extractRegsWithClaude(stateName, pageText) {
+  const prompt =
+`You are extracting RECREATIONAL saltwater fishing regulations from an official ${stateName} agency page.
+Return ONLY a JSON array (no prose, no markdown). For each of these species that appears with a size or bag limit, add:
+{"species": <one key below>, "minSizeIn": number|null, "maxSizeIn": number|null, "bagLimit": number|null, "season": string|null, "catchRelease": boolean, "gamefish": boolean, "notes": string|null}
+Species keys: ${BOT_SPECIES.join(', ')}.
+Rules: sizes in inches (total length). If a species is managed by region/zone with different numbers, set notes to "varies by region — verify" and leave numbers null. Omit species not on the page. Do NOT guess. Return [] if nothing found.
+
+PAGE TEXT:
+${pageText.slice(0, 60000)}`;
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 2000, messages: [{ role: 'user', content: prompt }] }),
+  });
+  const data = await resp.json();
+  const text = (data?.content || []).map(b => b.text || '').join('').trim();
+  const a = text.indexOf('['), b = text.lastIndexOf(']');
+  if (a === -1 || b === -1) return [];
+  try { return JSON.parse(text.slice(a, b + 1)); } catch { return []; }
+}
+
+async function runRegsBotForState(stateCode) {
+  const src = STATE_REG_SOURCES[stateCode];
+  if (!src) return { state: stateCode, skipped: 'no source' };
+  try {
+    const res = await fetch(src.url, { headers: { 'user-agent': 'BoneTideRegsBot/1.0' } });
+    const pageText = stripHtml(await res.text());
+    const hash = require('crypto').createHash('sha256').update(pageText).digest('hex');
+
+    const prev = (await pool.query(`SELECT last_hash FROM reg_source_checks WHERE state_code=$1`, [stateCode])).rows[0];
+    const changed = !prev || prev.last_hash !== hash;
+    await pool.query(
+      `INSERT INTO reg_source_checks (state_code, last_hash, last_checked, last_status)
+       VALUES ($1,$2,NOW(),$3)
+       ON CONFLICT (state_code) DO UPDATE SET last_hash=$2, last_checked=NOW(), last_status=$3`,
+      [stateCode, hash, changed ? 'changed' : 'unchanged']
+    );
+    if (!changed) return { state: stateCode, changed: false };
+    if (!pageText || pageText.length < 200) return { state: stateCode, changed: true, note: 'page empty/JS-rendered — skipped' };
+
+    const extracted = await extractRegsWithClaude(src.name, pageText);
+    let proposals = 0;
+    for (const e of (Array.isArray(extracted) ? extracted : [])) {
+      const species = String(e.species || '').toLowerCase().trim();
+      if (!species || !BOT_SPECIES.includes(species)) continue;
+      const cur = (await pool.query(
+        `SELECT min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes
+         FROM regulations WHERE state_code=$1 AND species=$2 AND region='' LIMIT 1`,
+        [stateCode, species]
+      )).rows[0] || null;
+      const proposed = {
+        minSizeIn: e.minSizeIn ?? null, maxSizeIn: e.maxSizeIn ?? null, bagLimit: e.bagLimit ?? null,
+        season: e.season ?? null, gamefish: !!e.gamefish, catchRelease: !!e.catchRelease, notes: e.notes ?? null,
+      };
+      if (cur && Number(cur.min_size_in) === proposed.minSizeIn && Number(cur.max_size_in) === proposed.maxSizeIn &&
+          cur.bag_limit === proposed.bagLimit && (cur.season || null) === proposed.season) continue; // unchanged
+      await pool.query(`DELETE FROM reg_proposals WHERE state_code=$1 AND species=$2 AND status='pending'`, [stateCode, species]);
+      await pool.query(
+        `INSERT INTO reg_proposals (state_code, species, region, proposed, current, source_url, source_excerpt, status)
+         VALUES ($1,$2,'',$3,$4,$5,$6,'pending')`,
+        [stateCode, species, JSON.stringify(proposed), cur ? JSON.stringify(cur) : null, src.url, pageText.slice(0, 600)]
+      );
+      proposals++;
+    }
+    return { state: stateCode, changed: true, proposals };
+  } catch (err) {
+    console.error(`[regsbot] ${stateCode}:`, err.message);
+    await pool.query(`UPDATE reg_source_checks SET last_status='error', last_checked=NOW() WHERE state_code=$1`, [stateCode]).catch(() => {});
+    return { state: stateCode, error: err.message };
+  }
+}
+
+async function runRegsBot() {
+  const out = [];
+  for (const st of Object.keys(STATE_REG_SOURCES)) out.push(await runRegsBotForState(st));
+  console.log('[regsbot] run complete:', JSON.stringify(out));
+  return out;
+}
+
+// Dependency-free scheduler: check hourly, run once per day around 8am server time.
+let _lastBotRunDay = null;
+setInterval(() => {
+  const now = new Date();
+  const day = now.toISOString().slice(0, 10);
+  if (now.getHours() === 8 && _lastBotRunDay !== day) {
+    _lastBotRunDay = day;
+    runRegsBot().catch(e => console.error('[regsbot] scheduled run failed:', e.message));
+  }
+}, 60 * 60 * 1000);
+
+app.get('/api/admin/regs/proposals', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT * FROM reg_proposals WHERE status='pending' ORDER BY created_at DESC LIMIT 200`);
+    res.json({ proposals: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/regs/proposals/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    const p = (await pool.query(`SELECT * FROM reg_proposals WHERE id=$1`, [req.params.id])).rows[0];
+    if (!p) return res.status(404).json({ error: 'not found' });
+    const o = { ...p.proposed, ...(req.body || {}) }; // admin edits on approve override the draft
+    const src = STATE_REG_SOURCES[p.state_code];
+    await pool.query(
+      `INSERT INTO regulations
+         (state_code, species, region, min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes, source_url, verified_date, review_by, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,CURRENT_DATE,(CURRENT_DATE + INTERVAL '90 days'),NOW())
+       ON CONFLICT (state_code, species, region) DO UPDATE SET
+         min_size_in=$4, max_size_in=$5, bag_limit=$6, season=$7, gamefish=$8, catch_release=$9,
+         notes=$10, source_url=$11, verified_date=CURRENT_DATE, review_by=(CURRENT_DATE + INTERVAL '90 days'), updated_at=NOW()`,
+      [p.state_code, p.species, p.region, o.minSizeIn ?? null, o.maxSizeIn ?? null, o.bagLimit ?? null,
+       o.season ?? null, !!o.gamefish, !!o.catchRelease, o.notes ?? null, p.source_url || src?.url || null]
+    );
+    await pool.query(`UPDATE reg_proposals SET status='approved', resolved_at=NOW() WHERE id=$1`, [p.id]);
+    await pool.query(`DELETE FROM reg_gaps WHERE state_code=$1 AND species=$2`, [p.state_code, p.species]).catch(() => {});
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/regs/proposals/:id/reject', requireAdmin, async (req, res) => {
+  try {
+    await pool.query(`UPDATE reg_proposals SET status='rejected', resolved_at=NOW() WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/regs/run', requireAdmin, async (req, res) => {
+  try { res.json({ ran: await runRegsBot() }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/admin/demo/seed', requireAdmin, async (req, res) => {
