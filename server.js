@@ -3142,6 +3142,29 @@ pool.query(`
   )
 `).catch(e => console.error('[init] moderation_log:', e.message));
 
+// Audit log of admin ACTIONS (who cleared/removed/resolved/banned what) — for
+// accountability once more than one person has admin.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS admin_actions (
+    id          SERIAL PRIMARY KEY,
+    admin_id    INTEGER,
+    action      TEXT NOT NULL,
+    target_type TEXT,
+    target_id   TEXT,
+    detail      TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.error('[init] admin_actions:', e.message));
+
+async function logAdminAction(adminId, action, targetType, targetId, detail = null) {
+  try {
+    await pool.query(
+      `INSERT INTO admin_actions (admin_id, action, target_type, target_id, detail) VALUES ($1,$2,$3,$4,$5)`,
+      [adminId ?? null, action, targetType ?? null, targetId != null ? String(targetId) : null, detail]
+    );
+  } catch (e) { console.error('[admin log]', e.message); }
+}
+
 // Admin guard — verifies JWT AND that the user has is_admin=true in the DB.
 async function requireAdmin(req, res, next) {
   const header = req.headers['authorization'] ?? '';
@@ -3595,19 +3618,19 @@ app.get('/api/admin/photos', requireAdmin, async (req, res) => {
 
 // ── Delete any community content ─────────────────────────────────────────────
 app.delete('/api/admin/catches/:id', requireAdmin, async (req, res) => {
-  try { await pool.query(`DELETE FROM catches WHERE id=$1`, [req.params.id]); res.json({ deleted: true }); }
+  try { await pool.query(`DELETE FROM catches WHERE id=$1`, [req.params.id]); await logAdminAction(req.adminUser.id, 'delete_catch', 'catch', req.params.id); res.json({ deleted: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.delete('/api/admin/spots/:id', requireAdmin, async (req, res) => {
-  try { await pool.query(`DELETE FROM spots WHERE id=$1`, [req.params.id]); res.json({ deleted: true }); }
+  try { await pool.query(`DELETE FROM spots WHERE id=$1`, [req.params.id]); await logAdminAction(req.adminUser.id, 'delete_spot', 'spot', req.params.id); res.json({ deleted: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.delete('/api/admin/comments/:id', requireAdmin, async (req, res) => {
-  try { await pool.query(`DELETE FROM comments WHERE id=$1`, [req.params.id]); res.json({ deleted: true }); }
+  try { await pool.query(`DELETE FROM comments WHERE id=$1`, [req.params.id]); await logAdminAction(req.adminUser.id, 'delete_comment', 'comment', req.params.id); res.json({ deleted: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.delete('/api/admin/photos/:id', requireAdmin, async (req, res) => {
-  try { await pool.query(`DELETE FROM spot_photos WHERE id=$1`, [req.params.id]); res.json({ deleted: true }); }
+  try { await pool.query(`DELETE FROM spot_photos WHERE id=$1`, [req.params.id]); await logAdminAction(req.adminUser.id, 'delete_photo', 'photo', req.params.id); res.json({ deleted: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3649,6 +3672,7 @@ app.post('/api/admin/appeals/:id/resolve', requireAdmin, async (req, res) => {
       );
       if (appeal.catch_id) await pool.query(`UPDATE catches SET pts_awarded=$1 WHERE id=$2`, [awarded, appeal.catch_id]);
     }
+    await logAdminAction(req.adminUser.id, 'resolve_appeal', 'appeal', req.params.id, decision);
     res.json({ resolved: true, decision, awarded });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3674,7 +3698,21 @@ app.post('/api/admin/users/:id/ban', requireAdmin, async (req, res) => {
       `UPDATE users SET is_banned=$1 WHERE id=$2 RETURNING id, is_banned`, [banned, req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await logAdminAction(req.adminUser.id, banned ? 'ban_user' : 'unban_user', 'user', req.params.id);
     res.json({ user: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Admin action audit log — who cleared/removed/resolved/banned what ─────────
+app.get('/api/admin/actions', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT a.id, a.action, a.target_type, a.target_id, a.detail, a.created_at,
+              a.admin_id, u.name AS admin_name
+       FROM admin_actions a LEFT JOIN users u ON u.id=a.admin_id
+       ORDER BY a.created_at DESC LIMIT 200`
+    );
+    res.json({ actions: rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
