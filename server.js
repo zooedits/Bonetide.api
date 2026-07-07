@@ -3366,10 +3366,19 @@ async function runRegsBotForState(stateCode) {
       if (cur && Number(cur.min_size_in) === proposed.minSizeIn && Number(cur.max_size_in) === proposed.maxSizeIn &&
           cur.bag_limit === proposed.bagLimit && (cur.season || null) === proposed.season) continue; // unchanged
       await pool.query(`DELETE FROM reg_proposals WHERE state_code=$1 AND species=$2 AND status='pending'`, [stateCode, species]);
+      // Grab the slice of page text AROUND this species' name (not the page top),
+      // and build a text-fragment link that jumps to / highlights the species on
+      // the source page when the browser supports it and the text is visible.
+      const display = species.replace(/_/g, ' ');
+      const at = pageText.toLowerCase().indexOf(display);
+      const excerpt = at === -1
+        ? pageText.slice(0, 300)
+        : (at > 40 ? '…' : '') + pageText.slice(Math.max(0, at - 40), Math.min(pageText.length, at + 320)).trim() + '…';
+      const verifyUrl = src.url + '#:~:text=' + encodeURIComponent(display);
       await pool.query(
         `INSERT INTO reg_proposals (state_code, species, region, proposed, current, source_url, source_excerpt, status)
          VALUES ($1,$2,'',$3,$4,$5,$6,'pending')`,
-        [stateCode, species, JSON.stringify(proposed), cur ? JSON.stringify(cur) : null, src.url, pageText.slice(0, 600)]
+        [stateCode, species, JSON.stringify(proposed), cur ? JSON.stringify(cur) : null, verifyUrl, excerpt]
       );
       proposals++;
     }
