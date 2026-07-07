@@ -1193,6 +1193,99 @@ app.get('/api/catches', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Community feed: public catches + public spots, merged & sorted, with angler
+// attribution, like/comment counts, optional distance filter, cursor pagination.
+// No auth required (guest-readable), matching the other community reads.
+function _haversineMi(lat1, lon1, lat2, lon2) {
+  const R = 3958.8, d = Math.PI / 180;
+  const a = Math.sin((lat2 - lat1) * d / 2) ** 2 +
+            Math.cos(lat1 * d) * Math.cos(lat2 * d) * Math.sin((lon2 - lon1) * d / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+app.get('/api/feed', async (req, res) => {
+  try {
+    const { lat, lon, radius = 100, limit = 25, type = 'all', before = null } = req.query;
+    const lim = Math.min(parseInt(limit) || 25, 50);
+    const haveGeo = lat != null && lon != null && !isNaN(parseFloat(lat)) && !isNaN(parseFloat(lon));
+    const items = [];
+
+    if (type === 'all' || type === 'catches') {
+      const { rows } = await pool.query(
+        `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.lat, c.lon, c.caught_at AS created_at,
+                u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.public_profile, u.anonymize_shared,
+                (SELECT COUNT(*) FROM likes    WHERE target_type='catch' AND target_id=c.id) AS like_count,
+                (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
+         FROM catches c JOIN users u ON u.id=c.user_id
+         WHERE u.share_with_community=true AND c.is_public=true
+         ${before ? 'AND c.caught_at < $1' : ''}
+         ORDER BY c.caught_at DESC LIMIT ${lim + 1}`,
+        before ? [before] : []
+      );
+      for (const r of rows) {
+        let la = r.lat, lo = r.lon;
+        if (la != null && lo != null) { const j = jitterCoords(la, lo, r.id); la = j.lat; lo = j.lon; }
+        const anon = r.anonymize_shared;
+        items.push({
+          type: 'catch', id: r.id, imageUrl: r.image_url ?? null,
+          species: r.species, lengthIn: r.length_in, released: r.released,
+          lat: la, lon: lo, createdAt: r.created_at,
+          likeCount: Number(r.like_count) || 0, commentCount: Number(r.comment_count) || 0,
+          angler: {
+            userId: r.angler_id,
+            name: anon ? null : (r.angler_name ?? null),
+            avatar: anon ? null : (r.avatar ?? null),
+            isClub: !!r.is_club, badge: r.club_badge ?? null,
+            publicProfile: !!r.public_profile && !anon,
+          },
+        });
+      }
+    }
+
+    if (type === 'all' || type === 'spots') {
+      const { rows } = await pool.query(
+        `SELECT s.id, s.name, s.type AS spot_type, s.note, s.lat, s.lon, s.photo_url, s.created_at,
+                u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.public_profile,
+                (SELECT COUNT(*) FROM likes    WHERE target_type='spot' AND target_id=s.id) AS like_count,
+                (SELECT COUNT(*) FROM comments WHERE target_type='spot' AND target_id=s.id) AS comment_count
+         FROM spots s JOIN users u ON u.id=s.user_id
+         WHERE s.is_private=false
+         ${before ? 'AND s.created_at < $1' : ''}
+         ORDER BY s.created_at DESC LIMIT ${lim + 1}`,
+        before ? [before] : []
+      );
+      for (const r of rows) {
+        items.push({
+          type: 'spot', id: r.id, imageUrl: r.photo_url ?? null,
+          name: r.name, spotType: r.spot_type, note: r.note,
+          lat: r.lat, lon: r.lon, createdAt: r.created_at,
+          likeCount: Number(r.like_count) || 0, commentCount: Number(r.comment_count) || 0,
+          angler: {
+            userId: r.angler_id, name: r.angler_name ?? null, avatar: r.avatar ?? null,
+            isClub: !!r.is_club, badge: r.club_badge ?? null, publicProfile: !!r.public_profile,
+          },
+        });
+      }
+    }
+
+    if (haveGeo) {
+      const uLat = parseFloat(lat), uLon = parseFloat(lon), rad = parseFloat(radius) || 100;
+      for (const it of items) {
+        it.distanceMi = (it.lat != null && it.lon != null) ? _haversineMi(uLat, uLon, it.lat, it.lon) : null;
+      }
+      let within = items.filter(it => it.distanceMi != null && it.distanceMi <= rad);
+      if (within.length === 0) within = items; // nationwide fallback so it's never empty
+      within.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      return res.json({ items: within.slice(0, lim) });
+    }
+
+    items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json({ items: items.slice(0, lim) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Delete one of the requesting user's own catches. Ownership is enforced by the
 // user_id match, so a user can only ever delete their own. Likes/comments left
 // on the catch in the community feed are cleaned up best-effort.
