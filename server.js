@@ -2056,6 +2056,26 @@ pool.query(`
   )
 `).catch(e => console.error('[init] reg_source_checks:', e.message));
 
+// ── Phase 4: auto-publish + self-verification migration ──────────────────────
+// CREATE TABLE IF NOT EXISTS above won't touch tables that already exist, so the
+// new columns are added explicitly. All idempotent — safe to run every boot.
+//   regulations.pending_review     : row was auto-published but not yet confirmed
+//   regulations.auto_published_at  : when it went live (drives the 21-day expiry)
+//   reg_proposals.auto_published   : this draft was pushed live (confirm/deny), not held
+//   reg_proposals.confidence       : 'high' (3 reads agree) | 'conflict' (they don't)
+//   reg_proposals.hold_reason      : why a draft was held (big_change | new_species | conflict …)
+//   reg_proposals.reads            : the 3 raw reads for this species, stored only on conflict
+//   reg_source_checks.fail_count   : consecutive fetch/extract failures (surfaces the alert banner)
+pool.query(`
+  ALTER TABLE regulations     ADD COLUMN IF NOT EXISTS pending_review    BOOLEAN DEFAULT false;
+  ALTER TABLE regulations     ADD COLUMN IF NOT EXISTS auto_published_at TIMESTAMPTZ;
+  ALTER TABLE reg_proposals   ADD COLUMN IF NOT EXISTS auto_published    BOOLEAN DEFAULT false;
+  ALTER TABLE reg_proposals   ADD COLUMN IF NOT EXISTS confidence        TEXT;
+  ALTER TABLE reg_proposals   ADD COLUMN IF NOT EXISTS hold_reason       TEXT;
+  ALTER TABLE reg_proposals   ADD COLUMN IF NOT EXISTS reads             JSONB;
+  ALTER TABLE reg_source_checks ADD COLUMN IF NOT EXISTS fail_count      INTEGER DEFAULT 0;
+`).catch(e => console.error('[init] regs auto-publish migration:', e.message));
+
 // Official state sources for the "Check my state's regulations" link-out.
 // Add a state here when you turn it on. Unlisted states get a safe search fallback.
 const STATE_REG_SOURCES = {
@@ -2115,6 +2135,10 @@ app.get('/api/regs', async (req, res) => {
         catchRelease: !!r.catch_release,
         notes: r.notes ?? null,
         verifiedDate: r.verified_date,
+        // Auto-published-but-unconfirmed: the gate should show a "pending review"
+        // tag and lean on the disclaimer. Human-confirmed rows have this false.
+        pendingReview: !!r.pending_review,
+        autoPublishedAt: r.auto_published_at || null,
       },
       source: { name: source.name, url: r.source_url || source.url },
     });
@@ -3380,11 +3404,22 @@ app.get('/api/admin/regs/gaps', requireAdmin, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 3: daily regulations scrub bot.
-// Fetches each turned-on state's official page, hashes it, and ONLY when it
-// changed asks Claude to extract the tracked species' limits into a structured
-// draft. Drafts land in reg_proposals for admin approval — the bot NEVER writes
-// live data. Runs once a day (dependency-free scheduler) + a manual /run trigger.
+// Phase 4: risk-tiered, self-verifying regulations bot.
+// Fetches each turned-on state's official page and hashes it. ONLY when the page
+// changed does it call the model — and on a change day it extracts 3× and
+// compares, so a single bad read can't slip through. What happens next depends
+// on the change:
+//   • no real change            → skip (no queue noise)
+//   • 3 agree + routine change   → AUTO-PUBLISH live (tagged "pending review")
+//                                  AND queue a confirm; deny reverts the value
+//   • big/suspicious change      → HOLD for approval, nothing goes live
+//   • the 3 reads disagree       → HOLD for approval, conflicting reads saved
+// "Big" = a size/bag limit moves >40%, a value crosses to/from no-limit or
+// prohibited, a season flips open↔closed, or it's a brand-new (never-verified)
+// species. Auto-published rows carry review_by = +21d, so an unconfirmed reg
+// auto-downgrades to the official link-out via the existing /api/regs stale path.
+// Cost stays low: the model only fires on change-days, 3× only then.
+// Runs once a day (dependency-free scheduler) + a manual /run trigger.
 // ─────────────────────────────────────────────────────────────────────────────
 const BOT_SPECIES = [
   'redfish', 'speckled_trout', 'flounder', 'sheepshead', 'black_drum',
@@ -3423,6 +3458,87 @@ ${pageText.slice(0, 60000)}`;
   try { return JSON.parse(text.slice(a, b + 1)); } catch { return []; }
 }
 
+// ── Risk-tiering + self-verification helpers ─────────────────────────────────
+const regNum = (v) => (v == null || v === '' ? null : Number(v));
+
+// A "real change" ignores only free-text notes (noisy); every enforceable field
+// counts. If this is true against the live row, we skip — no queue noise.
+function regEqual(cur, p) {
+  if (!cur) return false;
+  return regNum(cur.min_size_in) === regNum(p.minSizeIn)
+      && regNum(cur.max_size_in) === regNum(p.maxSizeIn)
+      && regNum(cur.bag_limit)   === regNum(p.bagLimit)
+      && (cur.season || null)    === (p.season || null)
+      && !!cur.catch_release     === !!p.catchRelease
+      && !!cur.gamefish          === !!p.gamefish;
+}
+
+// Best-effort read of whether a free-text season means "closed / no harvest".
+// Only used to detect an open↔closed FLIP; if both sides read the same we don't
+// touch it. Conservative — unknown/blank counts as "not closed".
+function seasonClosed(s) {
+  if (!s) return false;
+  return /\b(closed|closure|prohibit|no\s*harvest|no\s*take|harvest\s*prohibited|catch[-\s]*and[-\s]*release|release\s*only)\b/i.test(String(s));
+}
+
+// The "big change = hold" gate. Returns {verdict:'auto'|'hold', reason, detail}.
+// Hold if: brand-new (never human-verified) species; a size/bag limit moves
+// >40%; a value crosses to/from "no limit" (null↔value) or "prohibited"
+// (bag↔0, or release-only flips); or a season flips open↔closed.
+function classifyChange(cur, p) {
+  if (!cur) return { verdict: 'hold', reason: 'new_species', detail: 'first-ever value for this species — needs a human check' };
+  const reasons = [];
+  const checks = [
+    ['min_size_in', 'minSizeIn', 'min size'],
+    ['max_size_in', 'maxSizeIn', 'max size'],
+    ['bag_limit',   'bagLimit',  'daily limit'],
+  ];
+  for (const [ck, pk, label] of checks) {
+    const o = regNum(cur[ck]);
+    const n = regNum(p[pk]);
+    if ((o == null) !== (n == null)) { reasons.push(`${label} ${o == null ? 'set (was no limit)' : 'removed (now no limit)'}`); continue; }
+    if (o != null && n != null) {
+      if ((o === 0) !== (n === 0)) { reasons.push(`${label} ${n === 0 ? '→ 0 (prohibited)' : 'off 0'}`); continue; }
+      if (o > 0) { const pct = Math.abs(n - o) / o; if (pct > 0.40) reasons.push(`${label} ${o}→${n} (${Math.round(pct * 100)}%)`); }
+    }
+  }
+  if (!!cur.catch_release !== !!p.catchRelease) reasons.push(p.catchRelease ? 'now release-only (no harvest)' : 'harvest now allowed');
+  if (seasonClosed(cur.season) !== seasonClosed(p.season)) reasons.push(seasonClosed(p.season) ? 'season now closed' : 'season now open');
+  if (reasons.length) return { verdict: 'hold', reason: 'big_change', detail: reasons.join('; ') };
+  return { verdict: 'auto', reason: 'routine' };
+}
+
+// Canonical signature of one species' read, for comparing the 3 reads.
+function readSig(e) {
+  if (!e) return '__ABSENT__';
+  return JSON.stringify({
+    a: regNum(e.minSizeIn), b: regNum(e.maxSizeIn), c: regNum(e.bagLimit),
+    d: (e.season || '').trim().toLowerCase().replace(/\s+/g, ' '),
+    g: !!e.gamefish, r: !!e.catchRelease,
+  });
+}
+
+// Given the 3 whole-page reads, pull this species out of each and decide whether
+// they agree. onPage = it showed up in at least one read. agree = it showed up
+// in all three with identical enforceable values.
+function speciesConsensus(reads, species) {
+  const perRead = reads.map(arr =>
+    (Array.isArray(arr) ? arr : []).find(e => String(e.species || '').toLowerCase().trim() === species) || null
+  );
+  const onPage = perRead.some(Boolean);
+  const sigs = perRead.map(readSig);
+  const agree = onPage && new Set(sigs).size === 1 && sigs[0] !== '__ABSENT__';
+  return { onPage, agree, value: agree ? perRead.find(Boolean) : null, perRead };
+}
+
+function excerptFor(pageText, species) {
+  const display = species.replace(/_/g, ' ');
+  const at = pageText.toLowerCase().indexOf(display);
+  return at === -1
+    ? pageText.slice(0, 300)
+    : (at > 40 ? '…' : '') + pageText.slice(Math.max(0, at - 40), Math.min(pageText.length, at + 320)).trim() + '…';
+}
+
 async function runRegsBotForState(stateCode) {
   const src = STATE_REG_SOURCES[stateCode];
   if (!src) return { state: stateCode, skipped: 'no source' };
@@ -3433,52 +3549,107 @@ async function runRegsBotForState(stateCode) {
 
     const prev = (await pool.query(`SELECT last_hash FROM reg_source_checks WHERE state_code=$1`, [stateCode])).rows[0];
     const changed = !prev || prev.last_hash !== hash;
+    // A successful fetch clears the failure counter (changed OR unchanged).
     await pool.query(
-      `INSERT INTO reg_source_checks (state_code, last_hash, last_checked, last_status)
-       VALUES ($1,$2,NOW(),$3)
-       ON CONFLICT (state_code) DO UPDATE SET last_hash=$2, last_checked=NOW(), last_status=$3`,
+      `INSERT INTO reg_source_checks (state_code, last_hash, last_checked, last_status, fail_count)
+       VALUES ($1,$2,NOW(),$3,0)
+       ON CONFLICT (state_code) DO UPDATE SET last_hash=$2, last_checked=NOW(), last_status=$3, fail_count=0`,
       [stateCode, hash, changed ? 'changed' : 'unchanged']
     );
     if (!changed) return { state: stateCode, changed: false };
     if (!pageText || pageText.length < 200) return { state: stateCode, changed: true, note: 'page empty/JS-rendered — skipped' };
 
-    const extracted = await extractRegsWithClaude(src.name, pageText);
-    let proposals = 0;
-    for (const e of (Array.isArray(extracted) ? extracted : [])) {
-      const species = String(e.species || '').toLowerCase().trim();
-      if (!species || !BOT_SPECIES.includes(species)) continue;
+    // Change day → extract 3× and compare. This is the only place the model fires.
+    const reads = [];
+    for (let i = 0; i < 3; i++) reads.push(await extractRegsWithClaude(src.name, pageText));
+
+    let autoPublished = 0, held = 0, conflicts = 0, skipped = 0;
+    const verifyUrlFor = (sp) => src.url + '#:~:text=' + encodeURIComponent(sp.replace(/_/g, ' '));
+
+    for (const species of BOT_SPECIES) {
+      const { onPage, agree, value, perRead } = speciesConsensus(reads, species);
+      if (!onPage) continue; // not on the page in any read
+
       const cur = (await pool.query(
-        `SELECT min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes
+        `SELECT min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes,
+                verified_date, review_by, source_url
          FROM regulations WHERE state_code=$1 AND species=$2 AND region='' LIMIT 1`,
         [stateCode, species]
       )).rows[0] || null;
+      const excerpt = excerptFor(pageText, species);
+      const verifyUrl = verifyUrlFor(species);
+
+      // ── The 3 reads disagree → HOLD, and stash all three so you can eyeball them.
+      if (!agree) {
+        const best = perRead.find(Boolean) || {};
+        const proposed = {
+          minSizeIn: best.minSizeIn ?? null, maxSizeIn: best.maxSizeIn ?? null, bagLimit: best.bagLimit ?? null,
+          season: best.season ?? null, gamefish: !!best.gamefish, catchRelease: !!best.catchRelease, notes: best.notes ?? null,
+        };
+        await pool.query(`DELETE FROM reg_proposals WHERE state_code=$1 AND species=$2 AND status='pending'`, [stateCode, species]);
+        await pool.query(
+          `INSERT INTO reg_proposals
+             (state_code, species, region, proposed, current, source_url, source_excerpt, status, auto_published, confidence, hold_reason, reads)
+           VALUES ($1,$2,'',$3,$4,$5,$6,'pending',false,'conflict','conflict',$7)`,
+          [stateCode, species, JSON.stringify(proposed), cur ? JSON.stringify(cur) : null, verifyUrl, excerpt, JSON.stringify(perRead)]
+        );
+        conflicts++; held++;
+        continue;
+      }
+
+      // ── 3 agree. Build the proposed row from the consensus read.
       const proposed = {
-        minSizeIn: e.minSizeIn ?? null, maxSizeIn: e.maxSizeIn ?? null, bagLimit: e.bagLimit ?? null,
-        season: e.season ?? null, gamefish: !!e.gamefish, catchRelease: !!e.catchRelease, notes: e.notes ?? null,
+        minSizeIn: value.minSizeIn ?? null, maxSizeIn: value.maxSizeIn ?? null, bagLimit: value.bagLimit ?? null,
+        season: value.season ?? null, gamefish: !!value.gamefish, catchRelease: !!value.catchRelease, notes: value.notes ?? null,
       };
-      if (cur && Number(cur.min_size_in) === proposed.minSizeIn && Number(cur.max_size_in) === proposed.maxSizeIn &&
-          cur.bag_limit === proposed.bagLimit && (cur.season || null) === proposed.season) continue; // unchanged
+      if (regEqual(cur, proposed)) { skipped++; continue; } // no real change → no noise
+
+      const verdict = classifyChange(cur, proposed);
       await pool.query(`DELETE FROM reg_proposals WHERE state_code=$1 AND species=$2 AND status='pending'`, [stateCode, species]);
-      // Grab the slice of page text AROUND this species' name (not the page top),
-      // and build a text-fragment link that jumps to / highlights the species on
-      // the source page when the browser supports it and the text is visible.
-      const display = species.replace(/_/g, ' ');
-      const at = pageText.toLowerCase().indexOf(display);
-      const excerpt = at === -1
-        ? pageText.slice(0, 300)
-        : (at > 40 ? '…' : '') + pageText.slice(Math.max(0, at - 40), Math.min(pageText.length, at + 320)).trim() + '…';
-      const verifyUrl = src.url + '#:~:text=' + encodeURIComponent(display);
-      await pool.query(
-        `INSERT INTO reg_proposals (state_code, species, region, proposed, current, source_url, source_excerpt, status)
-         VALUES ($1,$2,'',$3,$4,$5,$6,'pending')`,
-        [stateCode, species, JSON.stringify(proposed), cur ? JSON.stringify(cur) : null, verifyUrl, excerpt]
-      );
-      proposals++;
+
+      if (verdict.verdict === 'auto') {
+        // Routine change → go live now, tagged pending, on a 21-day confirm clock.
+        // proposal.current holds the pre-change snapshot so "deny" can revert.
+        await pool.query(
+          `INSERT INTO regulations
+             (state_code, species, region, min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes,
+              source_url, verified_date, review_by, pending_review, auto_published_at, updated_at)
+           VALUES ($1,$2,'',$3,$4,$5,$6,$7,$8,$9,$10,CURRENT_DATE,(CURRENT_DATE + INTERVAL '21 days'),true,NOW(),NOW())
+           ON CONFLICT (state_code, species, region) DO UPDATE SET
+             min_size_in=$3, max_size_in=$4, bag_limit=$5, season=$6, gamefish=$7, catch_release=$8, notes=$9,
+             source_url=$10, verified_date=CURRENT_DATE, review_by=(CURRENT_DATE + INTERVAL '21 days'),
+             pending_review=true, auto_published_at=NOW(), updated_at=NOW()`,
+          [stateCode, species, proposed.minSizeIn, proposed.maxSizeIn, proposed.bagLimit, proposed.season,
+           proposed.gamefish, proposed.catchRelease, proposed.notes, verifyUrl]
+        );
+        await pool.query(
+          `INSERT INTO reg_proposals
+             (state_code, species, region, proposed, current, source_url, source_excerpt, status, auto_published, confidence, hold_reason, reads)
+           VALUES ($1,$2,'',$3,$4,$5,$6,'pending',true,'high',null,null)`,
+          [stateCode, species, JSON.stringify(proposed), cur ? JSON.stringify(cur) : null, verifyUrl, excerpt]
+        );
+        await pool.query(`DELETE FROM reg_gaps WHERE state_code=$1 AND species=$2`, [stateCode, species]).catch(() => {});
+        autoPublished++;
+      } else {
+        // Big/suspicious or brand-new → HOLD. Nothing goes live.
+        const holdReason = verdict.reason === 'new_species' ? 'new_species' : ('big_change: ' + (verdict.detail || ''));
+        await pool.query(
+          `INSERT INTO reg_proposals
+             (state_code, species, region, proposed, current, source_url, source_excerpt, status, auto_published, confidence, hold_reason, reads)
+           VALUES ($1,$2,'',$3,$4,$5,$6,'pending',false,'high',$7,null)`,
+          [stateCode, species, JSON.stringify(proposed), cur ? JSON.stringify(cur) : null, verifyUrl, excerpt, holdReason]
+        );
+        held++;
+      }
     }
-    return { state: stateCode, changed: true, proposals };
+
+    return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped };
   } catch (err) {
     console.error(`[regsbot] ${stateCode}:`, err.message);
-    await pool.query(`UPDATE reg_source_checks SET last_status='error', last_checked=NOW() WHERE state_code=$1`, [stateCode]).catch(() => {});
+    await pool.query(
+      `UPDATE reg_source_checks SET last_status='error', last_checked=NOW(), fail_count=COALESCE(fail_count,0)+1 WHERE state_code=$1`,
+      [stateCode]
+    ).catch(() => {});
     return { state: stateCode, error: err.message };
   }
 }
@@ -3508,6 +3679,11 @@ app.get('/api/admin/regs/proposals', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Approve = "this is good, make it human-verified." Handles BOTH cases:
+//   • an auto-published-pending row → CONFIRM it (clears the pending tag, resets
+//     the trust clock to 90 days). Any edits in req.body override the values.
+//   • a held draft → PUBLISH it live for the first time.
+// Either way the row ends up pending_review=false on the 90-day human clock.
 app.post('/api/admin/regs/proposals/:id/approve', requireAdmin, async (req, res) => {
   try {
     const p = (await pool.query(`SELECT * FROM reg_proposals WHERE id=$1`, [req.params.id])).rows[0];
@@ -3516,24 +3692,62 @@ app.post('/api/admin/regs/proposals/:id/approve', requireAdmin, async (req, res)
     const src = STATE_REG_SOURCES[p.state_code];
     await pool.query(
       `INSERT INTO regulations
-         (state_code, species, region, min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes, source_url, verified_date, review_by, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,CURRENT_DATE,(CURRENT_DATE + INTERVAL '90 days'),NOW())
+         (state_code, species, region, min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes,
+          source_url, verified_date, review_by, pending_review, auto_published_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,CURRENT_DATE,(CURRENT_DATE + INTERVAL '90 days'),false,NULL,NOW())
        ON CONFLICT (state_code, species, region) DO UPDATE SET
          min_size_in=$4, max_size_in=$5, bag_limit=$6, season=$7, gamefish=$8, catch_release=$9,
-         notes=$10, source_url=$11, verified_date=CURRENT_DATE, review_by=(CURRENT_DATE + INTERVAL '90 days'), updated_at=NOW()`,
+         notes=$10, source_url=$11, verified_date=CURRENT_DATE, review_by=(CURRENT_DATE + INTERVAL '90 days'),
+         pending_review=false, auto_published_at=NULL, updated_at=NOW()`,
       [p.state_code, p.species, p.region, o.minSizeIn ?? null, o.maxSizeIn ?? null, o.bagLimit ?? null,
        o.season ?? null, !!o.gamefish, !!o.catchRelease, o.notes ?? null, p.source_url || src?.url || null]
     );
     await pool.query(`UPDATE reg_proposals SET status='approved', resolved_at=NOW() WHERE id=$1`, [p.id]);
     await pool.query(`DELETE FROM reg_gaps WHERE state_code=$1 AND species=$2`, [p.state_code, p.species]).catch(() => {});
+    await logAdminAction(req.adminUser.id, p.auto_published ? 'confirm_reg' : 'approve_reg', 'reg_proposal', p.id, `${p.state_code}/${p.species}`).catch(() => {});
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Reject = "no." For a held draft, that's all it is (nothing was ever live). For
+// an auto-published-pending row this is a DENY → revert: restore the live row to
+// the pre-change snapshot we saved in proposal.current (or delete it if there was
+// no prior row), and clear the pending tag.
 app.post('/api/admin/regs/proposals/:id/reject', requireAdmin, async (req, res) => {
   try {
-    await pool.query(`UPDATE reg_proposals SET status='rejected', resolved_at=NOW() WHERE id=$1`, [req.params.id]);
+    const p = (await pool.query(`SELECT * FROM reg_proposals WHERE id=$1`, [req.params.id])).rows[0];
+    if (!p) return res.status(404).json({ error: 'not found' });
+    if (p.auto_published) {
+      const c = p.current;
+      if (c) {
+        await pool.query(
+          `UPDATE regulations SET
+             min_size_in=$1, max_size_in=$2, bag_limit=$3, season=$4, gamefish=$5, catch_release=$6, notes=$7,
+             source_url=$8, verified_date=$9, review_by=$10, pending_review=false, auto_published_at=NULL, updated_at=NOW()
+           WHERE state_code=$11 AND species=$12 AND region=$13`,
+          [c.min_size_in ?? null, c.max_size_in ?? null, c.bag_limit ?? null, c.season ?? null,
+           !!c.gamefish, !!c.catch_release, c.notes ?? null, c.source_url ?? null,
+           c.verified_date ?? null, c.review_by ?? null, p.state_code, p.species, p.region || '']
+        );
+      } else {
+        // No prior row existed → auto-publish created it → revert = remove it.
+        await pool.query(`DELETE FROM regulations WHERE state_code=$1 AND species=$2 AND region=$3`, [p.state_code, p.species, p.region || '']);
+      }
+    }
+    await pool.query(`UPDATE reg_proposals SET status='rejected', resolved_at=NOW() WHERE id=$1`, [p.id]);
+    await logAdminAction(req.adminUser.id, p.auto_published ? 'deny_reg_revert' : 'reject_reg', 'reg_proposal', p.id, `${p.state_code}/${p.species}`).catch(() => {});
     res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Per-source health for the admin banner: last check + consecutive failure count.
+app.get('/api/admin/regs/status', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT state_code, last_checked, last_status, COALESCE(fail_count,0) AS fail_count
+       FROM reg_source_checks ORDER BY state_code`
+    );
+    res.json({ sources: rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
