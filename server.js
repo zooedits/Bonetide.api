@@ -2088,7 +2088,24 @@ const STATE_REG_SOURCES = {
   AL: { name: 'Alabama DCNR — Saltwater Limits',          url: 'https://www.outdooralabama.com/fishing/saltwater-recreational-size-creel-limits' },
   MS: { name: 'Mississippi DMR — Recreational Limits',    url: 'https://dmr.ms.gov/recreational-catch-limits/' },
   LA: { name: 'Louisiana LDWF — Saltwater Finfish',       url: 'https://www.wlf.louisiana.gov/page/recreational-saltwater-finfish' },
-  TX: { name: 'Texas Parks & Wildlife — Saltwater Limits', url: 'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits' },
+  // TPWD's landing page is JS-rendered (a plain fetch sees no limits), but each
+  // per-species sub-page is static. So TX scrapes the sub-pages and merges them;
+  // `url` stays the human-facing index for the "check regulations" link.
+  TX: {
+    name: 'Texas Parks & Wildlife — Saltwater Limits',
+    url: 'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits',
+    scrape: [
+      'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/drum-bag-length-limits',
+      'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/seatrout-bag-length-limits',
+      'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/snapper-bag-length-limits',
+      'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/mackerel-bag-length-limits',
+      'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/flounder-bag-length-limits',
+      'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/sheepshead-bag-length-limits',
+      'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/snook-bag-length-limits',
+      'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/tarpon-bag-length-limits',
+      'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/grouper-bag-length-limits',
+    ],
+  },
 };
 function stateSource(stateCode) {
   const sc = (stateCode || '').toUpperCase();
@@ -3560,20 +3577,63 @@ function speciesConsensus(reads, species) {
   return { onPage, agree, value: agree ? perRead.find(Boolean) : null, perRead };
 }
 
+// State sites print the official/common name, not our internal key — so search
+// for the names anglers and agencies actually use. First alias that hits the
+// page wins, and we hand back the matched term so the "verify" jump-link can
+// highlight it too. Conservative on ambiguous single words (e.g. no bare "gag"
+// or "ling") to avoid landing on the wrong section.
+const SPECIES_ALIASES = {
+  redfish:          ['red drum', 'redfish'],
+  speckled_trout:   ['spotted seatrout', 'spotted sea trout', 'speckled trout', 'seatrout', 'sea trout'],
+  flounder:         ['southern flounder', 'gulf flounder', 'summer flounder', 'flounder'],
+  sheepshead:       ['sheepshead'],
+  black_drum:       ['black drum'],
+  snook:            ['common snook', 'snook'],
+  tripletail:       ['tripletail', 'triple tail'],
+  pompano:          ['florida pompano', 'pompano'],
+  spanish_mackerel: ['spanish mackerel'],
+  king_mackerel:    ['king mackerel'],
+  cobia:            ['cobia'],
+  tarpon:           ['tarpon'],
+  gag_grouper:      ['gag grouper'],
+  red_snapper:      ['red snapper'],
+  mangrove_snapper: ['mangrove snapper', 'gray snapper', 'grey snapper'],
+};
+
 function excerptFor(pageText, species) {
-  const display = species.replace(/_/g, ' ');
-  const at = pageText.toLowerCase().indexOf(display);
-  return at === -1
-    ? pageText.slice(0, 300)
-    : (at > 40 ? '…' : '') + pageText.slice(Math.max(0, at - 40), Math.min(pageText.length, at + 320)).trim() + '…';
+  const lower = pageText.toLowerCase();
+  const aliases = SPECIES_ALIASES[species] || [species.replace(/_/g, ' ')];
+  let at = -1;
+  let term = aliases[0];
+  for (const a of aliases) {
+    const i = lower.indexOf(a);
+    if (i !== -1) { at = i; term = a; break; }
+  }
+  if (at === -1) {
+    // Nothing matched — the species may simply not be on this page. Return a
+    // short lead so the admin can tell, but flag it so the term isn't trusted.
+    return { excerpt: pageText.slice(0, 260).trim() + '…', term: aliases[0], matched: false };
+  }
+  const excerpt =
+    (at > 60 ? '…' : '') +
+    pageText.slice(Math.max(0, at - 60), Math.min(pageText.length, at + 380)).trim() +
+    '…';
+  return { excerpt, term, matched: true };
 }
 
-async function runRegsBotForState(stateCode) {
+async function runRegsBotForState(stateCode, force = false) {
   const src = STATE_REG_SOURCES[stateCode];
   if (!src) return { state: stateCode, skipped: 'no source' };
   try {
-    const res = await fetch(src.url, { headers: { 'user-agent': 'BoneTideRegsBot/1.0' } });
-    const pageText = stripHtml(await res.text());
+    // A source can list several pages (e.g. a state that splits limits by
+    // species family). Fetch them all, tolerate individual failures, and merge.
+    const urls = Array.isArray(src.scrape) && src.scrape.length ? src.scrape : [src.url];
+    const results = await Promise.allSettled(
+      urls.map((u) => fetch(u, { headers: { 'user-agent': 'BoneTideRegsBot/1.0' } }).then((r) => r.text()))
+    );
+    const htmls = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+    if (!htmls.length) throw new Error('all sources failed to fetch');
+    const pageText = htmls.map(stripHtml).join('\n\n----\n\n');
     const hash = crypto.createHash('sha256').update(pageText).digest('hex');
 
     const prev = (await pool.query(`SELECT last_hash FROM reg_source_checks WHERE state_code=$1`, [stateCode])).rows[0];
@@ -3585,7 +3645,9 @@ async function runRegsBotForState(stateCode) {
        ON CONFLICT (state_code) DO UPDATE SET last_hash=$2, last_checked=NOW(), last_status=$3, fail_count=0`,
       [stateCode, hash, changed ? 'changed' : 'unchanged']
     );
-    if (!changed) return { state: stateCode, changed: false };
+    // force = re-scan even if the page hasn't changed (e.g. to apply a bot fix
+    // to sources whose fingerprint is already on file).
+    if (!changed && !force) return { state: stateCode, changed: false };
     if (!pageText || pageText.length < 200) return { state: stateCode, changed: true, note: 'page empty/JS-rendered — skipped' };
 
     // Change day → extract 3× and compare. This is the only place the model fires.
@@ -3593,7 +3655,6 @@ async function runRegsBotForState(stateCode) {
     for (let i = 0; i < 3; i++) reads.push(await extractRegsWithClaude(src.name, pageText));
 
     let autoPublished = 0, held = 0, conflicts = 0, skipped = 0;
-    const verifyUrlFor = (sp) => src.url + '#:~:text=' + encodeURIComponent(sp.replace(/_/g, ' '));
 
     for (const species of BOT_SPECIES) {
       const { onPage, agree, value, perRead } = speciesConsensus(reads, species);
@@ -3605,8 +3666,10 @@ async function runRegsBotForState(stateCode) {
          FROM regulations WHERE state_code=$1 AND species=$2 AND region='' LIMIT 1`,
         [stateCode, species]
       )).rows[0] || null;
-      const excerpt = excerptFor(pageText, species);
-      const verifyUrl = verifyUrlFor(species);
+      // Grab the slice of page text around the species' real name, and point the
+      // jump-link at that same term so it highlights on the source page.
+      const { excerpt, term } = excerptFor(pageText, species);
+      const verifyUrl = src.url + '#:~:text=' + encodeURIComponent(term);
 
       // ── The 3 reads disagree → HOLD, and stash all three so you can eyeball them.
       if (!agree) {
@@ -3683,10 +3746,10 @@ async function runRegsBotForState(stateCode) {
   }
 }
 
-async function runRegsBot() {
+async function runRegsBot(force = false) {
   const out = [];
-  for (const st of Object.keys(STATE_REG_SOURCES)) out.push(await runRegsBotForState(st));
-  console.log('[regsbot] run complete:', JSON.stringify(out));
+  for (const st of Object.keys(STATE_REG_SOURCES)) out.push(await runRegsBotForState(st, force));
+  console.log('[regsbot] run complete' + (force ? ' (forced)' : '') + ':', JSON.stringify(out));
   return out;
 }
 
@@ -3781,7 +3844,7 @@ app.get('/api/admin/regs/status', requireAdmin, async (req, res) => {
 });
 
 app.post('/api/admin/regs/run', requireAdmin, async (req, res) => {
-  try { res.json({ ran: await runRegsBot() }); }
+  try { res.json({ ran: await runRegsBot(!!(req.body && req.body.force)) }); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
