@@ -2148,6 +2148,27 @@ app.get('/api/regs', async (req, res) => {
   }
 });
 
+// Which states currently have (non-stale) data for a species — powers the state
+// carousel's dots so an angler can see at a glance where regs exist. One cheap
+// query; mirrors the stale rule in /api/regs so a downgraded row doesn't count.
+app.get('/api/regs/coverage', async (req, res) => {
+  try {
+    const species = (req.query.species || '').toLowerCase();
+    if (!species) return res.json({ coverage: [] });
+    const { rows } = await pool.query(
+      `SELECT state_code, bool_or(COALESCE(pending_review, false)) AS pending
+         FROM regulations
+        WHERE species=$1 AND region='' AND (review_by IS NULL OR review_by >= CURRENT_DATE)
+        GROUP BY state_code`,
+      [species]
+    );
+    res.json({ coverage: rows.map(r => ({ state: r.state_code, pending: !!r.pending })) });
+  } catch (err) {
+    console.error('Regs coverage error:', err);
+    res.json({ coverage: [] }); // fail safe → dots just stay neutral
+  }
+});
+
 app.post('/api/comments', async (req, res) => {
   const { targetType, targetId, body, parentCommentId, photoUrl } = req.body ?? {};
   if (!body || !body.trim()) return res.status(400).json({ error: 'body required' });
