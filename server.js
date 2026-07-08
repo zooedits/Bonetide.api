@@ -1169,6 +1169,8 @@ app.post('/api/catches', async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) RETURNING *`,
       [user.id,species,lengthIn,released??true,bait,note,lat,lon,tideHeightFt,tideDirection,windKts,windDirection,baroInHg,moonPct,goodBiteScore,ptsAwarded,imageUrl??null,isPublic??false]
     );
+    // Shadowbanned users' posts are created hidden — visible to them, nobody else.
+    if (await isShadowbanned(user.id)) await pool.query(`UPDATE catches SET hidden=true WHERE id=$1`, [newCatch.id]).catch(() => {});
     if (ptsAwarded > 0) {
       await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [ptsAwarded, user.id]);
       await pool.query(`INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'catch',$3,NOW())`, [user.id, ptsAwarded, newCatch.id.toString()]);
@@ -1247,7 +1249,7 @@ app.get('/api/feed', async (req, res) => {
                 (SELECT COUNT(*) FROM likes    WHERE target_type='catch' AND target_id=c.id) AS like_count,
                 (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
          FROM catches c JOIN users u ON u.id=c.user_id
-         WHERE u.share_with_community=true AND c.is_public=true
+         WHERE u.share_with_community=true AND c.is_public=true AND c.hidden IS NOT TRUE
          ${before ? 'AND c.caught_at < $1' : ''}
          ORDER BY c.caught_at DESC LIMIT ${lim + 1}`,
         before ? [before] : []
@@ -1279,7 +1281,7 @@ app.get('/api/feed', async (req, res) => {
                 (SELECT COUNT(*) FROM likes    WHERE target_type='spot' AND target_id=s.id) AS like_count,
                 (SELECT COUNT(*) FROM comments WHERE target_type='spot' AND target_id=s.id) AS comment_count
          FROM spots s JOIN users u ON u.id=s.user_id
-         WHERE s.is_private=false
+         WHERE s.is_private=false AND s.hidden IS NOT TRUE
          ${before ? 'AND s.created_at < $1' : ''}
          ORDER BY s.created_at DESC LIMIT ${lim + 1}`,
         before ? [before] : []
@@ -1517,6 +1519,7 @@ app.post('/api/spots', async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) RETURNING *`,
       [user.id, name, type ?? null, note ?? null, lat, lon, photoUrl, isPrivate ?? true]
     );
+    if (await isShadowbanned(user.id)) await pool.query(`UPDATE spots SET hidden=true WHERE id=$1`, [newSpot.id]).catch(() => {});
     res.json({ spot: formatSpot(newSpot) });
   } catch (err) {
     console.error('Create spot error:', err);
@@ -2103,6 +2106,8 @@ pool.query(`
   ALTER TABLE reg_proposals   ADD COLUMN IF NOT EXISTS confidence        TEXT;
   ALTER TABLE reg_proposals   ADD COLUMN IF NOT EXISTS hold_reason       TEXT;
   ALTER TABLE reg_proposals   ADD COLUMN IF NOT EXISTS reads             JSONB;
+  ALTER TABLE regulations     ADD COLUMN IF NOT EXISTS discrepancy_at    TIMESTAMPTZ;
+  ALTER TABLE regulations     ADD COLUMN IF NOT EXISTS discrepancy_url   TEXT;
   ALTER TABLE reg_source_checks ADD COLUMN IF NOT EXISTS fail_count      INTEGER DEFAULT 0;
   ALTER TABLE reg_source_checks ADD COLUMN IF NOT EXISTS species_found   INTEGER;
 `).catch(e => console.error('[init] regs auto-publish migration:', e.message));
@@ -2206,6 +2211,10 @@ app.get('/api/regs', async (req, res) => {
         // tag and lean on the disclaimer. Human-confirmed rows have this false.
         pendingReview: !!r.pending_review,
         autoPublishedAt: r.auto_published_at || null,
+        // Bot saw the source change to something it couldn't confirm; we're
+        // showing the last-known value and warning the angler to verify.
+        discrepancy: !!r.discrepancy_at,
+        discrepancyUrl: r.discrepancy_url || null,
       },
       source: { name: source.name, url: r.source_url || source.url },
     });
@@ -2262,6 +2271,7 @@ app.post('/api/comments', async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,NOW()) RETURNING *`,
       [user.id, targetType, tId, parentCommentId ?? null, body.trim().slice(0, 1000), photoUrl ?? null]
     );
+    if (await isShadowbanned(user.id)) await pool.query(`UPDATE comments SET hidden=true WHERE id=$1`, [newComment.id]).catch(() => {});
     const { rows: [userRow] } = await pool.query(
       `SELECT name, avatar, anonymize_shared, is_club, club_badge FROM users WHERE id=$1`, [user.id]
     );
@@ -2324,10 +2334,10 @@ app.get('/api/comments/:targetType/:targetId', async (req, res) => {
        FROM comments c
        JOIN users u ON u.id = c.user_id
        LEFT JOIN likes l ON l.target_type='comment' AND l.target_id=c.id
-       WHERE c.target_type=$1 AND c.target_id=$2
+       WHERE c.target_type=$1 AND c.target_id=$2 AND (c.hidden IS NOT TRUE OR c.user_id = $3)
        GROUP BY c.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge
        ORDER BY c.created_at ASC`,
-      [targetType, tId]
+      [targetType, tId, viewer?.id ?? -1]
     );
     let likedSet = new Set();
     if (viewer && rows.length) {
@@ -3327,6 +3337,21 @@ const PORT = process.env.PORT || 3000;
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin  BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_admin:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_banned:', e.message));
 
+// ── Admin moderation: shadowban (limited posting window) + silent content hide ──
+pool.query(`ALTER TABLE users    ADD COLUMN IF NOT EXISTS shadowbanned_until TIMESTAMPTZ`).catch(e => console.error('[init] shadowbanned_until:', e.message));
+pool.query(`ALTER TABLE catches  ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT false`).catch(e => console.error('[init] catches.hidden:', e.message));
+pool.query(`ALTER TABLE spots    ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT false`).catch(e => console.error('[init] spots.hidden:', e.message));
+pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT false`).catch(e => console.error('[init] comments.hidden:', e.message));
+
+// True if the user is currently inside a shadowban window. Their new posts are
+// created hidden — visible to them (so they don't notice), invisible to everyone.
+async function isShadowbanned(userId) {
+  try {
+    const { rows } = await pool.query(`SELECT shadowbanned_until FROM users WHERE id=$1`, [userId]);
+    return !!(rows[0] && rows[0].shadowbanned_until && new Date(rows[0].shadowbanned_until) > new Date());
+  } catch { return false; }
+}
+
 // Bone Tide Club (RevenueCat) columns. The extension added these via a one-off
 // psql command; declaring them here too makes the schema reproducible and is a
 // no-op if they already exist.
@@ -3770,6 +3795,9 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
            VALUES ($1,$2,'',$3,$4,$5,$6,'pending',false,'conflict','conflict',$7)`,
           [stateCode, species, JSON.stringify(proposed), cur ? JSON.stringify(cur) : null, verifyUrl, excerpt, JSON.stringify(perRead)]
         );
+        // We're keeping the last-known value live but the source looks different —
+        // flag the live row so the angler-facing screens warn "verify at source".
+        if (cur) await pool.query(`UPDATE regulations SET discrepancy_at=NOW(), discrepancy_url=$3 WHERE state_code=$1 AND species=$2 AND region=''`, [stateCode, species, verifyUrl]).catch(() => {});
         conflicts++; held++;
         continue;
       }
@@ -3795,7 +3823,7 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
            ON CONFLICT (state_code, species, region) DO UPDATE SET
              min_size_in=$3, max_size_in=$4, bag_limit=$5, season=$6, gamefish=$7, catch_release=$8, notes=$9,
              source_url=$10, verified_date=CURRENT_DATE, review_by=(CURRENT_DATE + INTERVAL '21 days'),
-             pending_review=true, auto_published_at=NOW(), updated_at=NOW()`,
+             pending_review=true, auto_published_at=NOW(), discrepancy_at=NULL, discrepancy_url=NULL, updated_at=NOW()`,
           [stateCode, species, proposed.minSizeIn, proposed.maxSizeIn, proposed.bagLimit, proposed.season,
            proposed.gamefish, proposed.catchRelease, proposed.notes, verifyUrl]
         );
@@ -3816,6 +3844,8 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
            VALUES ($1,$2,'',$3,$4,$5,$6,'pending',false,'high',$7,null)`,
           [stateCode, species, JSON.stringify(proposed), cur ? JSON.stringify(cur) : null, verifyUrl, excerpt, holdReason]
         );
+        // Existing live value stays, but flag it so anglers are warned to verify.
+        if (cur) await pool.query(`UPDATE regulations SET discrepancy_at=NOW(), discrepancy_url=$3 WHERE state_code=$1 AND species=$2 AND region=''`, [stateCode, species, verifyUrl]).catch(() => {});
         held++;
       }
     }
@@ -3836,7 +3866,16 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
         `UPDATE reg_source_checks SET species_found=$2, last_status=$3 WHERE state_code=$1`,
         [stateCode, foundCount, dataMissing ? 'data_missing' : 'scanned']
       );
-      if (dataMissing) console.warn(`[regsbot] ${stateCode}: page changed but 0/${liveCount} species found — possible site overhaul`);
+      if (dataMissing) {
+        // Source looks redesigned — flag every live reg for this state so anglers
+        // are warned to verify while we sort out the new source.
+        await pool.query(
+          `UPDATE regulations SET discrepancy_at=NOW(), discrepancy_url=$2
+            WHERE state_code=$1 AND region='' AND (review_by IS NULL OR review_by >= CURRENT_DATE)`,
+          [stateCode, src.url]
+        ).catch(() => {});
+        console.warn(`[regsbot] ${stateCode}: page changed but 0/${liveCount} species found — possible site overhaul`);
+      }
       return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped, foundCount, dataMissing };
     }
 
@@ -3952,7 +3991,7 @@ app.post('/api/admin/regs/proposals/:id/approve', requireAdmin, async (req, res)
        ON CONFLICT (state_code, species, region) DO UPDATE SET
          min_size_in=$4, max_size_in=$5, bag_limit=$6, season=$7, gamefish=$8, catch_release=$9,
          notes=$10, source_url=$11, verified_date=CURRENT_DATE, review_by=(CURRENT_DATE + INTERVAL '90 days'),
-         pending_review=false, auto_published_at=NULL, updated_at=NOW()`,
+         pending_review=false, auto_published_at=NULL, discrepancy_at=NULL, discrepancy_url=NULL, updated_at=NOW()`,
       [p.state_code, p.species, p.region, o.minSizeIn ?? null, o.maxSizeIn ?? null, o.bagLimit ?? null,
        o.season ?? null, !!o.gamefish, !!o.catchRelease, o.notes ?? null, p.source_url || src?.url || null]
     );
@@ -3989,6 +4028,8 @@ app.post('/api/admin/regs/proposals/:id/reject', requireAdmin, async (req, res) 
       }
     }
     await pool.query(`UPDATE reg_proposals SET status='rejected', resolved_at=NOW() WHERE id=$1`, [p.id]);
+    // Human reviewed and the standing value holds → clear any angler-facing warning.
+    await pool.query(`UPDATE regulations SET discrepancy_at=NULL, discrepancy_url=NULL WHERE state_code=$1 AND species=$2 AND region=$3`, [p.state_code, p.species, p.region || '']).catch(() => {});
     await logAdminAction(req.adminUser.id, p.auto_published ? 'deny_reg_revert' : 'reject_reg', 'reg_proposal', p.id, `${p.state_code}/${p.species}`).catch(() => {});
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4285,6 +4326,38 @@ app.post('/api/admin/users/:id/ban', requireAdmin, async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     await logAdminAction(req.adminUser.id, banned ? 'ban_user' : 'unban_user', 'user', req.params.id);
     res.json({ user: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Shadowban: limit a user's posting for N days. While active, everything they
+// post is created hidden (they see it; nobody else does). days=0 clears it.
+app.post('/api/admin/users/:id/shadowban', requireAdmin, async (req, res) => {
+  try {
+    const days = Math.max(0, parseInt(req.body?.days ?? 0) || 0);
+    const until = days > 0 ? new Date(Date.now() + days * 86400000) : null;
+    const { rows } = await pool.query(
+      `UPDATE users SET shadowbanned_until=$1 WHERE id=$2 RETURNING id, shadowbanned_until`,
+      [until, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await logAdminAction(req.adminUser.id, days > 0 ? 'shadowban_user' : 'unshadowban_user', 'user', req.params.id, days > 0 ? `${days}d` : null);
+    res.json({ user: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Silent hide/unhide a single item. Hidden content drops out of the community
+// feed and public comment lists but still shows in the author's own logbook /
+// profile — so a removal doesn't tip them off. type: catch | spot | comment.
+const HIDE_TABLE = { catch: 'catches', spot: 'spots', comment: 'comments' };
+app.post('/api/admin/content/:type/:id/hide', requireAdmin, async (req, res) => {
+  try {
+    const table = HIDE_TABLE[req.params.type];
+    if (!table) return res.status(400).json({ error: 'type must be catch, spot, or comment' });
+    const hidden = req.body?.hidden !== false; // default true; { hidden:false } to restore
+    const { rows } = await pool.query(`UPDATE ${table} SET hidden=$1 WHERE id=$2 RETURNING id`, [hidden, req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    await logAdminAction(req.adminUser.id, hidden ? 'hide_content' : 'unhide_content', req.params.type, req.params.id);
+    res.json({ ok: true, hidden });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
