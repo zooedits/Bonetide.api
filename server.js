@@ -1599,7 +1599,8 @@ app.delete('/api/spots/:id', async (req, res) => {
 app.get('/api/spots/:id/photos', async (req, res) => {
   try {
     const spotId = parseInt(req.params.id);
-    // Get photos with like counts per photo
+    const viewer = await getUserFromRequest(req).catch(() => null);
+    // Get photos with like counts per photo (hidden photos show only to their uploader)
     const { rows } = await pool.query(
       `SELECT sp.id, sp.photo_url, sp.created_at, sp.user_id,
               u.name AS user_name, u.avatar AS user_avatar, u.anonymize_shared,
@@ -1609,13 +1610,12 @@ app.get('/api/spots/:id/photos', async (req, res) => {
        FROM spot_photos sp
        JOIN users u ON u.id = sp.user_id
        LEFT JOIN likes l ON l.target_type='spot_photo' AND l.target_id=sp.id
-       WHERE sp.spot_id = $1
+       WHERE sp.spot_id = $1 AND (sp.hidden IS NOT TRUE OR sp.user_id = $2)
        GROUP BY sp.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge, u.public_profile
        ORDER BY sp.created_at DESC`,
-      [spotId]
+      [spotId, viewer?.id ?? -1]
     );
     // Check if requesting user has liked each photo
-    const viewer = await getUserFromRequest(req).catch(() => null);
     let likedSet = new Set();
     if (viewer && rows.length) {
       const photoIds = rows.map(r => r.id);
@@ -1667,6 +1667,7 @@ app.post('/api/spots/:id/photos', requireAuth, async (req, res) => {
        VALUES ($1, $2, $3, NOW()) RETURNING id, photo_url, created_at`,
       [req.params.id, userId, photoUrl]
     );
+    if (await isShadowbanned(userId)) await pool.query(`UPDATE spot_photos SET hidden=true WHERE id=$1`, [photo.id]).catch(() => {});
     res.json({ photo: { id: photo.id, photoUrl: photo.photo_url, createdAt: photo.created_at } });
   } catch (err) {
     console.error('[spot photos] Upload failed:', err.message);
@@ -3342,6 +3343,7 @@ pool.query(`ALTER TABLE users    ADD COLUMN IF NOT EXISTS shadowbanned_until TIM
 pool.query(`ALTER TABLE catches  ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT false`).catch(e => console.error('[init] catches.hidden:', e.message));
 pool.query(`ALTER TABLE spots    ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT false`).catch(e => console.error('[init] spots.hidden:', e.message));
 pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT false`).catch(e => console.error('[init] comments.hidden:', e.message));
+pool.query(`ALTER TABLE spot_photos ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT false`).catch(e => console.error('[init] spot_photos.hidden:', e.message));
 
 // True if the user is currently inside a shadowban window. Their new posts are
 // created hidden — visible to them (so they don't notice), invisible to everyone.
@@ -4348,7 +4350,7 @@ app.post('/api/admin/users/:id/shadowban', requireAdmin, async (req, res) => {
 // Silent hide/unhide a single item. Hidden content drops out of the community
 // feed and public comment lists but still shows in the author's own logbook /
 // profile — so a removal doesn't tip them off. type: catch | spot | comment.
-const HIDE_TABLE = { catch: 'catches', spot: 'spots', comment: 'comments' };
+const HIDE_TABLE = { catch: 'catches', spot: 'spots', comment: 'comments', spot_photo: 'spot_photos' };
 app.post('/api/admin/content/:type/:id/hide', requireAdmin, async (req, res) => {
   try {
     const table = HIDE_TABLE[req.params.type];
