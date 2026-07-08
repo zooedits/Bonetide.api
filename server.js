@@ -602,6 +602,36 @@ app.put('/api/auth/birthday-month', requireAuth, async (req, res) => {
   }
 });
 
+// Register this device's Expo push token against the logged-in user. Stores the
+// is_admin flag alongside so admin-only sends are a simple WHERE.
+app.post('/api/push/register', requireAuth, async (req, res) => {
+  try {
+    const { token, platform } = req.body ?? {};
+    if (!token || typeof token !== 'string' || token.indexOf('ExponentPushToken') !== 0) {
+      return res.status(400).json({ error: 'valid Expo push token required' });
+    }
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows } = await pool.query(`SELECT id, is_admin FROM users WHERE ${column}=$1 LIMIT 1`, [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await pool.query(
+      `INSERT INTO push_tokens (token, user_id, platform, is_admin, updated_at)
+       VALUES ($1,$2,$3,$4,NOW())
+       ON CONFLICT (token) DO UPDATE SET user_id=$2, platform=$3, is_admin=$4, updated_at=NOW()`,
+      [token, rows[0].id, platform || null, !!rows[0].is_admin]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Drop a token (e.g. on logout).
+app.post('/api/push/unregister', requireAuth, async (req, res) => {
+  try {
+    const { token } = req.body ?? {};
+    if (token) await pool.query(`DELETE FROM push_tokens WHERE token=$1`, [token]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Birthday "Double Points" day — the user activates a single 24-hour boost
 // window during their birthday month. For 24h from the tap, catches pay 2× and
 // the daily cap is lifted to BOOST_DAILY_CAP. One activation per birthday year.
@@ -2076,6 +2106,17 @@ pool.query(`
   ALTER TABLE reg_source_checks ADD COLUMN IF NOT EXISTS fail_count      INTEGER DEFAULT 0;
   ALTER TABLE reg_source_checks ADD COLUMN IF NOT EXISTS species_found   INTEGER;
 `).catch(e => console.error('[init] regs auto-publish migration:', e.message));
+
+// ── Push notification device tokens ──────────────────────────────────────────
+pool.query(`
+  CREATE TABLE IF NOT EXISTS push_tokens (
+    token      TEXT PRIMARY KEY,
+    user_id    INTEGER,
+    platform   TEXT,
+    is_admin   BOOLEAN DEFAULT false,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.error('[init] push_tokens:', e.message));
 
 // Official state sources for the "Check my state's regulations" link-out.
 // Add a state here when you turn it on. Unlisted states get a safe search fallback.
@@ -3615,10 +3656,23 @@ function excerptFor(pageText, species) {
     // short lead so the admin can tell, but flag it so the term isn't trusted.
     return { excerpt: pageText.slice(0, 260).trim() + '…', term: aliases[0], matched: false };
   }
-  const excerpt =
-    (at > 60 ? '…' : '') +
-    pageText.slice(Math.max(0, at - 60), Math.min(pageText.length, at + 380)).trim() +
-    '…';
+  // End the clip where the NEXT tracked species starts, so it's this fish's
+  // section and not a fixed blob that bleeds into the next one. Small lead in
+  // front catches values printed just before the name (table-row layouts).
+  const LEAD = 40, MAX = 500;
+  const from = Math.max(0, at - LEAD);
+  let end = Math.min(pageText.length, at + MAX);
+  const after = at + term.length;
+  for (const sp of BOT_SPECIES) {
+    if (sp === species) continue;
+    const others = SPECIES_ALIASES[sp] || [sp.replace(/_/g, ' ')];
+    for (const a of others) {
+      const j = lower.indexOf(a, after);
+      if (j !== -1 && j < end) end = j;
+    }
+  }
+  const clip = pageText.slice(from, end).trim();
+  const excerpt = (from > 0 ? '…' : '') + clip + (end < pageText.length ? '…' : '');
   return { excerpt, term, matched: true };
 }
 
@@ -3765,10 +3819,64 @@ async function runRegsBotForState(stateCode, force = false) {
   }
 }
 
+// ── Push send helpers (Expo Push API) ───────────────────────────────────────
+// Server → device via Expo's HTTP push service. Batches of 100, and prunes any
+// token Expo reports as dead so the table doesn't rot.
+async function sendPush(messages) {
+  const list = (messages || []).filter((m) => m && m.to);
+  if (!list.length) return;
+  for (let i = 0; i < list.length; i += 100) {
+    const chunk = list.slice(i, i + 100);
+    try {
+      const res = await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(chunk),
+      });
+      const json = await res.json().catch(() => null);
+      const receipts = json && Array.isArray(json.data) ? json.data : [];
+      receipts.forEach((r, idx) => {
+        if (r && r.status === 'error' && r.details && r.details.error === 'DeviceNotRegistered') {
+          const dead = chunk[idx] && chunk[idx].to;
+          if (dead) pool.query(`DELETE FROM push_tokens WHERE token=$1`, [dead]).catch(() => {});
+        }
+      });
+    } catch (e) { console.error('[push] send error:', e.message); }
+  }
+}
+
+async function notifyAdmins(title, body, data = {}) {
+  try {
+    const { rows } = await pool.query(`SELECT token FROM push_tokens WHERE is_admin = true`);
+    if (!rows.length) return;
+    await sendPush(rows.map((r) => ({ to: r.token, title, body, data, sound: 'default', priority: 'high' })));
+  } catch (e) { console.error('[push] notifyAdmins:', e.message); }
+}
+
 async function runRegsBot(force = false) {
   const out = [];
   for (const st of Object.keys(STATE_REG_SOURCES)) out.push(await runRegsBotForState(st, force));
   console.log('[regsbot] run complete' + (force ? ' (forced)' : '') + ':', JSON.stringify(out));
+
+  // Tell admins if anything needs eyes — nothing noteworthy = no notification.
+  const t = out.reduce((a, s) => ({
+    held:     a.held     + (s.held || 0),
+    auto:     a.auto     + (s.autoPublished || 0),
+    redesign: a.redesign + (s.dataMissing ? 1 : 0),
+    errors:   a.errors   + (s.error ? 1 : 0),
+  }), { held: 0, auto: 0, redesign: 0, errors: 0 });
+  const bits = [];
+  if (t.redesign) bits.push(`${t.redesign} source${t.redesign > 1 ? 's' : ''} may be redesigned`);
+  if (t.held)     bits.push(`${t.held} held for review`);
+  if (t.auto)     bits.push(`${t.auto} auto-published`);
+  if (t.errors)   bits.push(`${t.errors} unreadable`);
+  if (bits.length) {
+    await notifyAdmins(
+      t.redesign ? '⚠ Regs need attention' : '🎣 Regs updated',
+      bits.join(' · '),
+      { type: 'regs_run', screen: 'RegsAdmin' }
+    );
+  }
   return out;
 }
 
