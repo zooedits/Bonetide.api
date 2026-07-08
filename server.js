@@ -2074,6 +2074,7 @@ pool.query(`
   ALTER TABLE reg_proposals   ADD COLUMN IF NOT EXISTS hold_reason       TEXT;
   ALTER TABLE reg_proposals   ADD COLUMN IF NOT EXISTS reads             JSONB;
   ALTER TABLE reg_source_checks ADD COLUMN IF NOT EXISTS fail_count      INTEGER DEFAULT 0;
+  ALTER TABLE reg_source_checks ADD COLUMN IF NOT EXISTS species_found   INTEGER;
 `).catch(e => console.error('[init] regs auto-publish migration:', e.message));
 
 // Official state sources for the "Check my state's regulations" link-out.
@@ -3654,11 +3655,12 @@ async function runRegsBotForState(stateCode, force = false) {
     const reads = [];
     for (let i = 0; i < 3; i++) reads.push(await extractRegsWithClaude(src.name, pageText));
 
-    let autoPublished = 0, held = 0, conflicts = 0, skipped = 0;
+    let autoPublished = 0, held = 0, conflicts = 0, skipped = 0, foundCount = 0;
 
     for (const species of BOT_SPECIES) {
       const { onPage, agree, value, perRead } = speciesConsensus(reads, species);
       if (!onPage) continue; // not on the page in any read
+      foundCount++;
 
       const cur = (await pool.query(
         `SELECT min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes,
@@ -3735,7 +3737,24 @@ async function runRegsBotForState(stateCode, force = false) {
       }
     }
 
-    return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped };
+    // Coverage-collapse guard: if a source we're actively serving data for
+    // suddenly yields NO species (page still loads, but the limits moved or
+    // vanished — the signature of a site overhaul), don't pass silently. We
+    // never touched the live rows on an empty read, so nothing's corrupted —
+    // this just raises the alarm so the URL can be fixed before data goes stale.
+    const liveCount = Number((await pool.query(
+      `SELECT COUNT(*) AS c FROM regulations
+        WHERE state_code=$1 AND region='' AND (review_by IS NULL OR review_by >= CURRENT_DATE)`,
+      [stateCode]
+    )).rows[0].c);
+    const dataMissing = foundCount === 0 && liveCount >= 3;
+    await pool.query(
+      `UPDATE reg_source_checks SET species_found=$2, last_status=$3 WHERE state_code=$1`,
+      [stateCode, foundCount, dataMissing ? 'data_missing' : (changed ? 'changed' : 'unchanged')]
+    );
+    if (dataMissing) console.warn(`[regsbot] ${stateCode}: page changed but 0/${liveCount} species found — possible site overhaul`);
+
+    return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped, foundCount, dataMissing };
   } catch (err) {
     console.error(`[regsbot] ${stateCode}:`, err.message);
     await pool.query(
@@ -3836,7 +3855,7 @@ app.post('/api/admin/regs/proposals/:id/reject', requireAdmin, async (req, res) 
 app.get('/api/admin/regs/status', requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT state_code, last_checked, last_status, COALESCE(fail_count,0) AS fail_count
+      `SELECT state_code, last_checked, last_status, COALESCE(fail_count,0) AS fail_count, species_found
        FROM reg_source_checks ORDER BY state_code`
     );
     res.json({ sources: rows });
