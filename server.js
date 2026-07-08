@@ -3528,16 +3528,17 @@ async function extractRegsWithClaude(stateName, pageText) {
   const prompt =
 `You are extracting RECREATIONAL saltwater fishing regulations from an official ${stateName} agency page.
 Return ONLY a JSON array (no prose, no markdown). For each of these species that appears with a size or bag limit, add:
-{"species": <one key below>, "minSizeIn": number|null, "maxSizeIn": number|null, "bagLimit": number|null, "season": string|null, "catchRelease": boolean, "gamefish": boolean, "notes": string|null}
+{"species": <one key below>, "minSizeIn": number|null, "maxSizeIn": number|null, "bagLimit": number|null, "season": string|null, "catchRelease": boolean, "gamefish": boolean, "notes": string|null, "sourceText": string|null}
 Species keys: ${BOT_SPECIES.join(', ')}.
 Rules: sizes in inches (total length). If a species is managed by region/zone with different numbers, set notes to "varies by region — verify" and leave numbers null. Omit species not on the page. Do NOT guess. Return [] if nothing found.
+sourceText: copy the EXACT words from the page that state this species' limits — verbatim, no paraphrasing, no added words. Keep it short (the sentence or row for this species). If you can't point to explicit text, set it to null.
 
 PAGE TEXT:
 ${pageText.slice(0, 60000)}`;
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 2000, messages: [{ role: 'user', content: prompt }] }),
+    body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] }),
   });
   const data = await resp.json();
   const text = (data?.content || []).map(b => b.text || '').join('').trim();
@@ -3614,9 +3615,16 @@ function speciesConsensus(reads, species) {
     (Array.isArray(arr) ? arr : []).find(e => String(e.species || '').toLowerCase().trim() === species) || null
   );
   const onPage = perRead.some(Boolean);
+  // "Real data" = an enforceable value, not just the name appearing. A bare
+  // mention (all nulls, or "varies by region") shouldn't become a proposal —
+  // that's what produced blank conflict cards.
+  const hasData = perRead.some((e) => e && (
+    regNum(e.minSizeIn) != null || regNum(e.maxSizeIn) != null || regNum(e.bagLimit) != null ||
+    e.catchRelease === true || (e.season != null && String(e.season).trim() !== '')
+  ));
   const sigs = perRead.map(readSig);
   const agree = onPage && new Set(sigs).size === 1 && sigs[0] !== '__ABSENT__';
-  return { onPage, agree, value: agree ? perRead.find(Boolean) : null, perRead };
+  return { onPage, hasData, agree, value: agree ? perRead.find(Boolean) : null, perRead };
 }
 
 // State sites print the official/common name, not our internal key — so search
@@ -3676,34 +3684,53 @@ function excerptFor(pageText, species) {
   return { excerpt, term, matched: true };
 }
 
-async function runRegsBotForState(stateCode, force = false) {
+// Only trust the model's verbatim quote if it actually appears on the page
+// (whitespace/case-insensitive). Guards against a paraphrased or invented quote
+// being shown as "what the site says".
+function verifiedQuote(sourceText, pageText) {
+  if (!sourceText || typeof sourceText !== 'string') return null;
+  const q = sourceText.trim();
+  if (q.length < 8) return null;
+  const norm = (s) => s.toLowerCase().replace(/\s+/g, ' ');
+  return norm(pageText).includes(norm(q)) ? q : null;
+}
+
+// Fetch a source's page(s) and return the merged, stripped text + its hash.
+// A source can list several pages (a state that splits limits by species family);
+// we fetch them all, tolerate individual failures, and merge.
+async function fetchSourceText(src) {
+  const urls = Array.isArray(src.scrape) && src.scrape.length ? src.scrape : [src.url];
+  const results = await Promise.allSettled(
+    urls.map((u) => fetch(u, { headers: { 'user-agent': 'BoneTideRegsBot/1.0' } }).then((r) => r.text()))
+  );
+  const htmls = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+  if (!htmls.length) throw new Error('all sources failed to fetch');
+  const pageText = htmls.map(stripHtml).join('\n\n----\n\n');
+  return { pageText, hash: crypto.createHash('sha256').update(pageText).digest('hex') };
+}
+
+async function runRegsBotForState(stateCode, force = false, onlySpecies = null) {
   const src = STATE_REG_SOURCES[stateCode];
   if (!src) return { state: stateCode, skipped: 'no source' };
   try {
-    // A source can list several pages (e.g. a state that splits limits by
-    // species family). Fetch them all, tolerate individual failures, and merge.
-    const urls = Array.isArray(src.scrape) && src.scrape.length ? src.scrape : [src.url];
-    const results = await Promise.allSettled(
-      urls.map((u) => fetch(u, { headers: { 'user-agent': 'BoneTideRegsBot/1.0' } }).then((r) => r.text()))
-    );
-    const htmls = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
-    if (!htmls.length) throw new Error('all sources failed to fetch');
-    const pageText = htmls.map(stripHtml).join('\n\n----\n\n');
-    const hash = crypto.createHash('sha256').update(pageText).digest('hex');
+    const { pageText, hash } = await fetchSourceText(src);
 
-    const prev = (await pool.query(`SELECT last_hash FROM reg_source_checks WHERE state_code=$1`, [stateCode])).rows[0];
-    const changed = !prev || prev.last_hash !== hash;
-    // A successful fetch clears the failure counter (changed OR unchanged).
-    await pool.query(
-      `INSERT INTO reg_source_checks (state_code, last_hash, last_checked, last_status, fail_count)
-       VALUES ($1,$2,NOW(),$3,0)
-       ON CONFLICT (state_code) DO UPDATE SET last_hash=$2, last_checked=NOW(), last_status=$3, fail_count=0`,
-      [stateCode, hash, changed ? 'changed' : 'unchanged']
-    );
-    // force = re-scan even if the page hasn't changed (e.g. to apply a bot fix
-    // to sources whose fingerprint is already on file).
-    if (!changed && !force) return { state: stateCode, changed: false };
     if (!pageText || pageText.length < 200) return { state: stateCode, changed: true, note: 'page empty/JS-rendered — skipped' };
+
+    if (!onlySpecies) {
+      const prev = (await pool.query(`SELECT last_hash FROM reg_source_checks WHERE state_code=$1`, [stateCode])).rows[0];
+      const changed = !prev || prev.last_hash !== hash;
+      // A successful fetch clears the failure counter (changed OR unchanged).
+      await pool.query(
+        `INSERT INTO reg_source_checks (state_code, last_hash, last_checked, last_status, fail_count)
+         VALUES ($1,$2,NOW(),$3,0)
+         ON CONFLICT (state_code) DO UPDATE SET last_hash=$2, last_checked=NOW(), last_status=$3, fail_count=0`,
+        [stateCode, hash, changed ? 'changed' : 'unchanged']
+      );
+      // force = re-scan even if the page hasn't changed (e.g. to apply a bot fix
+      // to sources whose fingerprint is already on file).
+      if (!changed && !force) return { state: stateCode, changed: false };
+    }
 
     // Change day → extract 3× and compare. This is the only place the model fires.
     const reads = [];
@@ -3711,9 +3738,9 @@ async function runRegsBotForState(stateCode, force = false) {
 
     let autoPublished = 0, held = 0, conflicts = 0, skipped = 0, foundCount = 0;
 
-    for (const species of BOT_SPECIES) {
-      const { onPage, agree, value, perRead } = speciesConsensus(reads, species);
-      if (!onPage) continue; // not on the page in any read
+    for (const species of (onlySpecies ? [onlySpecies] : BOT_SPECIES)) {
+      const { onPage, hasData, agree, value, perRead } = speciesConsensus(reads, species);
+      if (!onPage || !hasData) continue; // not on the page, or on it with no real numbers
       foundCount++;
 
       const cur = (await pool.query(
@@ -3722,9 +3749,11 @@ async function runRegsBotForState(stateCode, force = false) {
          FROM regulations WHERE state_code=$1 AND species=$2 AND region='' LIMIT 1`,
         [stateCode, species]
       )).rows[0] || null;
-      // Grab the slice of page text around the species' real name, and point the
-      // jump-link at that same term so it highlights on the source page.
-      const { excerpt, term } = excerptFor(pageText, species);
+      // Prefer the model's verbatim quote (verified to be on the page); fall
+      // back to the proximity clip if it can't be confirmed.
+      const { excerpt: clipExcerpt, term } = excerptFor(pageText, species);
+      const chosenRead = agree ? value : (perRead.find(Boolean) || null);
+      const excerpt = (chosenRead && verifiedQuote(chosenRead.sourceText, pageText)) || clipExcerpt;
       const verifyUrl = src.url + '#:~:text=' + encodeURIComponent(term);
 
       // ── The 3 reads disagree → HOLD, and stash all three so you can eyeball them.
@@ -3791,30 +3820,36 @@ async function runRegsBotForState(stateCode, force = false) {
       }
     }
 
-    // Coverage-collapse guard: if a source we're actively serving data for
-    // suddenly yields NO species (page still loads, but the limits moved or
-    // vanished — the signature of a site overhaul), don't pass silently. We
-    // never touched the live rows on an empty read, so nothing's corrupted —
-    // this just raises the alarm so the URL can be fixed before data goes stale.
-    const liveCount = Number((await pool.query(
-      `SELECT COUNT(*) AS c FROM regulations
-        WHERE state_code=$1 AND region='' AND (review_by IS NULL OR review_by >= CURRENT_DATE)`,
-      [stateCode]
-    )).rows[0].c);
-    const dataMissing = foundCount === 0 && liveCount >= 3;
-    await pool.query(
-      `UPDATE reg_source_checks SET species_found=$2, last_status=$3 WHERE state_code=$1`,
-      [stateCode, foundCount, dataMissing ? 'data_missing' : (changed ? 'changed' : 'unchanged')]
-    );
-    if (dataMissing) console.warn(`[regsbot] ${stateCode}: page changed but 0/${liveCount} species found — possible site overhaul`);
+    if (!onlySpecies) {
+      // Coverage-collapse guard: if a source we're actively serving data for
+      // suddenly yields NO species (page still loads, but the limits moved or
+      // vanished — the signature of a site overhaul), don't pass silently. We
+      // never touched the live rows on an empty read, so nothing's corrupted —
+      // this just raises the alarm so the URL can be fixed before data goes stale.
+      const liveCount = Number((await pool.query(
+        `SELECT COUNT(*) AS c FROM regulations
+          WHERE state_code=$1 AND region='' AND (review_by IS NULL OR review_by >= CURRENT_DATE)`,
+        [stateCode]
+      )).rows[0].c);
+      const dataMissing = foundCount === 0 && liveCount >= 3;
+      await pool.query(
+        `UPDATE reg_source_checks SET species_found=$2, last_status=$3 WHERE state_code=$1`,
+        [stateCode, foundCount, dataMissing ? 'data_missing' : 'scanned']
+      );
+      if (dataMissing) console.warn(`[regsbot] ${stateCode}: page changed but 0/${liveCount} species found — possible site overhaul`);
+      return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped, foundCount, dataMissing };
+    }
 
-    return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped, foundCount, dataMissing };
+    // Single-species re-scan result (no source-health side effects).
+    return { state: stateCode, species: onlySpecies, autoPublished, held, conflicts, skipped, found: foundCount > 0 };
   } catch (err) {
-    console.error(`[regsbot] ${stateCode}:`, err.message);
-    await pool.query(
-      `UPDATE reg_source_checks SET last_status='error', last_checked=NOW(), fail_count=COALESCE(fail_count,0)+1 WHERE state_code=$1`,
-      [stateCode]
-    ).catch(() => {});
+    console.error(`[regsbot] ${stateCode}${onlySpecies ? '/' + onlySpecies : ''}:`, err.message);
+    if (!onlySpecies) {
+      await pool.query(
+        `UPDATE reg_source_checks SET last_status='error', last_checked=NOW(), fail_count=COALESCE(fail_count,0)+1 WHERE state_code=$1`,
+        [stateCode]
+      ).catch(() => {});
+    }
     return { state: stateCode, error: err.message };
   }
 }
@@ -3973,6 +4008,21 @@ app.get('/api/admin/regs/status', requireAdmin, async (req, res) => {
 app.post('/api/admin/regs/run', requireAdmin, async (req, res) => {
   try { res.json({ ran: await runRegsBot(!!(req.body && req.body.force)) }); }
   catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Re-scan a single species for one state on demand — re-fetches the source,
+// re-reads 3×, and rebuilds just that species' proposal. Doesn't touch the
+// source's fingerprint or health, so it's a safe targeted retry.
+app.post('/api/admin/regs/rescan-species', requireAdmin, async (req, res) => {
+  try {
+    const state = String((req.body && req.body.state) || '').toUpperCase();
+    const species = String((req.body && req.body.species) || '').toLowerCase();
+    if (!state || !species) return res.status(400).json({ error: 'state and species required' });
+    if (!STATE_REG_SOURCES[state]) return res.status(400).json({ error: 'no source configured for ' + state });
+    const result = await runRegsBotForState(state, true, species);
+    await logAdminAction(req.adminUser.id, 'rescan_species', 'reg', `${state}/${species}`).catch(() => {});
+    res.json(result);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/admin/demo/seed', requireAdmin, async (req, res) => {
