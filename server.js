@@ -2079,8 +2079,16 @@ pool.query(`
 // Official state sources for the "Check my state's regulations" link-out.
 // Add a state here when you turn it on. Unlisted states get a safe search fallback.
 const STATE_REG_SOURCES = {
-  GA: { name: 'Georgia DNR — Coastal Resources', url: 'https://coastalgadnr.org/limits' },
-  FL: { name: 'Florida FWC — Saltwater Recreational', url: 'https://myfwc.com/fishing/saltwater/recreational/' },
+  // Southeast
+  GA: { name: 'Georgia DNR — Coastal Resources',          url: 'https://coastalgadnr.org/limits' },
+  FL: { name: 'Florida FWC — Saltwater Recreational',     url: 'https://myfwc.com/fishing/saltwater/recreational/' },
+  SC: { name: 'SC DNR — Saltwater Finfish Limits',        url: 'https://www.eregulations.com/southcarolina/fishing/finfish-size-catch-limits' },
+  NC: { name: 'NC Marine Fisheries — Recreational Limits', url: 'https://www.deq.nc.gov/about/divisions/marine-fisheries/rules-proclamations-and-size-and-bag-limits/recreational-size-and-bag-limits' },
+  // Gulf
+  AL: { name: 'Alabama DCNR — Saltwater Limits',          url: 'https://www.outdooralabama.com/fishing/saltwater-recreational-size-creel-limits' },
+  MS: { name: 'Mississippi DMR — Recreational Limits',    url: 'https://dmr.ms.gov/recreational-catch-limits/' },
+  LA: { name: 'Louisiana LDWF — Saltwater Finfish',       url: 'https://www.wlf.louisiana.gov/page/recreational-saltwater-finfish' },
+  TX: { name: 'Texas Parks & Wildlife — Saltwater Limits', url: 'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits' },
 };
 function stateSource(stateCode) {
   const sc = (stateCode || '').toUpperCase();
