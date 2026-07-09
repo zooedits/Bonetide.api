@@ -2060,6 +2060,13 @@ pool.query(`
   )
 `).catch(e => console.error('[init] reg_gaps:', e.message));
 
+// Some species are intentionally link-out only: the state manages them under a
+// group/complex (e.g. NC's Snapper/Grouper Complex) and publishes no size/bag,
+// so there's nothing to store and nothing to fix. Dismissing keeps them out of
+// the Gaps list forever while anglers still get the official-source link.
+pool.query(`ALTER TABLE reg_gaps ADD COLUMN IF NOT EXISTS dismissed BOOLEAN DEFAULT false`)
+  .catch(e => console.error('[init] reg_gaps.dismissed:', e.message));
+
 // ── Phase 3: scrub-bot tables ────────────────────────────────────────────────
 // Proposed changes the daily bot drafts from official sources. NOTHING here is
 // live — an admin approves (writes to `regulations`) or rejects each one.
@@ -3535,9 +3542,28 @@ app.post('/api/admin/regs', requireAdmin, async (req, res) => {
 app.get('/api/admin/regs/gaps', requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT state_code, species, hits, last_seen FROM reg_gaps ORDER BY hits DESC, last_seen DESC LIMIT 300`
+      `SELECT state_code, species, hits, last_seen FROM reg_gaps
+        WHERE dismissed IS NOT TRUE
+        ORDER BY hits DESC, last_seen DESC LIMIT 300`
     );
     res.json({ gaps: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Mark a gap as link-out only (dismissed=true) so it stops nagging, or restore it.
+app.post('/api/admin/regs/gaps/dismiss', requireAdmin, async (req, res) => {
+  try {
+    const state = String(req.body?.state || '').toUpperCase();
+    const species = String(req.body?.species || '').toLowerCase();
+    const dismissed = req.body?.dismissed !== false;
+    if (!state || !species) return res.status(400).json({ error: 'state and species required' });
+    await pool.query(
+      `INSERT INTO reg_gaps (state_code, species, dismissed) VALUES ($1,$2,$3)
+       ON CONFLICT (state_code, species) DO UPDATE SET dismissed=$3`,
+      [state, species, dismissed]
+    );
+    await logAdminAction(req.adminUser.id, dismissed ? 'gap_linkout_only' : 'gap_restore', 'reg', `${state}/${species}`).catch(() => {});
+    res.json({ ok: true, dismissed });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
