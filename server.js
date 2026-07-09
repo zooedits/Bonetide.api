@@ -2136,7 +2136,28 @@ pool.query(`
 const STATE_REG_SOURCES = {
   // Southeast
   GA: { name: 'Georgia DNR — Coastal Resources',          url: 'https://coastalgadnr.org/limits' },
-  FL: { name: 'Florida FWC — Saltwater Recreational',     url: 'https://myfwc.com/fishing/saltwater/recreational/' },
+  // FWC's /recreational/ landing page is a hub — it links to species but lists no
+  // limits. The numbers live on per-species pages, so FL scrapes those and merges.
+  // `url` stays the human-facing hub for the "check regulations" link.
+  FL: {
+    name: 'Florida FWC — Saltwater Recreational',
+    url: 'https://myfwc.com/fishing/saltwater/recreational/',
+    scrape: [
+      'https://myfwc.com/fishing/saltwater/recreational/red-drum/',
+      'https://myfwc.com/fishing/saltwater/recreational/spotted-seatrout/',
+      'https://myfwc.com/fishing/saltwater/recreational/snook/',
+      'https://myfwc.com/fishing/saltwater/recreational/flounder/',
+      'https://myfwc.com/fishing/saltwater/recreational/sheepshead/',
+      'https://myfwc.com/fishing/saltwater/recreational/black-drum/',
+      'https://myfwc.com/fishing/saltwater/recreational/pompano/',
+      'https://myfwc.com/fishing/saltwater/recreational/tripletail/',
+      'https://myfwc.com/fishing/saltwater/recreational/cobia/',
+      'https://myfwc.com/fishing/saltwater/recreational/tarpon/',
+      'https://myfwc.com/fishing/saltwater/recreational/mackerel/',
+      'https://myfwc.com/fishing/saltwater/recreational/snapper/',
+      'https://myfwc.com/fishing/saltwater/recreational/grouper/',
+    ],
+  },
   SC: { name: 'SC DNR — Saltwater Finfish Limits',        url: 'https://www.eregulations.com/southcarolina/fishing/finfish-size-catch-limits' },
   NC: { name: 'NC Marine Fisheries — Recreational Limits', url: 'https://www.deq.nc.gov/about/divisions/marine-fisheries/rules-proclamations-and-size-and-bag-limits/recreational-size-and-bag-limits' },
   // Gulf
@@ -3820,10 +3841,10 @@ async function fetchSourceText(src) {
 // corrected, its old hash would make the bot think "no change" and skip it — so
 // stale rows for retired/changed sources are cleared here on boot. Bump the
 // version string to force a clean re-scan of the listed states.
-const REG_SOURCE_RESET = 'v2-2026-07-de-nj-ma';
+const REG_SOURCE_RESET = 'v3-2026-07-fl-de-nj-ma';
 pool.query(
   `DELETE FROM reg_source_checks WHERE state_code = ANY($1::text[])`,
-  [['DE', 'NJ', 'MA', 'WA', 'AK', 'HI']]
+  [['FL', 'DE', 'NJ', 'MA', 'WA', 'AK', 'HI']]
 ).then(() => console.log('[init] cleared stale reg source fingerprints (' + REG_SOURCE_RESET + ')'))
  .catch(e => console.error('[init] reg source reset:', e.message));
 
