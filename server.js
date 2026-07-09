@@ -2154,6 +2154,24 @@ const STATE_REG_SOURCES = {
       'https://tpwd.texas.gov/regulations/outdoor-annual/fishing/saltwater-fishing/bag-length-limits/grouper-bag-length-limits',
     ],
   },
+  // Mid-Atlantic
+  VA: { name: 'Virginia VMRC — Saltwater Rec Limits',     url: 'https://webapps.mrc.virginia.gov/public/reports/swrecfishingrules.php' },
+  MD: { name: 'Maryland DNR — Atlantic Limits',           url: 'https://www.eregulations.com/maryland/fishing/atlantic-seasons-sizes-limits' },
+  DE: { name: 'Delaware DNREC — Fishing Limits',          url: 'https://www.eregulations.com/delaware/fishing/general-fishing-regulations' },
+  NJ: { name: 'NJ Fish & Wildlife — Marine Limits',       url: 'https://www.eregulations.com/newjersey/fishing/marine-recreational-regulations' },
+  NY: { name: 'NY DEC — Recreational Saltwater',          url: 'https://dec.ny.gov/things-to-do/saltwater-fishing/recreational-fishing-regulations' },
+  // Northeast
+  CT: { name: 'CT DEEP — Marine Fishing Limits',          url: 'https://www.eregulations.com/connecticut/fishing/marine-fishing-regulations' },
+  RI: { name: 'RI DEM — Saltwater Limits',                url: 'https://www.eregulations.com/rhodeisland/saltwater/recreational-saltwater-fishing-regulations' },
+  MA: { name: 'MA Division of Marine Fisheries',          url: 'https://www.mass.gov/info-details/recreational-saltwater-fishing-regulations' },
+  NH: { name: 'NH Fish & Game — Saltwater Limits',        url: 'https://www.eregulations.com/newhampshire/fishing/saltwater-fishing' },
+  ME: { name: 'Maine DMR — Recreational Limits',          url: 'https://www.maine.gov/dmr/fisheries/recreational/regulations' },
+  // Pacific + Alaska + Hawaii
+  CA: { name: 'California CDFW — Ocean Sport Fishing',    url: 'https://www.eregulations.com/california/fishing/species-regulations' },
+  OR: { name: 'Oregon ODFW — Sport Fishing',              url: 'https://www.eregulations.com/oregon/fishing/marine-zone' },
+  WA: { name: 'Washington WDFW — Fishing Regulations',    url: 'https://wdfw.wa.gov/fishing/regulations' },
+  AK: { name: 'Alaska ADF&G — Sport Fishing',             url: 'https://www.adfg.alaska.gov/index.cfm?adfg=fishregulations.main' },
+  HI: { name: 'Hawaii DAR — Fishing Regulations',         url: 'https://dlnr.hawaii.gov/dar/fishing/fishing-regulations/' },
 };
 function stateSource(stateCode) {
   const sc = (stateCode || '').toUpperCase();
@@ -3537,9 +3555,16 @@ app.get('/api/admin/regs/gaps', requireAdmin, async (req, res) => {
 // Runs once a day (dependency-free scheduler) + a manual /run trigger.
 // ─────────────────────────────────────────────────────────────────────────────
 const BOT_SPECIES = [
+  // Southeast + Gulf
   'redfish', 'speckled_trout', 'flounder', 'sheepshead', 'black_drum',
   'snook', 'tripletail', 'pompano', 'spanish_mackerel', 'king_mackerel',
   'cobia', 'tarpon', 'gag_grouper', 'red_snapper', 'mangrove_snapper',
+  // Mid-Atlantic + Northeast
+  'striped_bass', 'black_sea_bass', 'tautog', 'bluefish', 'scup',
+  'summer_flounder', 'weakfish',
+  // Pacific + Alaska
+  'lingcod', 'rockfish', 'california_halibut', 'pacific_halibut',
+  'white_seabass', 'chinook_salmon', 'coho_salmon', 'cabezon', 'kelp_bass',
 ];
 
 function stripHtml(html) {
@@ -3675,6 +3700,30 @@ const SPECIES_ALIASES = {
   gag_grouper:      ['gag grouper'],
   red_snapper:      ['red snapper'],
   mangrove_snapper: ['mangrove snapper', 'gray snapper', 'grey snapper'],
+
+  // Mid-Atlantic + Northeast.
+  // NOTE: Atlantic states often call STRIPED BASS "rockfish" (esp. MD/VA), while
+  // our 'rockfish' key is the PACIFIC species. So striped_bass does NOT claim the
+  // bare word "rockfish", and pacific 'rockfish' only matches Pacific-specific
+  // names — otherwise a Maryland page would map striped bass onto a Pacific fish.
+  striped_bass:     ['striped bass', 'striper'],
+  black_sea_bass:   ['black sea bass'],
+  tautog:           ['tautog', 'blackfish'],
+  bluefish:         ['bluefish'],
+  scup:             ['scup', 'porgy'],
+  summer_flounder:  ['summer flounder', 'fluke'],
+  weakfish:         ['weakfish', 'squeteague'],
+
+  // Pacific + Alaska
+  lingcod:            ['lingcod'],
+  rockfish:           ['rockfish complex', 'pacific rockfish', 'rock cod', 'groundfish rockfish'],
+  california_halibut: ['california halibut'],
+  pacific_halibut:    ['pacific halibut'],
+  white_seabass:      ['white seabass', 'white sea bass'],
+  chinook_salmon:     ['chinook salmon', 'king salmon', 'chinook'],
+  coho_salmon:        ['coho salmon', 'silver salmon', 'coho'],
+  cabezon:            ['cabezon'],
+  kelp_bass:          ['kelp bass', 'calico bass'],
 };
 
 function excerptFor(pageText, species) {
@@ -3863,7 +3912,11 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
           WHERE state_code=$1 AND region='' AND (review_by IS NULL OR review_by >= CURRENT_DATE)`,
         [stateCode]
       )).rows[0].c);
-      const dataMissing = foundCount === 0 && liveCount >= 3;
+      // Only alarm if this source USED to yield species and now yields none. A
+      // state whose page legitimately contains none of our tracked fish (or a
+      // brand-new source) must not trip the redesign alarm.
+      const prevFound = Number((await pool.query(`SELECT COALESCE(species_found, -1) AS f FROM reg_source_checks WHERE state_code=$1`, [stateCode])).rows[0]?.f ?? -1);
+      const dataMissing = foundCount === 0 && liveCount >= 3 && prevFound > 0;
       await pool.query(
         `UPDATE reg_source_checks SET species_found=$2, last_status=$3 WHERE state_code=$1`,
         [stateCode, foundCount, dataMissing ? 'data_missing' : 'scanned']
