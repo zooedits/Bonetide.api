@@ -3741,9 +3741,9 @@ function excerptFor(pageText, species) {
     if (i !== -1) { at = i; term = a; break; }
   }
   if (at === -1) {
-    // Nothing matched — the species may simply not be on this page. Return a
-    // short lead so the admin can tell, but flag it so the term isn't trusted.
-    return { excerpt: pageText.slice(0, 260).trim() + '…', term: aliases[0], matched: false };
+    // The species name isn't on the page at all. Don't hand back the page's
+    // opening boilerplate — it reads like the site said that about this fish.
+    return { excerpt: `(“${aliases[0]}” doesn’t appear on this page — it may be managed under a group/complex, or listed under another name.)`, term: aliases[0], matched: false };
   }
   // End the clip where the NEXT tracked species starts, so it's this fish's
   // section and not a fixed blob that bleeds into the next one. Small lead in
@@ -3828,11 +3828,24 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
     const reads = [];
     for (let i = 0; i < 3; i++) reads.push(await extractRegsWithClaude(src.name, pageText));
 
-    let autoPublished = 0, held = 0, conflicts = 0, skipped = 0, foundCount = 0;
+    let autoPublished = 0, held = 0, conflicts = 0, skipped = 0, foundCount = 0, cleared = 0;
 
     for (const species of (onlySpecies ? [onlySpecies] : BOT_SPECIES)) {
       const { onPage, hasData, agree, value, perRead } = speciesConsensus(reads, species);
-      if (!onPage || !hasData) continue; // not on the page, or on it with no real numbers
+      // Not on the page, or on it with no enforceable numbers (e.g. NC lists
+      // mangrove snapper under "Snapper/Grouper Complex" with no limits). Don't
+      // just skip: clear any stale HELD draft we created for it in an earlier
+      // scan, or it sits in the review queue forever with nothing to approve.
+      // Auto-published drafts are left alone — deleting one would orphan a live row.
+      if (!onPage || !hasData) {
+        const del = await pool.query(
+          `DELETE FROM reg_proposals
+            WHERE state_code=$1 AND species=$2 AND status='pending' AND auto_published IS NOT TRUE`,
+          [stateCode, species]
+        ).catch(() => ({ rowCount: 0 }));
+        if (del.rowCount) cleared += del.rowCount;
+        continue;
+      }
       foundCount++;
 
       const cur = (await pool.query(
@@ -3947,11 +3960,11 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
         ).catch(() => {});
         console.warn(`[regsbot] ${stateCode}: page changed but 0/${liveCount} species found — possible site overhaul`);
       }
-      return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped, foundCount, dataMissing };
+      return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped, cleared, foundCount, dataMissing };
     }
 
     // Single-species re-scan result (no source-health side effects).
-    return { state: stateCode, species: onlySpecies, autoPublished, held, conflicts, skipped, found: foundCount > 0 };
+    return { state: stateCode, species: onlySpecies, autoPublished, held, conflicts, skipped, cleared, found: foundCount > 0 };
   } catch (err) {
     console.error(`[regsbot] ${stateCode}${onlySpecies ? '/' + onlySpecies : ''}:`, err.message);
     if (!onlySpecies) {
