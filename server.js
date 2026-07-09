@@ -2157,21 +2157,26 @@ const STATE_REG_SOURCES = {
   // Mid-Atlantic
   VA: { name: 'Virginia VMRC — Saltwater Rec Limits',     url: 'https://webapps.mrc.virginia.gov/public/reports/swrecfishingrules.php' },
   MD: { name: 'Maryland DNR — Atlantic Limits',           url: 'https://www.eregulations.com/maryland/fishing/atlantic-seasons-sizes-limits' },
-  DE: { name: 'Delaware DNREC — Fishing Limits',          url: 'https://www.eregulations.com/delaware/fishing/general-fishing-regulations' },
-  NJ: { name: 'NJ Fish & Wildlife — Marine Limits',       url: 'https://www.eregulations.com/newjersey/fishing/marine-recreational-regulations' },
+  DE: { name: 'Delaware DNREC — Tidal Size & Creel',      url: 'https://www.eregulations.com/delaware/fishing/tidal-seasons-size-creel-limits' },
+  NJ: { name: 'NJ Fish & Wildlife — Size & Possession',   url: 'https://www.eregulations.com/newjersey/fishing/saltwater/state-size-possession-limits' },
   NY: { name: 'NY DEC — Recreational Saltwater',          url: 'https://dec.ny.gov/things-to-do/saltwater-fishing/recreational-fishing-regulations' },
   // Northeast
   CT: { name: 'CT DEEP — Marine Fishing Limits',          url: 'https://www.eregulations.com/connecticut/fishing/marine-fishing-regulations' },
   RI: { name: 'RI DEM — Saltwater Limits',                url: 'https://www.eregulations.com/rhodeisland/saltwater/recreational-saltwater-fishing-regulations' },
-  MA: { name: 'MA Division of Marine Fisheries',          url: 'https://www.mass.gov/info-details/recreational-saltwater-fishing-regulations' },
+  MA: { name: 'MA DMF — Recreational Saltwater',          url: 'https://www.eregulations.com/massachusetts/fishing/saltwater/recreational-saltwater-fishing-regulations' },
   NH: { name: 'NH Fish & Game — Saltwater Limits',        url: 'https://www.eregulations.com/newhampshire/fishing/saltwater-fishing' },
   ME: { name: 'Maine DMR — Recreational Limits',          url: 'https://www.maine.gov/dmr/fisheries/recreational/regulations' },
-  // Pacific + Alaska + Hawaii
+  // Pacific
   CA: { name: 'California CDFW — Ocean Sport Fishing',    url: 'https://www.eregulations.com/california/fishing/species-regulations' },
   OR: { name: 'Oregon ODFW — Sport Fishing',              url: 'https://www.eregulations.com/oregon/fishing/marine-zone' },
-  WA: { name: 'Washington WDFW — Fishing Regulations',    url: 'https://wdfw.wa.gov/fishing/regulations' },
-  AK: { name: 'Alaska ADF&G — Sport Fishing',             url: 'https://www.adfg.alaska.gov/index.cfm?adfg=fishregulations.main' },
-  HI: { name: 'Hawaii DAR — Fishing Regulations',         url: 'https://dlnr.hawaii.gov/dar/fishing/fishing-regulations/' },
+  // WA / AK / HI are intentionally NOT bot sources. Their regs are managed by
+  // area/zone (Puget Sound vs coast; AK's per-region emergency orders; HI's
+  // island rules) and live behind portals with no single static limits table —
+  // the bot found zero species on all three. Rather than burn 3 AI reads per
+  // change-day on pages that yield nothing (and risk publishing a statewide
+  // number that's wrong for the angler's zone), these link out to the official
+  // source via stateRegs.js and show "no limits saved yet" in the carousel.
+  // Re-add here if a clean per-species page is found.
 };
 function stateSource(stateCode) {
   const sc = (stateCode || '').toUpperCase();
@@ -3784,6 +3789,17 @@ async function fetchSourceText(src) {
   const pageText = htmls.map(stripHtml).join('\n\n----\n\n');
   return { pageText, hash: crypto.createHash('sha256').update(pageText).digest('hex') };
 }
+
+// A source's fingerprint is tied to the URL it came from. When a source URL is
+// corrected, its old hash would make the bot think "no change" and skip it — so
+// stale rows for retired/changed sources are cleared here on boot. Bump the
+// version string to force a clean re-scan of the listed states.
+const REG_SOURCE_RESET = 'v2-2026-07-de-nj-ma';
+pool.query(
+  `DELETE FROM reg_source_checks WHERE state_code = ANY($1::text[])`,
+  [['DE', 'NJ', 'MA', 'WA', 'AK', 'HI']]
+).then(() => console.log('[init] cleared stale reg source fingerprints (' + REG_SOURCE_RESET + ')'))
+ .catch(e => console.error('[init] reg source reset:', e.message));
 
 async function runRegsBotForState(stateCode, force = false, onlySpecies = null) {
   const src = STATE_REG_SOURCES[stateCode];
