@@ -1034,11 +1034,69 @@ function getSeasonInfo(date = new Date()) {
   };
 }
 
+// ── New-species bonus ────────────────────────────────────────────────────────
+// The app promises: "Catch something you haven't logged before and you bank a
+// species bonus." This awards it — once per species, per season, photo required.
+// Recorded in the milestones table under key `species_<name>_<season>` so it's
+// idempotent and resets with the season like everything else. Awarded ON TOP of
+// the daily cap. Fully guarded: a failure here must never break a catch.
+const NEW_SPECIES_BONUS = 25;
+
+// The new-species bonus (and milestone awarding generally) relies on a duplicate
+// insert FAILING to stay idempotent — otherwise a double-tap could pay twice.
+// The table predates these migrations, so make sure that constraint really exists.
+pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS milestones_user_key_uniq ON milestones (user_id, key)`)
+  .catch(e => console.error('[init] milestones unique index:', e.message));
+
+async function awardNewSpeciesBonus(userId, species, hasPhoto) {
+  if (!hasPhoto || !species) return null;
+  try {
+    const season = getSeasonInfo();
+    const safe = String(species).toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    const key = `species_${safe}_${season.key}`;
+    // Insert first: the PK/unique constraint makes this the race-safe check.
+    try {
+      await pool.query(`INSERT INTO milestones (user_id, key) VALUES ($1,$2)`, [userId, key]);
+    } catch {
+      return null; // already earned this season (or table rejected it) — no double pay
+    }
+    await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [NEW_SPECIES_BONUS, userId]);
+    await pool.query(
+      `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'new_species',$3,NOW())`,
+      [userId, NEW_SPECIES_BONUS, key]
+    );
+    return { key, label: `New species: ${String(species).replace(/_/g, ' ')}`, points: NEW_SPECIES_BONUS };
+  } catch (e) {
+    console.error('[milestone] awardNewSpeciesBonus (non-fatal):', e.message);
+    return null;
+  }
+}
+
 // base key -> { label, points }. Must stay in sync with pointsEngine MILESTONE_DEFS.
 const MILESTONE_DEFS = {
-  first_catch:     { label: 'First catch of the season', points: 50 },
-  species_sampler: { label: 'Species sampler',           points: 50 },
-  inshore_slam:    { label: 'Inshore slam',              points: 150 },
+  // Getting started
+  first_catch:      { label: 'First catch of the season',  points: 50 },
+  species_sampler:  { label: 'Species sampler',            points: 50 },
+  inshore_slam:     { label: 'Inshore slam',               points: 150 },
+
+  // Volume ladder — the grind, for people who just fish a lot.
+  catches_10:       { label: 'Ten on the board',           points: 75 },
+  catches_25:       { label: 'Quarter century',            points: 150 },
+  catches_50:       { label: 'Fifty fish',                 points: 300 },
+  catches_100:      { label: 'Century club',               points: 600 },
+
+  // Variety ladder — rewards curiosity, the "try a new bait/spot" angler.
+  species_5:        { label: 'Five species',               points: 100 },
+  species_10:       { label: 'Ten species',                points: 250 },
+  species_15:       { label: 'Fifteen species',            points: 500 },
+
+  // Skill / effort
+  slam_plus:        { label: 'Slam plus',                  points: 250 },
+  release_25:       { label: 'Conservationist',            points: 150 },
+  early_bird:       { label: 'Early bird',                 points: 75 },
+  night_owl:        { label: 'Night shift',                points: 75 },
+  explorer_3:       { label: 'Explorer',                   points: 125 },
+  streak_7:         { label: 'Seven-day streak',           points: 200 },
 };
 
 // Check + award any newly-earned milestones after a catch. Only counts catches
@@ -1085,6 +1143,92 @@ async function awardMilestones(userId, currentSpecies, currentHasPhoto) {
         [userId, ['redfish', 'speckled_trout']]
       );
       if ((rows[0]?.n ?? 0) >= 2) toAward.push('inshore_slam');
+    }
+
+    // ── Season-scoped tallies, fetched once and reused by the ladders below ──
+    const needVolume  = ['catches_10','catches_25','catches_50','catches_100'].some(k => !have.has(keyFor(k)));
+    const needVariety = ['species_5','species_10','species_15'].some(k => !have.has(keyFor(k)));
+    if (needVolume || needVariety) {
+      const { rows } = await pool.query(
+        `SELECT COUNT(*)::int AS catches, COUNT(DISTINCT species)::int AS species
+           FROM catches
+          WHERE user_id=$1 AND image_url IS NOT NULL
+            AND caught_at >= $2 AND caught_at < $3`,
+        [userId, season.start, season.end]
+      );
+      const nCatches = rows[0]?.catches ?? 0;
+      const nSpecies = rows[0]?.species ?? 0;
+
+      // Volume ladder — every tier the count clears, so a big first session can
+      // legitimately unlock several at once.
+      for (const [base, need] of [['catches_10',10],['catches_25',25],['catches_50',50],['catches_100',100]]) {
+        if (!have.has(keyFor(base)) && nCatches >= need) toAward.push(base);
+      }
+      // Variety ladder
+      for (const [base, need] of [['species_5',5],['species_10',10],['species_15',15]]) {
+        if (!have.has(keyFor(base)) && nSpecies >= need) toAward.push(base);
+      }
+    }
+
+    // slam_plus — redfish + speckled trout + flounder, same calendar day
+    if (!have.has(keyFor('slam_plus'))) {
+      const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT species)::int AS n FROM catches
+          WHERE user_id=$1 AND image_url IS NOT NULL
+            AND DATE(caught_at)=CURRENT_DATE AND species = ANY($2)`,
+        [userId, ['redfish', 'speckled_trout', 'flounder']]
+      );
+      if ((rows[0]?.n ?? 0) >= 3) toAward.push('slam_plus');
+    }
+
+    // release_25 — 25 released fish this season. Rewards conservation.
+    if (!have.has(keyFor('release_25'))) {
+      const { rows } = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM catches
+          WHERE user_id=$1 AND released=true AND image_url IS NOT NULL
+            AND caught_at >= $2 AND caught_at < $3`,
+        [userId, season.start, season.end]
+      );
+      if ((rows[0]?.n ?? 0) >= 25) toAward.push('release_25');
+    }
+
+    // early_bird / night_owl — a catch logged before 6am / after 9pm local-ish.
+    // Uses the catch timestamp's hour; good enough for a fun badge.
+    for (const [base, sql] of [
+      ['early_bird', `EXTRACT(HOUR FROM caught_at) < 6`],
+      ['night_owl',  `EXTRACT(HOUR FROM caught_at) >= 21`],
+    ]) {
+      if (have.has(keyFor(base))) continue;
+      const { rows } = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM catches
+          WHERE user_id=$1 AND image_url IS NOT NULL
+            AND caught_at >= $2 AND caught_at < $3 AND ${sql}`,
+        [userId, season.start, season.end]
+      );
+      if ((rows[0]?.n ?? 0) >= 1) toAward.push(base);
+    }
+
+    // explorer_3 — catches logged at 3+ distinct spots (rounded coords) this season.
+    if (!have.has(keyFor('explorer_3'))) {
+      const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT (ROUND(lat::numeric,2) || ',' || ROUND(lon::numeric,2)))::int AS n
+           FROM catches
+          WHERE user_id=$1 AND image_url IS NOT NULL AND lat IS NOT NULL AND lon IS NOT NULL
+            AND caught_at >= $2 AND caught_at < $3`,
+        [userId, season.start, season.end]
+      );
+      if ((rows[0]?.n ?? 0) >= 3) toAward.push('explorer_3');
+    }
+
+    // streak_7 — logged a catch on 7 consecutive calendar days (ending today).
+    if (!have.has(keyFor('streak_7'))) {
+      const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT DATE(caught_at))::int AS n FROM catches
+          WHERE user_id=$1 AND image_url IS NOT NULL
+            AND caught_at >= CURRENT_DATE - INTERVAL '6 days'`,
+        [userId]
+      );
+      if ((rows[0]?.n ?? 0) >= 7) toAward.push('streak_7');
     }
 
     for (const base of toAward) {
@@ -1178,6 +1322,9 @@ app.post('/api/catches', async (req, res) => {
 
     // Season milestones — bonus points on top of the daily cap. Fully guarded.
     const milestonesJustEarned = await awardMilestones(user.id, species, !!imageUrl);
+    // First time logging this species this season → the bonus the app promises.
+    const speciesBonus = await awardNewSpeciesBonus(user.id, species, !!imageUrl);
+    if (speciesBonus) milestonesJustEarned.push(speciesBonus);
 
     res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap, boostActive, pointsRejectReason: scanRejectReason, milestonesJustEarned });
   } catch (err) {
@@ -2092,6 +2239,14 @@ pool.query(`
   )
 `).catch(e => console.error('[init] reg_zone_flags:', e.message));
 
+// zones: the per-zone limits table, verbatim from the source, but ONLY stored when
+// all 3 reads agree on it. When they don't, zones stays null and the angler sees
+// the note + official link rather than numbers we aren't sure of.
+pool.query(`
+  ALTER TABLE reg_zone_flags ADD COLUMN IF NOT EXISTS zones      JSONB;
+  ALTER TABLE reg_zone_flags ADD COLUMN IF NOT EXISTS verified_on DATE;
+`).catch(e => console.error('[init] reg_zone_flags zones:', e.message));
+
 // ── Phase 3: scrub-bot tables ────────────────────────────────────────────────
 // Proposed changes the daily bot drafts from official sources. NOTHING here is
 // live — an admin approves (writes to `regulations`) or rejects each one.
@@ -2254,7 +2409,7 @@ app.get('/api/regs', async (req, res) => {
     // rather than showing nothing (or, worse, a number that's wrong in some
     // zones). Checked before the row lookup so a stale statewide row can't win.
     const zoneFlag = (await pool.query(
-      `SELECT zone_note, source_url FROM reg_zone_flags WHERE state_code=$1 AND species=$2 LIMIT 1`,
+      `SELECT zone_note, source_url, zones, verified_on FROM reg_zone_flags WHERE state_code=$1 AND species=$2 LIMIT 1`,
       [state, species]
     ).catch(() => ({ rows: [] }))).rows[0];
     if (zoneFlag && !region) {
@@ -2262,6 +2417,9 @@ app.get('/api/regs', async (req, res) => {
         hasData: false,
         reason: 'zone_varies',
         zoneNote: zoneFlag.zone_note || 'Limits differ by region or zone in this state.',
+        // Verbatim per-zone limits, only present when the 3 reads agreed.
+        zones: Array.isArray(zoneFlag.zones) ? zoneFlag.zones : null,
+        zonesVerifiedOn: zoneFlag.verified_on || null,
         source: { name: source.name, url: zoneFlag.source_url || source.url },
       });
     }
@@ -3677,7 +3835,10 @@ Return ONLY a JSON array (no prose, no markdown). For each of these species that
 Species keys: ${BOT_SPECIES.join(', ')}.
 Rules: sizes in inches (total length). Omit species not on the page. Do NOT guess. Return [] if nothing found.
 zoneVaries: set TRUE if this state's limits for this species differ by region/zone/area/waterbody, or differ for shore vs. vessel anglers, or any part of the state is catch-and-release only. This is critical — a statewide number would be WRONG for some anglers. When zoneVaries is true, leave minSizeIn/maxSizeIn/bagLimit null and set zoneNote to a short plain description (e.g. "9 regions; Indian River Lagoon is catch-and-release only").
-Only give numbers when they apply to the ENTIRE state for every angler.
+zones: when zoneVaries is true, ALSO return the per-zone table exactly as the page states it:
+"zones": [{"name": string, "minSizeIn": number|null, "maxSizeIn": number|null, "bagLimit": number|null, "season": string|null, "catchRelease": boolean, "notes": string|null}]
+Use the page's own zone names. Include every zone listed. If a zone is catch-and-release only, set catchRelease true and leave bagLimit null. Do NOT infer a zone that isn't printed, and do NOT merge zones. If the page names zones but doesn't give their numbers, return "zones": [].
+Only give top-level numbers when they apply to the ENTIRE state for every angler.
 sourceText: copy the EXACT words from the page that state this species' limits — verbatim, no paraphrasing, no added words. Keep it short (the sentence or row for this species). If you can't point to explicit text, set it to null.
 
 PAGE TEXT:
@@ -3821,6 +3982,38 @@ const SPECIES_ALIASES = {
   kelp_bass:          ['kelp bass', 'calico bass'],
 };
 
+// Canonical signature of a whole zone table, so the 3 reads can be compared.
+// Zone order doesn't matter; names are normalized. Any difference in a zone's
+// enforceable values makes the reads disagree.
+function zonesSig(zones) {
+  if (!Array.isArray(zones) || !zones.length) return '__NONE__';
+  return JSON.stringify(
+    zones
+      .map((z) => ({
+        n: String(z.name || '').trim().toLowerCase().replace(/\s+/g, ' '),
+        a: regNum(z.minSizeIn), b: regNum(z.maxSizeIn), c: regNum(z.bagLimit),
+        s: (z.season || '').trim().toLowerCase().replace(/\s+/g, ' '),
+        r: !!z.catchRelease,
+      }))
+      .sort((x, y) => x.n.localeCompare(y.n))
+  );
+}
+
+// Zones are only trusted when every read that saw this species produced the same
+// table. Otherwise we keep the note and drop the numbers.
+function zonesConsensus(perRead) {
+  const present = perRead.filter(Boolean);
+  if (!present.length) return null;
+  const sigs = present.map((e) => zonesSig(e.zones));
+  if (new Set(sigs).size !== 1 || sigs[0] === '__NONE__') return null;
+  const zones = present[0].zones;
+  // Sanity: a zone with no name is unusable; a zone with neither numbers nor a
+  // release flag tells the angler nothing. Drop the table rather than show junk.
+  const usable = zones.every((z) => String(z.name || '').trim() &&
+    (regNum(z.minSizeIn) != null || regNum(z.maxSizeIn) != null || regNum(z.bagLimit) != null || z.catchRelease === true));
+  return usable ? zones : null;
+}
+
 function excerptFor(pageText, species) {
   const lower = pageText.toLowerCase();
   const aliases = SPECIES_ALIASES[species] || [species.replace(/_/g, ' ')];
@@ -3930,11 +4123,16 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
       // never publish, never queue. The angler gets "zone-managed, verify here".
       const zoneRead = perRead.find((e) => e && e.zoneVaries);
       if (zoneRead) {
+        // Zones only stored when all reads that saw this species agree on the
+        // whole table; otherwise null → angler gets the note + link, no numbers.
+        const zones = zonesConsensus(perRead);
         await pool.query(
-          `INSERT INTO reg_zone_flags (state_code, species, zone_note, source_url, updated_at)
-           VALUES ($1,$2,$3,$4,NOW())
-           ON CONFLICT (state_code, species) DO UPDATE SET zone_note=$3, source_url=$4, updated_at=NOW()`,
-          [stateCode, species, zoneRead.zoneNote || 'Limits differ by region or zone.', src.url]
+          `INSERT INTO reg_zone_flags (state_code, species, zone_note, source_url, zones, verified_on, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,NOW())
+           ON CONFLICT (state_code, species) DO UPDATE SET
+             zone_note=$3, source_url=$4, zones=$5, verified_on=$6, updated_at=NOW()`,
+          [stateCode, species, zoneRead.zoneNote || 'Limits differ by region or zone.', src.url,
+           zones ? JSON.stringify(zones) : null, zones ? new Date() : null]
         ).catch(() => {});
         // Retire any statewide row/draft we may have published before we knew.
         await pool.query(
