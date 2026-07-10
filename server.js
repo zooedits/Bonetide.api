@@ -2067,6 +2067,31 @@ pool.query(`
 pool.query(`ALTER TABLE reg_gaps ADD COLUMN IF NOT EXISTS dismissed BOOLEAN DEFAULT false`)
   .catch(e => console.error('[init] reg_gaps.dismissed:', e.message));
 
+// ── Zone-managed species ─────────────────────────────────────────────────────
+// Some states set different limits by region/zone (FL manages redfish across 9
+// regions, and the Indian River Lagoon is catch-and-release only; NY's striped
+// bass differs in the Hudson; NJ's fluke differs on Delaware Bay; several states
+// use different minimums for shore vs. vessel anglers).
+//
+// A single statewide number is WRONG for some anglers in these cases, and a
+// confidently wrong limit is worse than no limit. So when the bot detects a
+// zone-managed species it records it here and NEVER publishes a statewide row.
+// /api/regs then tells the angler the fish is zone-managed and links to the
+// official source instead of showing a number.
+//
+// Per-zone limits live in regulations.region (already in the schema) — populating
+// that with verified zone boundaries is the follow-on step, not this one.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS reg_zone_flags (
+    state_code TEXT NOT NULL,
+    species    TEXT NOT NULL,
+    zone_note  TEXT,
+    source_url TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (state_code, species)
+  )
+`).catch(e => console.error('[init] reg_zone_flags:', e.message));
+
 // ── Phase 3: scrub-bot tables ────────────────────────────────────────────────
 // Proposed changes the daily bot drafts from official sources. NOTHING here is
 // live — an admin approves (writes to `regulations`) or rejects each one.
@@ -2224,6 +2249,22 @@ app.get('/api/regs', async (req, res) => {
     const region  = req.query.region || '';
     const source  = stateSource(state);
     if (!state || !species) return res.json({ hasData: false, reason: 'missing_params', source });
+
+    // Zone-managed? Then there IS no single statewide answer. Say so plainly
+    // rather than showing nothing (or, worse, a number that's wrong in some
+    // zones). Checked before the row lookup so a stale statewide row can't win.
+    const zoneFlag = (await pool.query(
+      `SELECT zone_note, source_url FROM reg_zone_flags WHERE state_code=$1 AND species=$2 LIMIT 1`,
+      [state, species]
+    ).catch(() => ({ rows: [] }))).rows[0];
+    if (zoneFlag && !region) {
+      return res.json({
+        hasData: false,
+        reason: 'zone_varies',
+        zoneNote: zoneFlag.zone_note || 'Limits differ by region or zone in this state.',
+        source: { name: source.name, url: zoneFlag.source_url || source.url },
+      });
+    }
 
     const { rows } = await pool.query(
       `SELECT * FROM regulations
@@ -3632,9 +3673,11 @@ async function extractRegsWithClaude(stateName, pageText) {
   const prompt =
 `You are extracting RECREATIONAL saltwater fishing regulations from an official ${stateName} agency page.
 Return ONLY a JSON array (no prose, no markdown). For each of these species that appears with a size or bag limit, add:
-{"species": <one key below>, "minSizeIn": number|null, "maxSizeIn": number|null, "bagLimit": number|null, "season": string|null, "catchRelease": boolean, "gamefish": boolean, "notes": string|null, "sourceText": string|null}
+{"species": <one key below>, "minSizeIn": number|null, "maxSizeIn": number|null, "bagLimit": number|null, "season": string|null, "catchRelease": boolean, "gamefish": boolean, "notes": string|null, "sourceText": string|null, "zoneVaries": boolean, "zoneNote": string|null}
 Species keys: ${BOT_SPECIES.join(', ')}.
-Rules: sizes in inches (total length). If a species is managed by region/zone with different numbers, set notes to "varies by region — verify" and leave numbers null. Omit species not on the page. Do NOT guess. Return [] if nothing found.
+Rules: sizes in inches (total length). Omit species not on the page. Do NOT guess. Return [] if nothing found.
+zoneVaries: set TRUE if this state's limits for this species differ by region/zone/area/waterbody, or differ for shore vs. vessel anglers, or any part of the state is catch-and-release only. This is critical — a statewide number would be WRONG for some anglers. When zoneVaries is true, leave minSizeIn/maxSizeIn/bagLimit null and set zoneNote to a short plain description (e.g. "9 regions; Indian River Lagoon is catch-and-release only").
+Only give numbers when they apply to the ENTIRE state for every angler.
 sourceText: copy the EXACT words from the page that state this species' limits — verbatim, no paraphrasing, no added words. Keep it short (the sentence or row for this species). If you can't point to explicit text, set it to null.
 
 PAGE TEXT:
@@ -3875,10 +3918,39 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
     const reads = [];
     for (let i = 0; i < 3; i++) reads.push(await extractRegsWithClaude(src.name, pageText));
 
-    let autoPublished = 0, held = 0, conflicts = 0, skipped = 0, foundCount = 0, cleared = 0;
+    let autoPublished = 0, held = 0, conflicts = 0, skipped = 0, foundCount = 0, cleared = 0, zoned = 0;
 
     for (const species of (onlySpecies ? [onlySpecies] : BOT_SPECIES)) {
       const { onPage, hasData, agree, value, perRead } = speciesConsensus(reads, species);
+
+      // ── ZONE GUARD ───────────────────────────────────────────────────────
+      // If any read says this species is managed by zone/region (or shore-vs-
+      // vessel), a single statewide row would be wrong for some anglers. Record
+      // the flag, make sure no stale statewide row keeps serving, and move on —
+      // never publish, never queue. The angler gets "zone-managed, verify here".
+      const zoneRead = perRead.find((e) => e && e.zoneVaries);
+      if (zoneRead) {
+        await pool.query(
+          `INSERT INTO reg_zone_flags (state_code, species, zone_note, source_url, updated_at)
+           VALUES ($1,$2,$3,$4,NOW())
+           ON CONFLICT (state_code, species) DO UPDATE SET zone_note=$3, source_url=$4, updated_at=NOW()`,
+          [stateCode, species, zoneRead.zoneNote || 'Limits differ by region or zone.', src.url]
+        ).catch(() => {});
+        // Retire any statewide row/draft we may have published before we knew.
+        await pool.query(
+          `DELETE FROM regulations WHERE state_code=$1 AND species=$2 AND region=''`,
+          [stateCode, species]
+        ).catch(() => {});
+        await pool.query(
+          `DELETE FROM reg_proposals WHERE state_code=$1 AND species=$2 AND status='pending'`,
+          [stateCode, species]
+        ).catch(() => {});
+        zoned++;
+        continue;
+      }
+      // Species is NOT zone-managed (any more) — clear a stale flag.
+      await pool.query(`DELETE FROM reg_zone_flags WHERE state_code=$1 AND species=$2`, [stateCode, species]).catch(() => {});
+
       // Not on the page, or on it with no enforceable numbers (e.g. NC lists
       // mangrove snapper under "Snapper/Grouper Complex" with no limits). Don't
       // just skip: clear any stale HELD draft we created for it in an earlier
@@ -4007,11 +4079,11 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
         ).catch(() => {});
         console.warn(`[regsbot] ${stateCode}: page changed but 0/${liveCount} species found — possible site overhaul`);
       }
-      return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped, cleared, foundCount, dataMissing };
+      return { state: stateCode, changed: true, autoPublished, held, conflicts, skipped, cleared, zoned, foundCount, dataMissing };
     }
 
     // Single-species re-scan result (no source-health side effects).
-    return { state: stateCode, species: onlySpecies, autoPublished, held, conflicts, skipped, cleared, found: foundCount > 0 };
+    return { state: stateCode, species: onlySpecies, autoPublished, held, conflicts, skipped, cleared, zoned, found: foundCount > 0 };
   } catch (err) {
     console.error(`[regsbot] ${stateCode}${onlySpecies ? '/' + onlySpecies : ''}:`, err.message);
     if (!onlySpecies) {
