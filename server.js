@@ -1325,8 +1325,10 @@ app.post('/api/catches', async (req, res) => {
     // First time logging this species this season → the bonus the app promises.
     const speciesBonus = await awardNewSpeciesBonus(user.id, species, !!imageUrl);
     if (speciesBonus) milestonesJustEarned.push(speciesBonus);
+    // Avatar rings — collectible awards, same guarded pattern as milestones.
+    const ringsJustEarned = await awardCatchRings(user.id, newCatch);
 
-    res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap, boostActive, pointsRejectReason: scanRejectReason, milestonesJustEarned });
+    res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap, boostActive, pointsRejectReason: scanRejectReason, milestonesJustEarned, ringsJustEarned });
   } catch (err) {
     console.error('Log catch error:', err);
     res.status(500).json({ error: err.message });
@@ -2695,6 +2697,188 @@ app.put('/api/privacy-prefs', async (req, res) => {
       anonymizeShared:    row.anonymize_shared ?? true,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══ AVATAR RINGS ════════════════════════════════════════════════════════════
+// 28 collectible rings that render around a user's avatar (same layering trick
+// as the Tide King crown). The PNGs ship in the app bundle; the server only
+// tracks ownership, awards, and which ring is equipped. Ring ids here MUST
+// match ringsCatalog.js in the app.
+// Lanes:
+//   streaks  → daily-login streak milestones (3/7/14/30 days)
+//   catch    → achievements checked on every logged catch
+//   monthly  → featured ring of the month, earned by logging any catch that month
+//   club     → Bone Tide Club exclusives, granted while membership is active
+//   bones    → reserved for the Tide King (granted by admin/next pass)
+pool.query(`
+  CREATE TABLE IF NOT EXISTS user_rings (
+    user_id    INTEGER NOT NULL,
+    ring_id    TEXT NOT NULL,
+    earned_via TEXT,
+    earned_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, ring_id)
+  )
+`).catch(e => console.error('[init] user_rings:', e.message));
+pool.query(`
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS equipped_ring  TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS login_streak   INTEGER DEFAULT 0;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_day DATE;
+`).catch(e => console.error('[init] users ring columns:', e.message));
+
+const RING_IDS = new Set([
+  'anchor', 'barracuda', 'blackflag', 'bones', 'cannonball', 'coral', 'crabclaw',
+  'darkoctopus', 'deepbluefish', 'fishbones', 'greenoctopus', 'jellyfish',
+  'lighthouse', 'litetackle', 'lurers', 'nautical', 'piratehat', 'piratesword',
+  'pirateswordv2', 'piratewindow', 'porthole', 'purpleoctopus', 'roughseas',
+  'seahorse', 'sharkteeth', 'sharktooth', 'treasure', 'treasurev2',
+]);
+const STREAK_RINGS  = { 3: 'nautical', 7: 'jellyfish', 14: 'seahorse', 30: 'porthole' };
+const MONTHLY_RINGS = { '2026-07': 'piratehat', '2026-08': 'piratesword' }; // add future months here
+const CLUB_RINGS    = ['pirateswordv2', 'treasurev2'];
+
+async function grantRing(userId, ringId, via) {
+  if (!RING_IDS.has(ringId)) return null;
+  const r = await pool.query(
+    `INSERT INTO user_rings (user_id, ring_id, earned_via) VALUES ($1,$2,$3)
+     ON CONFLICT (user_id, ring_id) DO NOTHING RETURNING ring_id`,
+    [userId, ringId, via]
+  );
+  return r.rowCount ? ringId : null;
+}
+
+// Checked after every logged catch. Same philosophy as awardMilestones: fully
+// guarded, never blocks the catch, returns whatever was newly earned so the
+// app can celebrate it.
+async function awardCatchRings(userId, c) {
+  const earned = [];
+  try {
+    const owned = new Set(
+      (await pool.query(`SELECT ring_id FROM user_rings WHERE user_id=$1`, [userId])).rows.map(r => r.ring_id)
+    );
+    const grant = async (id, via) => {
+      if (owned.has(id)) return;
+      const g = await grantRing(userId, id, via);
+      if (g) { earned.push(g); owned.add(g); }
+    };
+
+    const stats = (await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(DISTINCT species)::int AS species,
+              COUNT(*) FILTER (WHERE released)::int AS released,
+              COUNT(DISTINCT bait) FILTER (WHERE bait IS NOT NULL AND bait <> '')::int AS baits
+         FROM catches WHERE user_id=$1`,
+      [userId]
+    )).rows[0];
+
+    // Volume ladder
+    if (stats.total >= 1)   await grant('litetackle',   'first_catch');
+    if (stats.total >= 5)   await grant('crabclaw',     'catches_5');
+    if (stats.total >= 10)  await grant('greenoctopus', 'catches_10');
+    if (stats.total >= 25)  await grant('anchor',       'catches_25');
+    if (stats.total >= 50)  await grant('darkoctopus',  'catches_50');
+    if (stats.total >= 100) await grant('piratewindow', 'catches_100');
+    // Species ladder
+    if (stats.species >= 5)  await grant('deepbluefish', 'species_5');
+    if (stats.species >= 10) await grant('barracuda',    'species_10');
+    if (stats.species >= 20) await grant('treasure',     'species_20');
+    // Conservation ladder
+    if (stats.released >= 10) await grant('fishbones',     'released_10');
+    if (stats.released >= 50) await grant('purpleoctopus', 'released_50');
+    // Variety
+    if (stats.baits >= 3) await grant('lurers', 'baits_3');
+
+    // This-catch conditions. caught_at is server time (UTC); the 01-09 UTC
+    // window is ~9pm-5am on the US east coast, where the userbase lives.
+    // Worth revisiting if the app goes national.
+    const hr = new Date(c.caught_at).getUTCHours();
+    if (hr >= 1 && hr <= 9)                       await grant('blackflag',  'night_catch');
+    if (Number(c.length_in) >= 40)                await grant('cannonball', 'fish_40in');
+    if (Number(c.length_in) >= 50)                await grant('sharktooth', 'fish_50in');
+    if (/shark/i.test(String(c.species || '')))   await grant('sharkteeth', 'shark_logged');
+    if (Number(c.wind_kts) >= 15)                 await grant('roughseas',  'wind_15kt');
+
+    // Inshore slam: 3 species in one day
+    if (!owned.has('lighthouse')) {
+      const slam = (await pool.query(
+        `SELECT COUNT(DISTINCT species)::int AS n FROM catches WHERE user_id=$1 AND DATE(caught_at)=CURRENT_DATE`,
+        [userId]
+      )).rows[0];
+      if (slam.n >= 3) await grant('lighthouse', 'slam_3_species');
+    }
+
+    // Featured ring of the month: log any catch during the month
+    const mk = new Date().toISOString().slice(0, 7);
+    if (MONTHLY_RINGS[mk]) await grant(MONTHLY_RINGS[mk], `monthly_${mk}`);
+  } catch (e) {
+    console.error('[rings] award error (non-fatal):', e.message);
+  }
+  return earned;
+}
+
+// Owned rings + equipped + streak. Club exclusives are granted here so an
+// active subscriber sees them the moment they open the picker.
+app.get('/api/rings', async (req, res) => {
+  try {
+    const user = await getUserFromRequest(req);
+    const u = (await pool.query(
+      `SELECT is_club, equipped_ring, login_streak FROM users WHERE id=$1`, [user.id]
+    )).rows[0] || {};
+    if (u.is_club) for (const rid of CLUB_RINGS) await grantRing(user.id, rid, 'club');
+    const owned = (await pool.query(
+      `SELECT ring_id, earned_via, earned_at FROM user_rings WHERE user_id=$1 ORDER BY earned_at`, [user.id]
+    )).rows;
+    res.json({ owned, equipped: u.equipped_ring || null, loginStreak: u.login_streak || 0 });
+  } catch (err) { res.status(401).json({ error: err.message }); }
+});
+
+// Equip a ring (ringId: null unequips). Must own it.
+app.post('/api/rings/equip', async (req, res) => {
+  try {
+    const user = await getUserFromRequest(req);
+    const { ringId } = req.body || {};
+    if (ringId != null) {
+      const own = await pool.query(`SELECT 1 FROM user_rings WHERE user_id=$1 AND ring_id=$2`, [user.id, ringId]);
+      if (!own.rowCount) return res.status(403).json({ error: "You haven't earned that ring yet." });
+    }
+    await pool.query(`UPDATE users SET equipped_ring=$1 WHERE id=$2`, [ringId ?? null, user.id]);
+    res.json({ ok: true, equipped: ringId ?? null });
+  } catch (err) { res.status(401).json({ error: err.message }); }
+});
+
+// Daily login: one claim per UTC day. Streak continues if yesterday was
+// claimed, resets to 1 otherwise. Bones drip through the same ledger as every
+// other award (10/day, 25 on ring-milestone days), and streak rings + the
+// welcome ring land here.
+app.post('/api/daily-login', async (req, res) => {
+  try {
+    const user = await getUserFromRequest(req);
+    const u = (await pool.query(`SELECT login_streak, last_login_day FROM users WHERE id=$1`, [user.id])).rows[0];
+    const today = new Date().toISOString().slice(0, 10);
+    const last = u?.last_login_day ? new Date(u.last_login_day).toISOString().slice(0, 10) : null;
+    if (last === today) {
+      return res.json({ alreadyClaimed: true, streak: u.login_streak || 0, bonesAwarded: 0, ringsEarned: [] });
+    }
+    const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 10);
+    const streak = last === yesterday ? (u.login_streak || 0) + 1 : 1;
+    await pool.query(`UPDATE users SET login_streak=$1, last_login_day=$2 WHERE id=$3`, [streak, today, user.id]);
+
+    const isMilestone = STREAK_RINGS[streak] != null;
+    const bones = isMilestone ? 25 : 10;
+    await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [bones, user.id]);
+    await pool.query(
+      `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'daily_login',$3,NOW())`,
+      [user.id, bones, `day_${streak}`]
+    );
+
+    const ringsEarned = [];
+    const welcome = await grantRing(user.id, 'coral', 'welcome');
+    if (welcome) ringsEarned.push(welcome);
+    if (STREAK_RINGS[streak]) {
+      const g = await grantRing(user.id, STREAK_RINGS[streak], `streak_${streak}`);
+      if (g) ringsEarned.push(g);
+    }
+    res.json({ alreadyClaimed: false, streak, bonesAwarded: bones, ringsEarned });
+  } catch (err) { res.status(401).json({ error: err.message }); }
 });
 
 const tidePredictionsCache = new Map();
