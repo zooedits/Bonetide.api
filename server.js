@@ -1394,7 +1394,7 @@ app.get('/api/feed', async (req, res) => {
     if (type === 'all' || type === 'catches') {
       const { rows } = await pool.query(
         `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.lat, c.lon, c.caught_at AS created_at,
-                u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.public_profile, u.anonymize_shared,
+                u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.equipped_ring, u.public_profile, u.anonymize_shared,
                 (SELECT COUNT(*) FROM likes    WHERE target_type='catch' AND target_id=c.id) AS like_count,
                 (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
          FROM catches c JOIN users u ON u.id=c.user_id
@@ -1416,7 +1416,7 @@ app.get('/api/feed', async (req, res) => {
             userId: r.angler_id,
             name: anon ? null : (r.angler_name ?? null),
             avatar: anon ? null : (r.avatar ?? null),
-            isClub: !!r.is_club, badge: r.club_badge ?? null,
+            isClub: !!r.is_club, badge: r.club_badge ?? null, ringId: r.equipped_ring ?? null,
             publicProfile: !!r.public_profile && !anon,
           },
         });
@@ -1426,7 +1426,7 @@ app.get('/api/feed', async (req, res) => {
     if (type === 'all' || type === 'spots') {
       const { rows } = await pool.query(
         `SELECT s.id, s.name, s.type AS spot_type, s.note, s.lat, s.lon, s.photo_url, s.created_at,
-                u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.public_profile,
+                u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.equipped_ring, u.public_profile,
                 (SELECT COUNT(*) FROM likes    WHERE target_type='spot' AND target_id=s.id) AS like_count,
                 (SELECT COUNT(*) FROM comments WHERE target_type='spot' AND target_id=s.id) AS comment_count
          FROM spots s JOIN users u ON u.id=s.user_id
@@ -1443,7 +1443,7 @@ app.get('/api/feed', async (req, res) => {
           likeCount: Number(r.like_count) || 0, commentCount: Number(r.comment_count) || 0,
           angler: {
             userId: r.angler_id, name: r.angler_name ?? null, avatar: r.avatar ?? null,
-            isClub: !!r.is_club, badge: r.club_badge ?? null, publicProfile: !!r.public_profile,
+            isClub: !!r.is_club, badge: r.club_badge ?? null, ringId: r.equipped_ring ?? null, publicProfile: !!r.public_profile,
           },
         });
       }
@@ -1555,7 +1555,7 @@ function formatCatch(row) {
 app.get('/api/anglers/:id', async (req, res) => {
   try {
     const { rows: [u] } = await pool.query(
-      `SELECT id, name, avatar, is_club, club_badge, public_profile FROM users WHERE id=$1`,
+      `SELECT id, name, avatar, is_club, club_badge, equipped_ring, public_profile FROM users WHERE id=$1`,
       [req.params.id]
     );
     if (!u || !u.public_profile) return res.status(404).json({ error: 'Profile not available' });
@@ -1582,6 +1582,7 @@ app.get('/api/anglers/:id', async (req, res) => {
         avatar: u.avatar ?? null,
         isClub: !!u.is_club,
         clubBadge: u.club_badge ?? null,
+        ringId: u.equipped_ring ?? null,
         publicCatchCount: agg?.count ?? 0,
         since: agg?.since ?? null,
       },
@@ -1753,14 +1754,14 @@ app.get('/api/spots/:id/photos', async (req, res) => {
     const { rows } = await pool.query(
       `SELECT sp.id, sp.photo_url, sp.created_at, sp.user_id,
               u.name AS user_name, u.avatar AS user_avatar, u.anonymize_shared,
-              u.is_club AS author_is_club, u.club_badge AS author_badge,
+              u.is_club AS author_is_club, u.club_badge AS author_badge, u.equipped_ring AS author_ring,
               u.public_profile AS author_public_profile,
               COUNT(l.id)::int AS like_count
        FROM spot_photos sp
        JOIN users u ON u.id = sp.user_id
        LEFT JOIN likes l ON l.target_type='spot_photo' AND l.target_id=sp.id
        WHERE sp.spot_id = $1 AND (sp.hidden IS NOT TRUE OR sp.user_id = $2)
-       GROUP BY sp.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge, u.public_profile
+       GROUP BY sp.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge, u.equipped_ring, u.public_profile
        ORDER BY sp.created_at DESC`,
       [spotId, viewer?.id ?? -1]
     );
@@ -2543,7 +2544,7 @@ app.post('/api/comments', async (req, res) => {
     );
     if (await isShadowbanned(user.id)) await pool.query(`UPDATE comments SET hidden=true WHERE id=$1`, [newComment.id]).catch(() => {});
     const { rows: [userRow] } = await pool.query(
-      `SELECT name, avatar, anonymize_shared, is_club, club_badge FROM users WHERE id=$1`, [user.id]
+      `SELECT name, avatar, anonymize_shared, is_club, club_badge, equipped_ring FROM users WHERE id=$1`, [user.id]
     );
     res.json({ comment: {
       ...formatComment(newComment, userRow),
@@ -2599,13 +2600,13 @@ app.get('/api/comments/:targetType/:targetId', async (req, res) => {
     const viewer = await getUserFromRequest(req).catch(() => null);
     const { rows } = await pool.query(
       `SELECT c.*, u.name AS user_name, u.avatar AS user_avatar, u.anonymize_shared,
-              u.is_club, u.club_badge,
+              u.is_club, u.club_badge, u.equipped_ring,
               COUNT(l.id)::int AS like_count
        FROM comments c
        JOIN users u ON u.id = c.user_id
        LEFT JOIN likes l ON l.target_type='comment' AND l.target_id=c.id
        WHERE c.target_type=$1 AND c.target_id=$2 AND (c.hidden IS NOT TRUE OR c.user_id = $3)
-       GROUP BY c.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge
+       GROUP BY c.id, u.name, u.avatar, u.anonymize_shared, u.is_club, u.club_badge, u.equipped_ring
        ORDER BY c.created_at ASC`,
       [targetType, tId, viewer?.id ?? -1]
     );
@@ -2652,6 +2653,7 @@ function formatComment(row, userRow) {
     authorName: userRow?.anonymize_shared ? null : (userRow?.name ?? userRow?.user_name ?? null),
     authorIsClub: userRow?.anonymize_shared ? false : !!userRow?.is_club,
     authorBadge: userRow?.anonymize_shared ? null : (userRow?.club_badge ?? null),
+    authorRing: userRow?.anonymize_shared ? null : (userRow?.equipped_ring ?? userRow?.author_ring ?? null),
     createdAt: row.created_at,
     photoUrl: row.photo_url ?? null,
   };
