@@ -2712,15 +2712,25 @@ app.get('/api/tides', async (req, res) => {
   }
 
   const cached = tidePredictionsCache.get(station);
-  let predictions;
+  let predictions, extremes;
   if (cached && (Date.now() - cached.fetchedAt) < 6 * 3600 * 1000) {
     predictions = cached.predictions;
+    extremes = cached.extremes || [];
   } else {
     try {
       const today = new Date();
       const end   = new Date(today);
       end.setDate(end.getDate() + parseInt(days));
       const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
+
+      // NOAA times are requested in GMT and converted to real ISO instants
+      // (with the Z) here, ONCE. The old version asked for station-local time
+      // (lst_ldt) and then parsed those strings on this server - which runs on
+      // UTC - so every timestamp silently shifted by the station's UTC offset
+      // (4h on the east coast) before the phone converted it AGAIN. That's the
+      // "high tide at 3am instead of 6:25am" bug. GMT in, explicit Z out, and
+      // the phone's local conversion is the only conversion that ever happens.
+      const noaaUtcToIso = (t) => new Date(String(t).replace(' ', 'T') + 'Z').toISOString();
 
       // Not all NOAA stations support every datum, and some stations are
       // "subordinate" stations that aren't supported by the live predictions
@@ -2730,13 +2740,14 @@ app.get('/api/tides', async (req, res) => {
       // live predictions available.
       const datums = ['MLLW', 'MSL', 'STND'];
       let noaaData = null;
+      let chosenDatum = null;
       let lastErr = null;
 
       for (const datum of datums) {
-        const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${station}&product=predictions&datum=${datum}&time_zone=lst_ldt&interval=h&units=english&application=bonetideco&format=json`;
+        const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${station}&product=predictions&datum=${datum}&time_zone=gmt&interval=h&units=english&application=bonetideco&format=json`;
         const response = await fetch(url);
         const data = await response.json();
-        if (data.predictions) { noaaData = data; break; }
+        if (data.predictions) { noaaData = data; chosenDatum = datum; break; }
         lastErr = data.error?.message ?? 'NOAA returned no predictions';
       }
 
@@ -2747,8 +2758,29 @@ app.get('/api/tides', async (req, res) => {
         console.warn(`Tides unavailable for station ${station}: ${lastErr}`);
         return res.json({ available: false, reason: 'station_unsupported', stationId: station, predictions: [] });
       }
-      predictions = noaaData.predictions.map(p => ({ t: p.t, v: parseFloat(p.v) }));
-      tidePredictionsCache.set(station, { predictions, fetchedAt: Date.now() });
+      predictions = noaaData.predictions.map(p => ({ t: noaaUtcToIso(p.t), v: parseFloat(p.v) }));
+
+      // Exact high/low EVENTS (interval=hilo): the true extremes at their real
+      // minute (6:25 AM), with H/L type. The hourly curve above can only snap
+      // extremes to whole hours, which is up to ~30 min wrong - fine for the
+      // curve shape, not for the "HIGH 6:25 AM" cards anglers plan around.
+      extremes = [];
+      try {
+        const hiloUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(today)}&end_date=${fmt(end)}&station=${station}&product=predictions&datum=${chosenDatum}&time_zone=gmt&interval=hilo&units=english&application=bonetideco&format=json`;
+        const hiloRes = await fetch(hiloUrl);
+        const hiloData = await hiloRes.json();
+        if (Array.isArray(hiloData.predictions)) {
+          extremes = hiloData.predictions.map(p => ({
+            t: noaaUtcToIso(p.t),
+            v: parseFloat(p.v),
+            type: String(p.type).toUpperCase() === 'H' ? 'H' : 'L',
+          }));
+        }
+      } catch (e) {
+        console.warn(`Tide hilo unavailable for station ${station}: ${e.message}`);
+      }
+
+      tidePredictionsCache.set(station, { predictions, extremes, fetchedAt: Date.now() });
     } catch (err) {
       console.error('Tides error:', err);
       // Network/unexpected error — still return a clean shape rather than a
@@ -2756,32 +2788,39 @@ app.get('/api/tides', async (req, res) => {
       return res.json({ available: false, reason: 'fetch_error', error: err.message, predictions: [] });
     }
   }
-  const now = new Date();
-  const pad = n => String(n).padStart(2, '0');
-  const nowStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  // Timestamps are now real ISO instants, so "where are we on the curve" is
+  // plain epoch math - immune to whatever timezone this server runs in. (The
+  // old string comparison used the server's local clock against NOAA's
+  // station-local strings; on Railway's UTC clock that read the curve ~4h off.)
+  const nowMs = Date.now();
   let beforePt = null, afterPt = null;
   for (let i = 0; i < predictions.length - 1; i++) {
-    if (predictions[i].t <= nowStr && predictions[i+1].t > nowStr) { beforePt = predictions[i]; afterPt = predictions[i+1]; break; }
+    if (Date.parse(predictions[i].t) <= nowMs && Date.parse(predictions[i+1].t) > nowMs) { beforePt = predictions[i]; afterPt = predictions[i+1]; break; }
   }
   let currentHeight, currentDirection, currentPhase;
   if (beforePt && afterPt) {
-    const t0 = new Date(beforePt.t.replace(' ', 'T')).getTime();
-    const t1 = new Date(afterPt.t.replace(' ', 'T')).getTime();
-    const frac = (now.getTime() - t0) / (t1 - t0);
+    const t0 = Date.parse(beforePt.t);
+    const t1 = Date.parse(afterPt.t);
+    const frac = (nowMs - t0) / (t1 - t0);
     currentHeight = beforePt.v + frac * (afterPt.v - beforePt.v);
     const rising = afterPt.v > beforePt.v;
     currentDirection = rising ? 'Incoming' : 'Outgoing';
     currentPhase = Math.abs(afterPt.v - beforePt.v) < 0.3 ? (rising ? 'slack_high' : 'slack_low') : (rising ? 'incoming_fast' : 'outgoing_fast');
   } else {
-    const closest = predictions.reduce((best, p) => Math.abs(new Date(p.t.replace(' ', 'T')) - now) < Math.abs(new Date(best.t.replace(' ', 'T')) - now) ? p : best, predictions[0]);
+    const closest = predictions.reduce((best, p) => Math.abs(Date.parse(p.t) - nowMs) < Math.abs(Date.parse(best.t) - nowMs) ? p : best, predictions[0]);
     currentHeight = closest?.v ?? null; currentDirection = 'Incoming'; currentPhase = 'incoming_fast';
   }
-  const todayStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
-  const todayVals = predictions.filter(p => p.t.startsWith(todayStr)).map(p => p.v);
-  const dailyRange = todayVals.length ? Math.max(...todayVals) - Math.min(...todayVals) : 6;
+  // Daily range over the next 24h from now (the old "server-local calendar
+  // day" filter straddled the wrong hours on a UTC server).
+  const dayVals = predictions.filter(p => { const t = Date.parse(p.t); return t >= nowMs && t <= nowMs + 24 * 3600 * 1000; }).map(p => p.v);
+  const dailyRange = dayVals.length ? Math.max(...dayVals) - Math.min(...dayVals) : 6;
   res.json({
     stationId: station,
-    predictions: predictions.map(p => ({ t: new Date(p.t.replace(' ', 'T')).toISOString(), v: p.v })),
+    predictions,
+    // Exact high/low events, [{ t: ISO, v, type: 'H'|'L' }], at the true
+    // minute. Use these for HIGH/LOW cards and curve labels instead of
+    // hunting for the biggest hourly sample.
+    extremes,
     currentHeight: Math.round(currentHeight * 100) / 100,
     currentDirection, currentPhase, dailyRange,
   });
