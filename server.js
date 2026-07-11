@@ -494,7 +494,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     let { rows } = await pool.query(
-      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.public_profile,
+      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.equipped_ring, u.public_profile,
               COALESCE((
                 SELECT SUM(pt.delta) FROM points_transactions pt
                 WHERE pt.user_id = u.id AND pt.reason = 'catch'
@@ -507,7 +507,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     // Fall back to email match for merged/Apple accounts where provider column is null
     if (!rows.length && req.user.email) {
       ({ rows } = await pool.query(
-        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.public_profile,
+        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.equipped_ring, u.public_profile,
                 COALESCE((
                   SELECT SUM(pt.delta) FROM points_transactions pt
                   WHERE pt.user_id = u.id AND pt.reason = 'catch'
