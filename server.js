@@ -2300,6 +2300,19 @@ pool.query(`
   ALTER TABLE reg_source_checks ADD COLUMN IF NOT EXISTS species_found   INTEGER;
 `).catch(e => console.error('[init] regs auto-publish migration:', e.message));
 
+// ── Phase 5: seasonal rules ──────────────────────────────────────────────────
+// Some states set different limits by DATE within the year (e.g. DE summer
+// flounder: Jan 1 - May 31 = 16", Jun 1 - Dec 31 = 17.5"). A single number per
+// species can't hold that, and forcing it made the bot read "two sizes" as "no
+// limit". `rules` is an ordered list of dated windows, each with its own limits:
+//   [{ window: "Jan 1 - May 31", minSizeIn, maxSizeIn, bagLimit, catchRelease, notes }]
+// When rules is set, the flat columns stay null and clients pick today's window.
+// Flat (year-round) regs keep using the flat columns with rules = NULL, so the
+// existing 20 states are untouched.
+pool.query(`
+  ALTER TABLE regulations ADD COLUMN IF NOT EXISTS rules JSONB;
+`).catch(e => console.error('[init] regulations.rules:', e.message));
+
 // ── Push notification device tokens ──────────────────────────────────────────
 pool.query(`
   CREATE TABLE IF NOT EXISTS push_tokens (
@@ -2457,6 +2470,10 @@ app.get('/api/regs', async (req, res) => {
         gamefish: !!r.gamefish,
         catchRelease: !!r.catch_release,
         notes: r.notes ?? null,
+        // Seasonal windows, when the state sets limits by date. Each entry:
+        // { window, minSizeIn, maxSizeIn, bagLimit, catchRelease, notes }.
+        // Clients pick the window covering today and show the rest as context.
+        rules: Array.isArray(r.rules) && r.rules.length ? r.rules : null,
         verifiedDate: r.verified_date,
         // Auto-published-but-unconfirmed: the gate should show a "pending review"
         // tag and lean on the disclaimer. Human-confirmed rows have this false.
@@ -3839,6 +3856,9 @@ zones: when zoneVaries is true, ALSO return the per-zone table exactly as the pa
 "zones": [{"name": string, "minSizeIn": number|null, "maxSizeIn": number|null, "bagLimit": number|null, "season": string|null, "catchRelease": boolean, "notes": string|null}]
 Use the page's own zone names. Include every zone listed. If a zone is catch-and-release only, set catchRelease true and leave bagLimit null. Do NOT infer a zone that isn't printed, and do NOT merge zones. If the page names zones but doesn't give their numbers, return "zones": [].
 Only give top-level numbers when they apply to the ENTIRE state for every angler.
+seasonalRules: if this species' size or bag limits CHANGE BY DATE RANGE within the year (e.g. "January 1 - May 31: 16 inches; June 1 - December 31: 17.5 inches"), do NOT put a number in the top-level fields and NEVER report the limit as null/removed because of it. Instead return every dated rule:
+"seasonalRules": [{"window": string with the dates exactly as the page gives them (e.g. "Jan 1 - May 31"), "minSizeIn": number|null, "maxSizeIn": number|null, "bagLimit": number|null, "catchRelease": boolean, "notes": string|null}]
+Include every window printed on the page. If a value (e.g. the bag limit) is the same across all windows, repeat it inside each rule. Top-level minSizeIn/maxSizeIn/bagLimit are ONLY for a single value that applies the entire year. A limit is null ONLY if the page positively says there is no limit - a page listing different values for different dates always means seasonalRules, never null.
 sourceText: copy the EXACT words from the page that state this species' limits — verbatim, no paraphrasing, no added words. Keep it short (the sentence or row for this species). If you can't point to explicit text, set it to null.
 
 PAGE TEXT:
@@ -3858,6 +3878,21 @@ ${pageText.slice(0, 60000)}`;
 // ── Risk-tiering + self-verification helpers ─────────────────────────────────
 const regNum = (v) => (v == null || v === '' ? null : Number(v));
 
+// Canonical signature of a seasonal-rules list. Order-insensitive; any change
+// to a window's dates or enforceable values changes the signature. Works on
+// both shapes (proposed camelCase and a stored row's rules, which are saved in
+// the same camelCase shape).
+function rulesSig(rules) {
+  if (!Array.isArray(rules) || !rules.length) return '__NONE__';
+  return JSON.stringify(
+    rules.map(r => ({
+      w: String(r.window || '').trim().toLowerCase().replace(/\s+/g, ' '),
+      a: regNum(r.minSizeIn), b: regNum(r.maxSizeIn), c: regNum(r.bagLimit),
+      r: !!r.catchRelease,
+    })).sort((x, y) => x.w.localeCompare(y.w))
+  );
+}
+
 // A "real change" ignores only free-text notes (noisy); every enforceable field
 // counts. If this is true against the live row, we skip — no queue noise.
 function regEqual(cur, p) {
@@ -3867,7 +3902,8 @@ function regEqual(cur, p) {
       && regNum(cur.bag_limit)   === regNum(p.bagLimit)
       && (cur.season || null)    === (p.season || null)
       && !!cur.catch_release     === !!p.catchRelease
-      && !!cur.gamefish          === !!p.gamefish;
+      && !!cur.gamefish          === !!p.gamefish
+      && rulesSig(cur.rules)     === rulesSig(p.rules);
 }
 
 // Best-effort read of whether a free-text season means "closed / no harvest".
@@ -3884,6 +3920,22 @@ function seasonClosed(s) {
 // (bag↔0, or release-only flips); or a season flips open↔closed.
 function classifyChange(cur, p) {
   if (!cur) return { verdict: 'hold', reason: 'new_species', detail: 'first-ever value for this species — needs a human check' };
+
+  // Structure changes: flat ↔ seasonal, or the seasonal windows themselves
+  // changing. Always held — these reshape what anglers see and the windows
+  // need eyeballing against the source. NEVER auto-published.
+  const curSeasonal = Array.isArray(cur.rules) && cur.rules.length > 0;
+  const pSeasonal   = Array.isArray(p.rules) && p.rules.length > 0;
+  if (!curSeasonal && pSeasonal) {
+    return { verdict: 'hold', reason: 'went_seasonal', detail: 'the state now lists different limits by date — review each seasonal window against the source' };
+  }
+  if (curSeasonal && !pSeasonal) {
+    return { verdict: 'hold', reason: 'went_flat', detail: 'the state replaced seasonal windows with a single year-round value — confirm the windows are really gone' };
+  }
+  if (curSeasonal && pSeasonal && rulesSig(cur.rules) !== rulesSig(p.rules)) {
+    return { verdict: 'hold', reason: 'seasonal_change', detail: 'the seasonal windows or their limits changed — verify each window at the source' };
+  }
+
   const reasons = [];
   const checks = [
     ['min_size_in', 'minSizeIn', 'min size'],
@@ -3912,6 +3964,7 @@ function readSig(e) {
     a: regNum(e.minSizeIn), b: regNum(e.maxSizeIn), c: regNum(e.bagLimit),
     d: (e.season || '').trim().toLowerCase().replace(/\s+/g, ' '),
     g: !!e.gamefish, r: !!e.catchRelease,
+    s: rulesSig(e.seasonalRules),
   });
 }
 
@@ -3928,7 +3981,8 @@ function speciesConsensus(reads, species) {
   // that's what produced blank conflict cards.
   const hasData = perRead.some((e) => e && (
     regNum(e.minSizeIn) != null || regNum(e.maxSizeIn) != null || regNum(e.bagLimit) != null ||
-    e.catchRelease === true || (e.season != null && String(e.season).trim() !== '')
+    e.catchRelease === true || (e.season != null && String(e.season).trim() !== '') ||
+    (Array.isArray(e.seasonalRules) && e.seasonalRules.length > 0)
   ));
   const sigs = perRead.map(readSig);
   const agree = onPage && new Set(sigs).size === 1 && sigs[0] !== '__ABSENT__';
@@ -4166,7 +4220,7 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
       foundCount++;
 
       const cur = (await pool.query(
-        `SELECT min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes,
+        `SELECT min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes, rules,
                 verified_date, review_by, source_url
          FROM regulations WHERE state_code=$1 AND species=$2 AND region='' LIMIT 1`,
         [stateCode, species]
@@ -4184,6 +4238,7 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
         const proposed = {
           minSizeIn: best.minSizeIn ?? null, maxSizeIn: best.maxSizeIn ?? null, bagLimit: best.bagLimit ?? null,
           season: best.season ?? null, gamefish: !!best.gamefish, catchRelease: !!best.catchRelease, notes: best.notes ?? null,
+          rules: (Array.isArray(best.seasonalRules) && best.seasonalRules.length) ? best.seasonalRules : null,
         };
         await pool.query(`DELETE FROM reg_proposals WHERE state_code=$1 AND species=$2 AND status='pending'`, [stateCode, species]);
         await pool.query(
@@ -4203,6 +4258,7 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
       const proposed = {
         minSizeIn: value.minSizeIn ?? null, maxSizeIn: value.maxSizeIn ?? null, bagLimit: value.bagLimit ?? null,
         season: value.season ?? null, gamefish: !!value.gamefish, catchRelease: !!value.catchRelease, notes: value.notes ?? null,
+        rules: (Array.isArray(value.seasonalRules) && value.seasonalRules.length) ? value.seasonalRules : null,
       };
       if (regEqual(cur, proposed)) { skipped++; continue; } // no real change → no noise
 
@@ -4233,8 +4289,10 @@ async function runRegsBotForState(stateCode, force = false, onlySpecies = null) 
         await pool.query(`DELETE FROM reg_gaps WHERE state_code=$1 AND species=$2`, [stateCode, species]).catch(() => {});
         autoPublished++;
       } else {
-        // Big/suspicious or brand-new → HOLD. Nothing goes live.
-        const holdReason = verdict.reason === 'new_species' ? 'new_species' : ('big_change: ' + (verdict.detail || ''));
+        // Big/suspicious, structure change, or brand-new → HOLD. Nothing goes live.
+        const holdReason = verdict.reason === 'new_species'
+          ? 'new_species'
+          : `${verdict.reason}: ${verdict.detail || ''}`;
         await pool.query(
           `INSERT INTO reg_proposals
              (state_code, species, region, proposed, current, source_url, source_excerpt, status, auto_published, confidence, hold_reason, reads)
@@ -4386,15 +4444,17 @@ app.post('/api/admin/regs/proposals/:id/approve', requireAdmin, async (req, res)
     const src = STATE_REG_SOURCES[p.state_code];
     await pool.query(
       `INSERT INTO regulations
-         (state_code, species, region, min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes,
+         (state_code, species, region, min_size_in, max_size_in, bag_limit, season, gamefish, catch_release, notes, rules,
           source_url, verified_date, review_by, pending_review, auto_published_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,CURRENT_DATE,(CURRENT_DATE + INTERVAL '90 days'),false,NULL,NOW())
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,CURRENT_DATE,(CURRENT_DATE + INTERVAL '90 days'),false,NULL,NOW())
        ON CONFLICT (state_code, species, region) DO UPDATE SET
          min_size_in=$4, max_size_in=$5, bag_limit=$6, season=$7, gamefish=$8, catch_release=$9,
-         notes=$10, source_url=$11, verified_date=CURRENT_DATE, review_by=(CURRENT_DATE + INTERVAL '90 days'),
+         notes=$10, rules=$11, source_url=$12, verified_date=CURRENT_DATE, review_by=(CURRENT_DATE + INTERVAL '90 days'),
          pending_review=false, auto_published_at=NULL, discrepancy_at=NULL, discrepancy_url=NULL, updated_at=NOW()`,
       [p.state_code, p.species, p.region, o.minSizeIn ?? null, o.maxSizeIn ?? null, o.bagLimit ?? null,
-       o.season ?? null, !!o.gamefish, !!o.catchRelease, o.notes ?? null, p.source_url || src?.url || null]
+       o.season ?? null, !!o.gamefish, !!o.catchRelease, o.notes ?? null,
+       (Array.isArray(o.rules) && o.rules.length) ? JSON.stringify(o.rules) : null,
+       p.source_url || src?.url || null]
     );
     await pool.query(`UPDATE reg_proposals SET status='approved', resolved_at=NOW() WHERE id=$1`, [p.id]);
     await pool.query(`DELETE FROM reg_gaps WHERE state_code=$1 AND species=$2`, [p.state_code, p.species]).catch(() => {});
@@ -4416,12 +4476,13 @@ app.post('/api/admin/regs/proposals/:id/reject', requireAdmin, async (req, res) 
       if (c) {
         await pool.query(
           `UPDATE regulations SET
-             min_size_in=$1, max_size_in=$2, bag_limit=$3, season=$4, gamefish=$5, catch_release=$6, notes=$7,
-             source_url=$8, verified_date=$9, review_by=$10, pending_review=false, auto_published_at=NULL, updated_at=NOW()
-           WHERE state_code=$11 AND species=$12 AND region=$13`,
+             min_size_in=$1, max_size_in=$2, bag_limit=$3, season=$4, gamefish=$5, catch_release=$6, notes=$7, rules=$8,
+             source_url=$9, verified_date=$10, review_by=$11, pending_review=false, auto_published_at=NULL, updated_at=NOW()
+           WHERE state_code=$12 AND species=$13 AND region=$14`,
           [c.min_size_in ?? null, c.max_size_in ?? null, c.bag_limit ?? null, c.season ?? null,
-           !!c.gamefish, !!c.catch_release, c.notes ?? null, c.source_url ?? null,
-           c.verified_date ?? null, c.review_by ?? null, p.state_code, p.species, p.region || '']
+           !!c.gamefish, !!c.catch_release, c.notes ?? null,
+           (Array.isArray(c.rules) && c.rules.length) ? JSON.stringify(c.rules) : null,
+           c.source_url ?? null, c.verified_date ?? null, c.review_by ?? null, p.state_code, p.species, p.region || '']
         );
       } else {
         // No prior row existed → auto-publish created it → revert = remove it.
