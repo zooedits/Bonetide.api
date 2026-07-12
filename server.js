@@ -3982,17 +3982,31 @@ app.post('/api/admin/regs', requireAdmin, async (req, res) => {
     const species = (b.species || '').toLowerCase();
     if (!state || !species) return res.status(400).json({ error: 'state and species required' });
     const region = b.region || '';
+    // Seasonal windows, manually entered: [{ window, minSizeIn, maxSizeIn,
+    // bagLimit, catchRelease }]. When rules are present the flat columns are
+    // stored as given (usually null) and clients show today's window.
+    const rules = (Array.isArray(b.rules) && b.rules.length)
+      ? b.rules
+          .map(r => ({
+            window: String(r.window || '').trim(),
+            minSizeIn: r.minSizeIn ?? null, maxSizeIn: r.maxSizeIn ?? null,
+            bagLimit: r.bagLimit ?? null, catchRelease: !!r.catchRelease,
+            notes: r.notes ?? null,
+          }))
+          .filter(r => r.window)
+      : null;
     await pool.query(
       `INSERT INTO regulations
          (state_code, species, region, min_size_in, max_size_in, bag_limit, season,
-          gamefish, catch_release, notes, source_url, verified_date, review_by, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+          gamefish, catch_release, notes, rules, source_url, verified_date, review_by, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
        ON CONFLICT (state_code, species, region) DO UPDATE SET
          min_size_in=$4, max_size_in=$5, bag_limit=$6, season=$7, gamefish=$8,
-         catch_release=$9, notes=$10, source_url=$11, verified_date=$12, review_by=$13, updated_at=NOW()`,
+         catch_release=$9, notes=$10, rules=$11, source_url=$12, verified_date=$13, review_by=$14, updated_at=NOW()`,
       [state, species, region,
        b.minSizeIn ?? null, b.maxSizeIn ?? null, b.bagLimit ?? null, b.season ?? null,
-       !!b.gamefish, !!b.catchRelease, b.notes ?? null, b.sourceUrl ?? null,
+       !!b.gamefish, !!b.catchRelease, b.notes ?? null,
+       rules ? JSON.stringify(rules) : null, b.sourceUrl ?? null,
        b.verifiedDate ?? null, b.reviewBy ?? null]
     );
     // Clear the gap now that we have data for it.
