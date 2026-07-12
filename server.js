@@ -2883,6 +2883,31 @@ app.post('/api/daily-login', async (req, res) => {
   } catch (err) { res.status(401).json({ error: err.message }); }
 });
 
+// ── Regs methodology acknowledgments ─────────────────────────────────────────
+// Timestamped record that a user saw the "how our regulations work" popup and
+// affirmed it's informational. One row per user per season (quarter).
+pool.query(`
+  CREATE TABLE IF NOT EXISTS regs_acks (
+    user_id  INTEGER NOT NULL,
+    season   TEXT NOT NULL,
+    acked_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, season)
+  )
+`).catch(e => console.error('[init] regs_acks:', e.message));
+
+app.post('/api/regs/ack', async (req, res) => {
+  try {
+    const user = await getUserFromRequest(req);
+    const season = String((req.body && req.body.season) || '').slice(0, 12);
+    if (!season) return res.status(400).json({ error: 'season required' });
+    await pool.query(
+      `INSERT INTO regs_acks (user_id, season) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [user.id, season]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(401).json({ error: err.message }); }
+});
+
 const tidePredictionsCache = new Map();
 
 app.get('/api/tides', async (req, res) => {
