@@ -2393,6 +2393,16 @@ const STATE_REG_SOURCES = {
   // Pacific
   CA: { name: 'California CDFW — Ocean Sport Fishing',    url: 'https://www.eregulations.com/california/fishing/species-regulations' },
   OR: { name: 'Oregon ODFW — Sport Fishing',              url: 'https://www.eregulations.com/oregon/fishing/marine-zone' },
+  // The final three coastal states are structurally region-managed: WA runs 13
+  // Marine Areas, AK splits into regions with PDF pamphlets + emergency orders,
+  // HI has its own structure. No statewide limits page exists to scrape, so
+  // these sources exist primarily to (a) power the official-source link for
+  // anglers there and (b) let the bot flag what it can. Expect mostly gaps and
+  // zone_varies flags - that's correct behavior, not failure. Never publish a
+  // statewide number for a region-managed fishery.
+  WA: { name: 'Washington WDFW — Sport Fishing Rules',    url: 'https://www.eregulations.com/washington/fishing' },
+  AK: { name: 'Alaska ADF&G — Sport Fishing Regulations', url: 'https://www.adfg.alaska.gov/index.cfm?adfg=fishregulations.sport' },
+  HI: { name: 'Hawaii DLNR — Fishing Regulations',        url: 'https://dlnr.hawaii.gov/dar/fishing/fishing-regulations/' },
   // WA / AK / HI are intentionally NOT bot sources. Their regs are managed by
   // area/zone (Puget Sound vs coast; AK's per-region emergency orders; HI's
   // island rules) and live behind portals with no single static limits table —
