@@ -1273,7 +1273,21 @@ async function awardMilestones(userId, currentSpecies, currentHasPhoto) {
 }
 
 app.post('/api/catches', async (req, res) => {
-  const { species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken, imageUrl, isPublic } = req.body;
+  const { species, lengthIn, released, bait, note, lat, lon, tideHeightFt, tideDirection, windKts, windDirection, baroInHg, moonPct, goodBiteScore, sessionToken, imageUrl, isPublic, caughtAt } = req.body;
+  // Backdated (past) catches: accepted for the logbook and feed, but they earn
+  // NOTHING - no points, no milestones, no PB, no ring achievements. A typed-in
+  // history can't be verified, so it builds the record, not the economy.
+  let backdated = false;
+  let caughtAtDate = null;
+  if (caughtAt) {
+    const d = new Date(caughtAt);
+    const now = Date.now();
+    if (isNaN(d.getTime()) || d.getTime() > now + 3600e3 || d.getTime() < now - 40 * 365.25 * 86400e3) {
+      return res.status(400).json({ error: 'caughtAt must be a valid past date' });
+    }
+    if (now - d.getTime() > 10 * 60e3) backdated = true;
+    caughtAtDate = d.toISOString();
+  }
   if (!species) return res.status(400).json({ error: 'species required' });
   try {
     const user = await getUserFromRequest(req);
@@ -1295,8 +1309,8 @@ app.post('/api/catches', async (req, res) => {
       `SELECT COUNT(*)::int AS n FROM catches WHERE user_id=$1 AND species=$2 AND caught_at::date = CURRENT_DATE`,
       [user.id, species]
     );
-    const base = CATCH_SCALE[Math.min(spToday?.n ?? 0, CATCH_SCALE.length - 1)];
-    const perCatch = (boostActive ? base * 2 : base) + ((released ?? true) ? RELEASE_BONUS : 0);
+    const base = backdated ? 0 : CATCH_SCALE[Math.min(spToday?.n ?? 0, CATCH_SCALE.length - 1)];
+    const perCatch = backdated ? 0 : (boostActive ? base * 2 : base) + ((released ?? true) ? RELEASE_BONUS : 0);
     const ptsLeft = Math.max(0, dailyCap - todayPts);
 
     // Verify the scan token issued by /api/identify. Points are only awarded
@@ -1304,7 +1318,7 @@ app.post('/api/catches', async (req, res) => {
     // identified, and the screen-check did not flag this as a photo of a
     // photo/screen.
     let scanInfo = null;
-    let scanRejectReason = null;
+    let scanRejectReason = backdated ? 'past catch' : null;
     if (sessionToken) {
       try {
         const decoded = jwt.verify(sessionToken, JWT_SECRET);
@@ -1341,8 +1355,8 @@ app.post('/api/catches', async (req, res) => {
     const ptsAwarded = scanInfo && ptsLeft > 0 ? Math.min(perCatch, ptsLeft) : 0;
     const { rows: [newCatch] } = await pool.query(
       `INSERT INTO catches (user_id,species,length_in,released,bait,note,lat,lon,tide_height_ft,tide_direction,wind_kts,wind_direction,baro_in_hg,moon_pct,good_bite_score,pts_awarded,image_url,is_public,caught_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) RETURNING *`,
-      [user.id,species,lengthIn,released??true,bait,note,lat,lon,tideHeightFt,tideDirection,windKts,windDirection,baroInHg,moonPct,goodBiteScore,ptsAwarded,imageUrl??null,isPublic??false]
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,COALESCE($19,NOW())) RETURNING *`,
+      [user.id,species,lengthIn,released??true,bait,note,lat,lon,tideHeightFt,tideDirection,windKts,windDirection,baroInHg,moonPct,goodBiteScore,ptsAwarded,imageUrl??null,isPublic??true,caughtAtDate]
     );
     // Shadowbanned users' posts are created hidden — visible to them, nobody else.
     if (await isShadowbanned(user.id)) await pool.query(`UPDATE catches SET hidden=true WHERE id=$1`, [newCatch.id]).catch(() => {});
@@ -1357,7 +1371,7 @@ app.post('/api/catches', async (req, res) => {
     // tales), requires a real previous record to beat (your first of a species
     // is a baseline, not a PB), and pays at most once per species per season.
     let pbBonus = null;
-    if (scanInfo && Number(lengthIn) > 0) {
+    if (!backdated && scanInfo && Number(lengthIn) > 0) {
       try {
         const { rows: [prev] } = await pool.query(
           `SELECT MAX(length_in) AS best FROM catches WHERE user_id=$1 AND species=$2 AND id <> $3`,
@@ -1395,13 +1409,13 @@ app.post('/api/catches', async (req, res) => {
     if (pbBonus) milestonesJustEarnedPush.push(pbBonus);
 
     // Season milestones — bonus points on top of the daily cap. Fully guarded.
-    const milestonesJustEarned = await awardMilestones(user.id, species, !!imageUrl);
+    const milestonesJustEarned = backdated ? [] : await awardMilestones(user.id, species, !!imageUrl);
     if (milestonesJustEarnedPush.length) milestonesJustEarned.push(...milestonesJustEarnedPush);
     // First time logging this species this season → the bonus the app promises.
-    const speciesBonus = await awardNewSpeciesBonus(user.id, species, !!imageUrl);
+    const speciesBonus = backdated ? null : await awardNewSpeciesBonus(user.id, species, !!imageUrl);
     if (speciesBonus) milestonesJustEarned.push(speciesBonus);
     // Avatar rings — collectible awards, same guarded pattern as milestones.
-    const ringsJustEarned = await awardCatchRings(user.id, newCatch);
+    const ringsJustEarned = backdated ? [] : await awardCatchRings(user.id, newCatch);
 
     res.json({ catch: formatCatch(newCatch), ptsAwarded, dailyTotal: todayPts+ptsAwarded, dailyCap, boostActive, pointsRejectReason: scanRejectReason, milestonesJustEarned, ringsJustEarned });
   } catch (err) {
@@ -1426,7 +1440,7 @@ app.get('/api/catches', async (req, res) => {
          FROM catches c
          JOIN users u ON u.id = c.user_id
          WHERE u.share_with_community = true AND c.is_public = true
-         ORDER BY c.caught_at DESC LIMIT $1 OFFSET $2`,
+         ORDER BY c.id DESC LIMIT $1 OFFSET $2`,  -- upload order: every catch gets its moment
         [limit, offset]
       );
       const catches = rows.map(row => {
@@ -1475,7 +1489,7 @@ app.get('/api/feed', async (req, res) => {
          FROM catches c JOIN users u ON u.id=c.user_id
          WHERE u.share_with_community=true AND c.is_public=true AND c.hidden IS NOT TRUE
          ${before ? 'AND c.caught_at < $1' : ''}
-         ORDER BY c.caught_at DESC LIMIT ${lim + 1}`,
+         ORDER BY c.id DESC LIMIT ${lim + 1}`,  -- upload order
         before ? [before] : []
       );
       for (const r of rows) {
@@ -5009,7 +5023,7 @@ app.get('/api/admin/catches', requireAdmin, async (req, res) => {
               u.id AS user_id, u.name AS user_name
        FROM catches c JOIN users u ON u.id=c.user_id
        WHERE c.is_public = true
-       ORDER BY c.caught_at DESC LIMIT $1`, [limit]
+       ORDER BY c.id DESC LIMIT $1`, [limit]
     );
     res.json({ catches: rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
