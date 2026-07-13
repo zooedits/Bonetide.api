@@ -955,8 +955,12 @@ IDENTIFICATION GUIDANCE:
 
 SCREEN/PHOTO DETECTION: Also assess whether this is a PHOTO OF A SCREEN, PRINTED PHOTO, OR DIGITAL IMAGE rather than a real-life fish photo. Look for: screen glare/reflections, moiré patterns, monitor bezels, glass/print texture, pixel grid patterns, unnatural color banding, or a flat 2D appearance inconsistent with a hand-held catch photo.
 
+LENGTH PLAUSIBILITY: Estimate a plausible total-length range for this specific fish in inches, using anything in frame for scale (hands, boots, boards, rod, cooler, deck planks). Be generous - wide range is fine. If nothing gives scale, return null for both bounds.
+
+MEASURING DEVICE: Is the fish lying on/against a visible measuring device (bump board, ruler, measuring tape) with markings? If yes and the reading at the tail is legible, report the approximate reading in inches; otherwise null.
+
 Respond ONLY with a valid JSON object, no markdown, no explanation:
-{"commonName":"string","latinName":"string","confidence":0.0,"inRegion":true,"habitat":"inshore","catchRelease":false,"notes":"string","isPhotoOfScreen":false,"screenCheckConfidence":0.0}
+{"commonName":"string","latinName":"string","confidence":0.0,"inRegion":true,"habitat":"inshore","catchRelease":false,"notes":"string","isPhotoOfScreen":false,"screenCheckConfidence":0.0,"estLengthMinIn":null,"estLengthMaxIn":null,"measuringDevice":false,"deviceReadingIn":null}
 
 If you cannot identify the fish with reasonable confidence, return confidence below 0.5.
 If multiple species are plausible, pick the most likely one for the region and note the alternatives in the notes field.`;
@@ -981,6 +985,10 @@ If multiple species are plausible, pick the most likely one for the region and n
         isPhotoOfScreen:   !!result.isPhotoOfScreen,
         commonName:        result.commonName ?? null,
         confidence:        result.confidence ?? 0,
+        estLengthMinIn:    result.estLengthMinIn ?? null,
+        estLengthMaxIn:    result.estLengthMaxIn ?? null,
+        measuringDevice:   !!result.measuringDevice,
+        deviceReadingIn:   result.deviceReadingIn ?? null,
       },
       JWT_SECRET,
       { expiresIn: '5m' }
@@ -1308,6 +1316,15 @@ app.post('/api/catches', async (req, res) => {
           scanRejectReason = 'photo of screen/photo detected';
         } else if (decoded.commonName && species && decoded.commonName.toLowerCase() !== species.toLowerCase()) {
           scanRejectReason = 'species mismatch';
+        } else if (
+          decoded.estLengthMaxIn != null && Number(lengthIn) > 0 &&
+          Number(lengthIn) > Number(decoded.estLengthMaxIn) * 1.5
+        ) {
+          // Tier 2: the claim is wildly beyond what the photo could support
+          // (generous 1.5x headroom over the AI's already-generous upper
+          // bound, and skipped entirely when the photo gave no scale). This
+          // catches "45-inch" 14-inch trout, not honest rounding.
+          scanRejectReason = 'claimed length far exceeds what the photo shows';
         } else {
           scanInfo = decoded;
           usedScanTokens.add(sessionToken);
@@ -1349,15 +1366,29 @@ app.post('/api/catches', async (req, res) => {
         if (prev?.best != null && Number(lengthIn) > Number(prev.best)) {
           const season = getSeasonInfo();
           const pbKey = `pb_${String(species).toLowerCase().replace(/[^a-z0-9_]/g, '_')}_${season.key}`;
-          try {
+          const pbCommon = { pb: true, prevRecord: Number(prev.best), newRecord: Number(lengthIn), species };
+          // Tier 3: the +200 is EVIDENCE-grade. The photo must show the fish
+          // on a measuring device, and if the AI could read the board, the
+          // reading has to roughly agree with the claim (±2"). No board: the
+          // record still updates and gets celebrated - just no bones.
+          const measured = scanInfo.measuringDevice === true &&
+            (scanInfo.deviceReadingIn == null || Math.abs(Number(lengthIn) - Number(scanInfo.deviceReadingIn)) <= 2);
+          if (!measured) {
+            pbBonus = { ...pbCommon, key: `${pbKey}_unmeasured_${newCatch.id}`, label: `New record ${String(species).replace(/_/g, ' ')}: ${lengthIn}"`, points: 0, pbUnmeasured: true };
+          } else try {
             await pool.query(`INSERT INTO milestones (user_id, key) VALUES ($1,$2)`, [user.id, pbKey]);
             await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [PB_BONUS, user.id]);
             await pool.query(
               `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'personal_best',$3,NOW())`,
               [user.id, PB_BONUS, pbKey]
             );
-            pbBonus = { key: pbKey, label: `Personal best ${String(species).replace(/_/g, ' ')}: ${lengthIn}"`, points: PB_BONUS };
-          } catch { /* already paid a PB for this species this season */ }
+            pbBonus = { ...pbCommon, key: pbKey, label: `Personal best ${String(species).replace(/_/g, ' ')}: ${lengthIn}"`, points: PB_BONUS };
+          } catch {
+            // A record was beaten but this season's bonus is spent: report it
+            // anyway so the app celebrates the RECORD and explains the rules,
+            // instead of ignoring the angler's best fish of the year.
+            pbBonus = { ...pbCommon, key: `${pbKey}_unpaid_${newCatch.id}`, label: `New record ${String(species).replace(/_/g, ' ')}: ${lengthIn}"`, points: 0, pbUnpaid: true };
+          }
         }
       } catch (e) { console.error('[pb] non-fatal:', e.message); }
     }
