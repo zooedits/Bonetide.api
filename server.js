@@ -994,7 +994,15 @@ If multiple species are plausible, pick the most likely one for the region and n
   }
 });
 
-const DAILY_CAP = 1200, PTS_PER_CATCH = 10;
+const DAILY_CAP = 1200;
+// Diminishing per-species-per-day scale: the 1st redfish today pays 100, the
+// 2nd 80, then 60/40/20 - repeat catches of one species stop being a farm
+// while a varied day keeps paying well. Release bonus rewards conservation.
+// Personal-best pays big but ONLY on AI-scan-verified logs and once per
+// species per season - self-reported "one inch bigger" can't be farmed.
+const CATCH_SCALE = [100, 80, 60, 40, 20];
+const RELEASE_BONUS = 5;
+const PB_BONUS = 200;
 const BOOST_DAILY_CAP = 2000; // raised cap on the user's activated birthday boost day
 const usedScanTokens = new Set(); // in-memory single-use tracking (resets on deploy/restart)
 
@@ -1274,7 +1282,13 @@ app.post('/api/catches', async (req, res) => {
     );
     const boostActive = !!boostRow?.active;
     const dailyCap = boostActive ? BOOST_DAILY_CAP : DAILY_CAP;
-    const perCatch = boostActive ? PTS_PER_CATCH * 2 : PTS_PER_CATCH;
+    // Diminishing scale: how many of THIS species already logged today?
+    const { rows: [spToday] } = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM catches WHERE user_id=$1 AND species=$2 AND caught_at::date = CURRENT_DATE`,
+      [user.id, species]
+    );
+    const base = CATCH_SCALE[Math.min(spToday?.n ?? 0, CATCH_SCALE.length - 1)];
+    const perCatch = (boostActive ? base * 2 : base) + ((released ?? true) ? RELEASE_BONUS : 0);
     const ptsLeft = Math.max(0, dailyCap - todayPts);
 
     // Verify the scan token issued by /api/identify. Points are only awarded
@@ -1320,8 +1334,38 @@ app.post('/api/catches', async (req, res) => {
       await pool.query(`INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'catch',$3,NOW())`, [user.id, ptsAwarded, newCatch.id.toString()]);
     }
 
+    const milestonesJustEarnedPush = [];
+    // Personal best bonus: beat your own longest for this species. Guarded
+    // three ways against gaming: requires a valid AI scan (no typed-in tall
+    // tales), requires a real previous record to beat (your first of a species
+    // is a baseline, not a PB), and pays at most once per species per season.
+    let pbBonus = null;
+    if (scanInfo && Number(lengthIn) > 0) {
+      try {
+        const { rows: [prev] } = await pool.query(
+          `SELECT MAX(length_in) AS best FROM catches WHERE user_id=$1 AND species=$2 AND id <> $3`,
+          [user.id, species, newCatch.id]
+        );
+        if (prev?.best != null && Number(lengthIn) > Number(prev.best)) {
+          const season = getSeasonInfo();
+          const pbKey = `pb_${String(species).toLowerCase().replace(/[^a-z0-9_]/g, '_')}_${season.key}`;
+          try {
+            await pool.query(`INSERT INTO milestones (user_id, key) VALUES ($1,$2)`, [user.id, pbKey]);
+            await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [PB_BONUS, user.id]);
+            await pool.query(
+              `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'personal_best',$3,NOW())`,
+              [user.id, PB_BONUS, pbKey]
+            );
+            pbBonus = { key: pbKey, label: `Personal best ${String(species).replace(/_/g, ' ')}: ${lengthIn}"`, points: PB_BONUS };
+          } catch { /* already paid a PB for this species this season */ }
+        }
+      } catch (e) { console.error('[pb] non-fatal:', e.message); }
+    }
+    if (pbBonus) milestonesJustEarnedPush.push(pbBonus);
+
     // Season milestones — bonus points on top of the daily cap. Fully guarded.
     const milestonesJustEarned = await awardMilestones(user.id, species, !!imageUrl);
+    if (milestonesJustEarnedPush.length) milestonesJustEarned.push(...milestonesJustEarnedPush);
     // First time logging this species this season → the bonus the app promises.
     const speciesBonus = await awardNewSpeciesBonus(user.id, species, !!imageUrl);
     if (speciesBonus) milestonesJustEarned.push(speciesBonus);
@@ -2868,7 +2912,8 @@ app.post('/api/daily-login', async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     const last = u?.last_login_day ? new Date(u.last_login_day).toISOString().slice(0, 10) : null;
     if (last === today) {
-      return res.json({ alreadyClaimed: true, streak: u.login_streak || 0, bonesAwarded: 0, ringsEarned: [] });
+      const { rows: [bal0] } = await pool.query(`SELECT points_balance FROM users WHERE id=$1`, [user.id]);
+      return res.json({ alreadyClaimed: true, streak: u.login_streak || 0, bonesAwarded: 0, ringsEarned: [], pointsBalance: bal0?.points_balance ?? 0 });
     }
     const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 10);
     const streak = last === yesterday ? (u.login_streak || 0) + 1 : 1;
@@ -2889,7 +2934,8 @@ app.post('/api/daily-login', async (req, res) => {
       const g = await grantRing(user.id, STREAK_RINGS[streak], `streak_${streak}`);
       if (g) ringsEarned.push(g);
     }
-    res.json({ alreadyClaimed: false, streak, bonesAwarded: bones, ringsEarned });
+    const { rows: [bal] } = await pool.query(`SELECT points_balance FROM users WHERE id=$1`, [user.id]);
+    res.json({ alreadyClaimed: false, streak, bonesAwarded: bones, ringsEarned, pointsBalance: bal?.points_balance ?? 0 });
   } catch (err) { res.status(401).json({ error: err.message }); }
 });
 
