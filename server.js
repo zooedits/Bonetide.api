@@ -1473,6 +1473,17 @@ function _haversineMi(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// Batched view reporting: the app sends catch ids as they scroll into view.
+// Fire-and-forget, capped, and deliberately dumb - it counts impressions, not
+// engagement, because impressions are what fairness is measured in.
+app.post('/api/feed/views', async (req, res) => {
+  try {
+    const ids = (Array.isArray(req.body?.ids) ? req.body.ids : []).map(Number).filter(n => Number.isInteger(n) && n > 0).slice(0, 50);
+    if (ids.length) await pool.query(`UPDATE catches SET views = views + 1 WHERE id = ANY($1)`, [ids]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/feed', async (req, res) => {
   try {
     const { lat, lon, radius = 100, limit = 25, type = 'all', before = null } = req.query;
@@ -1481,17 +1492,58 @@ app.get('/api/feed', async (req, res) => {
     const items = [];
 
     if (type === 'all' || type === 'catches') {
-      const { rows } = await pool.query(
+      // ── The Bone Tide feed algorithm ─────────────────────────────────────
+      // Spine: strict upload order - every catch gets the same top-of-feed
+      // moment regardless of who posted it. Woven into the spine at fixed
+      // intervals: OVERLOOKED slots, older public catches with the fewest
+      // impressions, guaranteed a second showing. The spine is engagement-
+      // blind; the weave is anti-engagement (LOW views win). There is no slot
+      // anywhere that popularity can buy. Tune the weave with the constants.
+      const WEAVE_EVERY = 5;        // an overlooked catch every N feed cards
+      const OVERLOOKED_MIN_AGE_H = 12;  // old enough to have had its fresh moment
+      const OVERLOOKED_MAX_VIEWS = 25;  // still basically unseen
+
+      const { rows: spine } = await pool.query(
         `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.lat, c.lon, c.caught_at AS created_at,
                 u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.equipped_ring, u.public_profile, u.anonymize_shared,
                 (SELECT COUNT(*) FROM likes    WHERE target_type='catch' AND target_id=c.id) AS like_count,
                 (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
          FROM catches c JOIN users u ON u.id=c.user_id
          WHERE u.share_with_community=true AND c.is_public=true AND c.hidden IS NOT TRUE
-         ${before ? 'AND c.caught_at < $1' : ''}
-         ORDER BY c.id DESC LIMIT ${lim + 1}`,  -- upload order
+         ${before ? 'AND c.id < $1' : ''}
+         ORDER BY c.id DESC LIMIT ${lim + 1}`,
         before ? [before] : []
       );
+
+      // Overlooked candidates: oldest-unseen first, random among ties so the
+      // same three catches don't haunt every refresh. Only woven into the
+      // first page (no `before`) - deeper pages stay pure spine.
+      let overlooked = [];
+      if (!before && spine.length >= WEAVE_EVERY) {
+        const need = Math.floor(spine.length / WEAVE_EVERY);
+        const { rows: ov } = await pool.query(
+          `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.lat, c.lon, c.caught_at AS created_at,
+                  u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.equipped_ring, u.public_profile, u.anonymize_shared,
+                  (SELECT COUNT(*) FROM likes    WHERE target_type='catch' AND target_id=c.id) AS like_count,
+                  (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
+           FROM catches c JOIN users u ON u.id=c.user_id
+           WHERE u.share_with_community=true AND c.is_public=true AND c.hidden IS NOT TRUE
+             AND c.caught_at < NOW() - INTERVAL '${OVERLOOKED_MIN_AGE_H} hours'
+             AND c.views <= ${OVERLOOKED_MAX_VIEWS}
+             AND c.id NOT IN (SELECT unnest($1::int[]))
+           ORDER BY c.views ASC, RANDOM() LIMIT $2`,
+          [spine.map(r => r.id), need]
+        );
+        overlooked = ov.map(r => ({ ...r, _overlooked: true }));
+      }
+
+      // Weave: after every WEAVE_EVERY spine cards, deal one overlooked card.
+      const rows = [];
+      let oi = 0;
+      spine.forEach((r, i) => {
+        rows.push(r);
+        if ((i + 1) % WEAVE_EVERY === 0 && oi < overlooked.length) rows.push(overlooked[oi++]);
+      });
       for (const r of rows) {
         let la = r.lat, lo = r.lon;
         if (la != null && lo != null) { const j = jitterCoords(la, lo, r.id); la = j.lat; lo = j.lon; }
@@ -1499,6 +1551,7 @@ app.get('/api/feed', async (req, res) => {
         items.push({
           type: 'catch', id: r.id, imageUrl: r.image_url ?? null,
           species: r.species, lengthIn: r.length_in, released: r.released,
+          overlooked: !!r._overlooked,
           lat: la, lon: lo, createdAt: r.created_at,
           likeCount: Number(r.like_count) || 0, commentCount: Number(r.comment_count) || 0,
           angler: {
@@ -2404,6 +2457,13 @@ pool.query(`
 pool.query(`
   ALTER TABLE regulations ADD COLUMN IF NOT EXISTS rules JSONB;
 `).catch(e => console.error('[init] regulations.rules:', e.message));
+
+// ── Feed fairness infrastructure ─────────────────────────────────────────────
+// views: how many feed impressions a catch has had. Collected from day one so
+// "surface the overlooked" has real data the day it matters.
+pool.query(`
+  ALTER TABLE catches ADD COLUMN IF NOT EXISTS views INTEGER DEFAULT 0;
+`).catch(e => console.error('[init] catches.views:', e.message));
 
 // ── Push notification device tokens ──────────────────────────────────────────
 pool.query(`
