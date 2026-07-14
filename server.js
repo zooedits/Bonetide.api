@@ -982,6 +982,9 @@ If multiple species are plausible, pick the most likely one for the region and n
     const scanToken = jwt.sign(
       {
         purpose:           'scan',
+        // Manual entries verify the live photo but the angler fills the form in
+        // themselves, so their species pick stands over the AI's guess below.
+        manualEntry:       req.body?.mode === 'manual',
         isPhotoOfScreen:   !!result.isPhotoOfScreen,
         commonName:        result.commonName ?? null,
         confidence:        result.confidence ?? 0,
@@ -1328,7 +1331,16 @@ app.post('/api/catches', async (req, res) => {
           scanRejectReason = 'token already used';
         } else if (decoded.isPhotoOfScreen) {
           scanRejectReason = 'photo of screen/photo detected';
-        } else if (decoded.commonName && species && decoded.commonName.toLowerCase() !== species.toLowerCase()) {
+        } else if (
+          !decoded.manualEntry &&
+          decoded.commonName && species && decoded.commonName.toLowerCase() !== species.toLowerCase()
+        ) {
+          // AI Scan only. On a manual entry the angler names the fish, so the
+          // AI's guess doesn't get to veto it - the AI is often wrong on species
+          // it has never been asked to commit to. The photo-of-screen check,
+          // single-use, expiry, and the length sanity check below still apply,
+          // and species never inflates points anyway (the ladder is per-species-
+          // per-day), so trusting the angler here costs nothing.
           scanRejectReason = 'species mismatch';
         } else if (
           decoded.estLengthMaxIn != null && Number(lengthIn) > 0 &&
