@@ -3048,11 +3048,36 @@ app.post('/api/daily-login', async (req, res) => {
     const u = (await pool.query(`SELECT login_streak, last_login_day FROM users WHERE id=$1`, [user.id])).rows[0];
     const today = new Date().toISOString().slice(0, 10);
     const last = u?.last_login_day ? new Date(u.last_login_day).toISOString().slice(0, 10) : null;
-    if (last === today) {
-      const { rows: [bal0] } = await pool.query(`SELECT points_balance FROM users WHERE id=$1`, [user.id]);
-      return res.json({ alreadyClaimed: true, streak: u.login_streak || 0, bonesAwarded: 0, ringsEarned: [], pointsBalance: bal0?.points_balance ?? 0 });
-    }
     const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 10);
+
+    const ringsEarned = [];
+    // The welcome ring is for showing up at all, not for claiming today's bones.
+    // It used to be granted below the alreadyClaimed return, which meant anyone
+    // whose last_login_day was already stamped could never receive it - Home
+    // claims on every mount, so that's everyone after their first open of the
+    // day. grantRing is idempotent (ON CONFLICT DO NOTHING), so attempting it on
+    // every call costs nothing and self-heals.
+    const welcome = await grantRing(user.id, 'boxedcompass', 'welcome');
+    if (welcome) ringsEarned.push(welcome);
+
+    // Backfill every streak ring at or below the streak they're actually on.
+    // Granting only the exact milestone day meant a ring missed for any reason
+    // (an outage that day, a ring-id change, a wiped table) stayed unreachable
+    // until the streak came all the way back around.
+    const grantStreakRings = async (streakVal) => {
+      for (const [day, rid] of Object.entries(STREAK_RINGS)) {
+        if (Number(streakVal) >= Number(day)) {
+          const g = await grantRing(user.id, rid, `streak_${day}`);
+          if (g) ringsEarned.push(g);
+        }
+      }
+    };
+
+    if (last === today) {
+      await grantStreakRings(u.login_streak || 0);
+      const { rows: [bal0] } = await pool.query(`SELECT points_balance FROM users WHERE id=$1`, [user.id]);
+      return res.json({ alreadyClaimed: true, streak: u.login_streak || 0, bonesAwarded: 0, ringsEarned, pointsBalance: bal0?.points_balance ?? 0 });
+    }
     const streak = last === yesterday ? (u.login_streak || 0) + 1 : 1;
     await pool.query(`UPDATE users SET login_streak=$1, last_login_day=$2 WHERE id=$3`, [streak, today, user.id]);
 
@@ -3064,13 +3089,7 @@ app.post('/api/daily-login', async (req, res) => {
       [user.id, bones, `day_${streak}`]
     );
 
-    const ringsEarned = [];
-    const welcome = await grantRing(user.id, 'boxedcompass', 'welcome');
-    if (welcome) ringsEarned.push(welcome);
-    if (STREAK_RINGS[streak]) {
-      const g = await grantRing(user.id, STREAK_RINGS[streak], `streak_${streak}`);
-      if (g) ringsEarned.push(g);
-    }
+    await grantStreakRings(streak);
     const { rows: [bal] } = await pool.query(`SELECT points_balance FROM users WHERE id=$1`, [user.id]);
     res.json({ alreadyClaimed: false, streak, bonesAwarded: bones, ringsEarned, pointsBalance: bal?.points_balance ?? 0 });
   } catch (err) { res.status(401).json({ error: err.message }); }
