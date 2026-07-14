@@ -2861,12 +2861,12 @@ app.put('/api/privacy-prefs', async (req, res) => {
 });
 
 // ═══ AVATAR RINGS ════════════════════════════════════════════════════════════
-// 28 collectible rings that render around a user's avatar (same layering trick
+// 34 collectible rings that render around a user's avatar (same layering trick
 // as the Tide King crown). The PNGs ship in the app bundle; the server only
 // tracks ownership, awards, and which ring is equipped. Ring ids here MUST
 // match ringsCatalog.js in the app.
 // Lanes:
-//   streaks  → daily-login streak milestones (3/7/14/30 days)
+//   streaks  → daily-login streak milestones (3/7/14/30/50 days)
 //   catch    → achievements checked on every logged catch
 //   monthly  → featured ring of the month, earned by logging any catch that month
 //   club     → Bone Tide Club exclusives, granted while membership is active
@@ -2887,15 +2887,19 @@ pool.query(`
 `).catch(e => console.error('[init] users ring columns:', e.message));
 
 const RING_IDS = new Set([
-  'anchor', 'barracuda', 'blackflag', 'bones', 'cannonball', 'coral', 'crabclaw',
-  'darkoctopus', 'deepbluefish', 'fishbones', 'greenoctopus', 'jellyfish',
-  'lighthouse', 'litetackle', 'lurers', 'nautical', 'piratehat', 'piratesword',
-  'pirateswordv2', 'piratewindow', 'porthole', 'purpleoctopus', 'roughseas',
-  'seahorse', 'sharkteeth', 'sharktooth', 'treasure', 'treasurev2',
+  // common
+  'boxedcompass', 'firstrig', 'hookline', 'deckhand', 'bosunscoil', 'saltbone', 'razorjaw', 'chomp',
+  // uncommon
+  'oldlurer', 'twinhooks', 'ironlinks', 'depthofchains', 'tridentline', 'truenorth', 'knots', 'deadreckoning',
+  // rare
+  'bonejaw', 'bonecollector', 'anchors', 'coralandshells', 'gildedjaw', 'tiderunner', 'riptide',
+  'brokenchain', 'liesbeneath', 'eatorbeeatin', 'megladon', 'sharkteethport',
+  // legendary
+  'jawbone', 'crossedsteel', 'sunkenhoard', 'deepdweller', 'blackflag', 'captainsbounty',
 ]);
-const STREAK_RINGS  = { 3: 'nautical', 7: 'jellyfish', 14: 'seahorse', 30: 'porthole' };
-const MONTHLY_RINGS = { '2026-07': 'piratehat', '2026-08': 'piratesword' }; // add future months here
-const CLUB_RINGS    = ['pirateswordv2', 'treasurev2'];
+const STREAK_RINGS  = { 3: 'hookline', 7: 'deckhand', 14: 'bosunscoil', 30: 'saltbone', 50: 'knots' };
+const MONTHLY_RINGS = { '2026-07': 'blackflag', '2026-08': 'crossedsteel' }; // add future months here
+const CLUB_RINGS    = ['sunkenhoard']; // captainsbounty is crown-only, granted by admin
 
 async function grantRing(userId, ringId, via) {
   if (!RING_IDS.has(ringId)) return null;
@@ -2932,39 +2936,45 @@ async function awardCatchRings(userId, c) {
     )).rows[0];
 
     // Volume ladder
-    if (stats.total >= 1)   await grant('litetackle',   'first_catch');
-    if (stats.total >= 5)   await grant('crabclaw',     'catches_5');
-    if (stats.total >= 10)  await grant('greenoctopus', 'catches_10');
-    if (stats.total >= 25)  await grant('anchor',       'catches_25');
-    if (stats.total >= 50)  await grant('darkoctopus',  'catches_50');
-    if (stats.total >= 100) await grant('piratewindow', 'catches_100');
+    if (stats.total >= 1)   await grant('firstrig',      'first_catch');
+    if (stats.total >= 3)   await grant('razorjaw',      'catches_3');
+    if (stats.total >= 5)   await grant('oldlurer',      'catches_5');
+    if (stats.total >= 10)  await grant('ironlinks',     'catches_10');
+    if (stats.total >= 25)  await grant('tridentline',   'catches_25');
+    if (stats.total >= 40)  await grant('deadreckoning', 'catches_40');
+    if (stats.total >= 60)  await grant('anchors',       'catches_60');
+    if (stats.total >= 75)  await grant('deepdweller',   'catches_75');
+    if (stats.total >= 100) await grant('liesbeneath',   'catches_100');
     // Species ladder
-    if (stats.species >= 5)  await grant('deepbluefish', 'species_5');
-    if (stats.species >= 10) await grant('barracuda',    'species_10');
-    if (stats.species >= 20) await grant('treasure',     'species_20');
+    if (stats.species >= 5)  await grant('depthofchains',  'species_5');
+    if (stats.species >= 10) await grant('bonejaw',        'species_10');
+    if (stats.species >= 15) await grant('coralandshells', 'species_15');
+    if (stats.species >= 20) await grant('megladon',       'species_20');
     // Conservation ladder
-    if (stats.released >= 10) await grant('fishbones',     'released_10');
-    if (stats.released >= 50) await grant('purpleoctopus', 'released_50');
+    if (stats.released >= 5)  await grant('chomp',         'released_5');
+    if (stats.released >= 10) await grant('truenorth',     'released_10');
+    if (stats.released >= 25) await grant('bonecollector', 'released_25');
+    if (stats.released >= 50) await grant('eatorbeeatin',  'released_50');
     // Variety
-    if (stats.baits >= 3) await grant('lurers', 'baits_3');
+    if (stats.baits >= 3) await grant('twinhooks', 'baits_3');
 
     // This-catch conditions. caught_at is server time (UTC); the 01-09 UTC
     // window is ~9pm-5am on the US east coast, where the userbase lives.
     // Worth revisiting if the app goes national.
     const hr = new Date(c.caught_at).getUTCHours();
-    if (hr >= 1 && hr <= 9)                       await grant('blackflag',  'night_catch');
-    if (Number(c.length_in) >= 40)                await grant('cannonball', 'fish_40in');
-    if (Number(c.length_in) >= 50)                await grant('sharktooth', 'fish_50in');
-    if (/shark/i.test(String(c.species || '')))   await grant('sharkteeth', 'shark_logged');
-    if (Number(c.wind_kts) >= 15)                 await grant('roughseas',  'wind_15kt');
+    if (hr >= 1 && hr <= 9)                       await grant('brokenchain',    'night_catch');
+    if (Number(c.length_in) >= 40)                await grant('sharkteethport', 'fish_40in');
+    if (Number(c.length_in) >= 50)                await grant('jawbone',        'fish_50in');
+    if (/shark/i.test(String(c.species || '')))   await grant('gildedjaw',      'shark_logged');
+    if (Number(c.wind_kts) >= 15)                 await grant('tiderunner',     'wind_15kt');
 
     // Inshore slam: 3 species in one day
-    if (!owned.has('lighthouse')) {
+    if (!owned.has('riptide')) {
       const slam = (await pool.query(
         `SELECT COUNT(DISTINCT species)::int AS n FROM catches WHERE user_id=$1 AND DATE(caught_at)=CURRENT_DATE`,
         [userId]
       )).rows[0];
-      if (slam.n >= 3) await grant('lighthouse', 'slam_3_species');
+      if (slam.n >= 3) await grant('riptide', 'slam_3_species');
     }
 
     // Featured ring of the month: log any catch during the month
@@ -3033,7 +3043,7 @@ app.post('/api/daily-login', async (req, res) => {
     );
 
     const ringsEarned = [];
-    const welcome = await grantRing(user.id, 'coral', 'welcome');
+    const welcome = await grantRing(user.id, 'boxedcompass', 'welcome');
     if (welcome) ringsEarned.push(welcome);
     if (STREAK_RINGS[streak]) {
       const g = await grantRing(user.id, STREAK_RINGS[streak], `streak_${streak}`);
