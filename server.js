@@ -4211,9 +4211,22 @@ app.get('/api/rewards/profile', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Six-tier bones ladder. These thresholds are PRINTED ON THE BADGE ARTWORK
+// ("1,000+ POINTS"), so the art is the contract and this must match it — and
+// tiersCatalog.js on the client mirrors it.
+//
+// Was four tiers with thresholds that contradicted the badges: cast_member at 0
+// (art says 100+), marsh_guide at 3000 (art says 1,000+), bone_tide_legend at
+// 5000 (art says 10,000+), plus a 'tide_angler' tier that has no badge at all,
+// and no deckhand/tide_tracker/coastal_captain despite art existing for each.
 function getTierKey(pts) {
-  if (pts >= 5000) return 'bone_tide_legend'; if (pts >= 3000) return 'marsh_guide';
-  if (pts >= 500) return 'tide_angler'; return 'cast_member';
+  const p = pts ?? 0;
+  if (p >= 10000) return 'bone_tide_legend';
+  if (p >= 5000)  return 'coastal_captain';
+  if (p >= 2500)  return 'tide_tracker';
+  if (p >= 1000)  return 'marsh_guide';
+  if (p >= 100)   return 'cast_member';
+  return 'deckhand';
 }
 
 app.post('/api/redeem', async (req, res) => {
