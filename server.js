@@ -2997,6 +2997,23 @@ const STREAK_RINGS  = { 3: 'hookline', 7: 'deckhand', 14: 'bosunscoil', 30: 'sal
 const MONTHLY_RINGS = { '2026-07': 'blackflag', '2026-08': 'crossedsteel' }; // add future months here
 const CLUB_RINGS    = ['sunkenhoard']; // captainsbounty is crown-only, granted by admin
 
+// One-time cleanup on boot: drop ownership rows and equipped refs for rings that
+// no longer exist. These accumulate whenever the catalog changes (a rename, a
+// cut ring, or — as happened here — an old build granting old ids while deploys
+// were failing). They render as nothing but still count, so "5 of 34" showed
+// while the grid drew 3. Cheap, idempotent, and saves hand-running SQL every
+// time the ring set moves.
+pool.query(
+  `DELETE FROM user_rings WHERE ring_id <> ALL($1::text[])`, [[...RING_IDS]]
+).then(r => { if (r.rowCount) console.log(`[rings] purged ${r.rowCount} stale ownership row(s)`); })
+ .catch(e => console.warn('[rings] stale purge:', e.message));
+
+pool.query(
+  `UPDATE users SET equipped_ring=NULL WHERE equipped_ring IS NOT NULL AND equipped_ring <> ALL($1::text[])`,
+  [[...RING_IDS]]
+).then(r => { if (r.rowCount) console.log(`[rings] cleared ${r.rowCount} stale equipped ring(s)`); })
+ .catch(e => console.warn('[rings] stale equip clear:', e.message));
+
 async function grantRing(userId, ringId, via) {
   if (!RING_IDS.has(ringId)) return null;
   const r = await pool.query(
@@ -3092,10 +3109,18 @@ app.get('/api/rings', async (req, res) => {
       `SELECT is_club, equipped_ring, login_streak FROM users WHERE id=$1`, [user.id]
     )).rows[0] || {};
     if (u.is_club) for (const rid of CLUB_RINGS) await grantRing(user.id, rid, 'club');
+    // Only return rings that still EXIST. user_rings can hold ids from a previous
+    // catalog (a ring that got renamed or cut), and those render as nothing in the
+    // app while still inflating "12 of 34" — the count said 5, the grid drew 3.
+    // Filtering here means a stale row can never be counted again.
     const owned = (await pool.query(
-      `SELECT ring_id, earned_via, earned_at FROM user_rings WHERE user_id=$1 ORDER BY earned_at`, [user.id]
+      `SELECT ring_id, earned_via, earned_at FROM user_rings
+        WHERE user_id=$1 AND ring_id = ANY($2::text[]) ORDER BY earned_at`,
+      [user.id, [...RING_IDS]]
     )).rows;
-    res.json({ owned, equipped: u.equipped_ring || null, loginStreak: u.login_streak || 0 });
+    // Same for the equipped ring: a stale id would render a blank frame forever.
+    const equipped = u.equipped_ring && RING_IDS.has(u.equipped_ring) ? u.equipped_ring : null;
+    res.json({ owned, equipped, loginStreak: u.login_streak || 0 });
   } catch (err) { res.status(401).json({ error: err.message }); }
 });
 
