@@ -826,6 +826,177 @@ app.delete('/api/auth/avatar', requireAuth, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ACCOUNT DELETION  (App Store Guideline 5.1.1(v) — hard rejection without it)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Policy: ANONYMIZE, don't hard-delete.
+//   • Every piece of PII on the users row is wiped: name, email, phone, avatar,
+//     all provider credentials, device_id, RevenueCat id, birthday, streaks.
+//   • The row itself survives as a tombstone so public catches keep a valid
+//     foreign key and the feed / leaderboard / species records don't develop
+//     holes. The tombstone renders as "Deleted Angler" with the default avatar,
+//     because every surface already reads users.name / users.avatar.
+//   • public_profile flips false, so angler search and /api/anglers/:id both
+//     stop returning them (search filters on public_profile, the profile route
+//     404s on it). Nobody can navigate to a tombstone.
+//   • Credentials are nulled, so the account can never be logged back into and
+//     a future sign-in with the same Apple/Google id creates a fresh account.
+//     Any JWT still in the wild stops resolving on the next request because the
+//     provider-column lookup no longer matches anything.
+//
+// Cloudinary: the AVATAR is destroyed (it's a face, it's PII). Catch photos are
+// NOT touched — they're content the user published publicly and they hang off
+// catch rows that survive. Apple requires the account to be gone, not every
+// artifact the account ever produced.
+//
+// The wipe is built from information_schema rather than a hardcoded column
+// list. Several users columns were added by hand via psql over time and only
+// exist as comments in this file; a hardcoded UPDATE naming a missing column
+// would throw and take the whole deletion down. This touches what's actually
+// there and ignores the rest.
+
+const ACCOUNT_WIPE_TO_NULL = [
+  'email', 'avatar', 'phone',
+  'google_id', 'apple_id', 'auth_id', 'device_id',
+  'rc_user_id', 'club_expires_at', 'club_badge', 'equipped_ring',
+  'birthday_month', 'birthday_bonus_year', 'birthday_boost_at',
+  'shadowbanned_until', 'last_login_day',
+];
+const ACCOUNT_WIPE_TO_FALSE = [
+  'is_club', 'public_profile', 'is_admin', 'share_with_community',
+];
+const ACCOUNT_WIPE_TO_ZERO = [
+  'points_balance', 'login_streak',
+];
+
+let _usersColumnCache = null;
+async function usersColumnSet() {
+  if (_usersColumnCache) return _usersColumnCache;
+  const { rows } = await pool.query(
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'users'`
+  );
+  _usersColumnCache = new Set(rows.map(r => r.column_name));
+  return _usersColumnCache;
+}
+
+// Turn a Cloudinary secure_url back into the public_id needed by the destroy
+// API. Avatar URLs look like:
+//   https://res.cloudinary.com/<cloud>/image/upload/c_fill,g_face,w_400,h_400,f_webp,q_auto:good/avatars/abc123.webp
+// public_id is "avatars/abc123" — everything after /upload/, minus any leading
+// transformation segment, minus a version segment, minus the file extension.
+function cloudinaryPublicIdFromUrl(url) {
+  try {
+    if (typeof url !== 'string' || url.indexOf('/upload/') === -1) return null;
+    let tail = url.split('/upload/')[1];
+    if (!tail) return null;
+    const parts = tail.split('/');
+    // Drop a transformation segment (contains ',' or looks like "x_value").
+    if (parts.length > 1 && (parts[0].includes(',') || /^[a-z]{1,3}_/.test(parts[0]))) parts.shift();
+    // Drop a version segment ("v1712345678").
+    if (parts.length > 1 && /^v\d+$/.test(parts[0])) parts.shift();
+    const joined = parts.join('/');
+    if (!joined) return null;
+    return joined.replace(/\.[a-z0-9]+$/i, '');
+  } catch { return null; }
+}
+
+// Signed destroy. Best-effort: a Cloudinary failure must never block the DB
+// wipe, because a half-deleted account is worse than an orphaned image.
+async function destroyCloudinaryAsset(url) {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const apiKey    = process.env.CLOUDINARY_API_KEY;
+  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+  if (!cloudName || !apiKey || !apiSecret) return false;
+  const publicId = cloudinaryPublicIdFromUrl(url);
+  if (!publicId) return false;
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signatureBase = `public_id=${publicId}&timestamp=${timestamp}`;
+  const signature = crypto.createHash('sha1').update(signatureBase + apiSecret).digest('hex');
+
+  const form = new URLSearchParams();
+  form.append('public_id', publicId);
+  form.append('api_key', apiKey);
+  form.append('timestamp', String(timestamp));
+  form.append('signature', signature);
+
+  const r = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/destroy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form,
+  });
+  const data = await r.json();
+  return data?.result === 'ok';
+}
+
+// Resolve the numeric DB id for a JWT, using the same provider-column-then-
+// email fallback every other auth route uses.
+async function resolveDbUser(reqUser, columns = 'id') {
+  const column = PROVIDER_COLUMN[reqUser.provider] ?? 'google_id';
+  let { rows } = await pool.query(
+    `SELECT ${columns} FROM users WHERE ${column}=$1 LIMIT 1`, [reqUser.id]
+  );
+  if (!rows.length && reqUser.email) {
+    ({ rows } = await pool.query(
+      `SELECT ${columns} FROM users WHERE email=$1 LIMIT 1`, [reqUser.email]
+    ));
+  }
+  return rows[0] ?? null;
+}
+
+app.delete('/api/auth/account', requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    // Typed confirmation. The client makes the user type DELETE; requiring it
+    // server-side too means a stray fetch can't nuke an account.
+    const confirm = String(req.body?.confirm ?? '').trim().toUpperCase();
+    if (confirm !== 'DELETE') {
+      return res.status(400).json({ error: 'confirm must be "DELETE"' });
+    }
+
+    const me = await resolveDbUser(req.user, 'id, avatar, is_admin, is_deleted');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    if (me.is_deleted) return res.json({ ok: true, alreadyDeleted: true });
+
+    // Guardrail: the admin account is the only one that can moderate. Losing it
+    // to a mistap is unrecoverable. Deletion still works for every real user,
+    // and App Review is never signed in as an admin.
+    if (me.is_admin) {
+      return res.status(403).json({ error: 'Admin accounts cannot be deleted in-app.' });
+    }
+
+    const cols = await usersColumnSet();
+    const sets = [`name = 'Deleted Angler'`];
+    for (const c of ACCOUNT_WIPE_TO_NULL)  if (cols.has(c)) sets.push(`${c} = NULL`);
+    for (const c of ACCOUNT_WIPE_TO_FALSE) if (cols.has(c)) sets.push(`${c} = false`);
+    for (const c of ACCOUNT_WIPE_TO_ZERO)  if (cols.has(c)) sets.push(`${c} = 0`);
+    if (cols.has('is_deleted')) sets.push(`is_deleted = true`);
+    if (cols.has('deleted_at')) sets.push(`deleted_at = NOW()`);
+
+    await client.query('BEGIN');
+    await client.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $1`, [me.id]);
+    await client.query(`DELETE FROM push_tokens WHERE user_id = $1`, [me.id]);
+    await client.query('COMMIT');
+
+    // Post-commit, best-effort. The account is already gone either way.
+    if (me.avatar) {
+      destroyCloudinaryAsset(me.avatar)
+        .catch(e => console.error('[delete-account] avatar destroy:', e?.message));
+    }
+
+    console.log(`[delete-account] anonymized user ${me.id}`);
+    res.json({ ok: true, userId: me.id });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('[delete-account] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 const REGION_SPECIES = {
   southeast: [
     // Inshore staples
@@ -1746,6 +1917,7 @@ app.get('/api/anglers/search', async (req, res) => {
          FROM users u
          LEFT JOIN catches c ON c.user_id = u.id AND c.is_public = true
         WHERE u.public_profile = true
+          AND COALESCE(u.is_deleted, false) = false
           AND u.name ILIKE $1
         GROUP BY u.id
         ORDER BY (u.name ILIKE $2) DESC, COUNT(c.id) DESC, u.name ASC
@@ -4485,6 +4657,10 @@ pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_expires_at TIMESTAMP
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_badge      TEXT`).catch(e => console.error('[init] club_badge:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS public_profile  BOOLEAN DEFAULT false`).catch(e => console.error('[init] public_profile:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo         BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_demo:', e.message));
+
+// Account deletion tombstone columns. See DELETE /api/auth/account above.
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_deleted:', e.message));
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`).catch(e => console.error('[init] deleted_at:', e.message));
 pool.query(`
   CREATE TABLE IF NOT EXISTS moderation_log (
     id         SERIAL PRIMARY KEY,
