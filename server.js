@@ -69,12 +69,12 @@ app.use(express.json({ limit: '10mb' }));
 async function getOrCreateUser(deviceId) {
   if (!deviceId) throw new Error('deviceId required');
   const existing = await pool.query(
-    'SELECT id, points_balance FROM users WHERE device_id = $1', [deviceId]
+    'SELECT id, points_balance, lifetime_points FROM users WHERE device_id = $1', [deviceId]
   );
   if (existing.rows.length) return existing.rows[0];
   const created = await pool.query(
     `INSERT INTO users (device_id, points_balance, created_at)
-     VALUES ($1, 0, NOW()) RETURNING id, points_balance`, [deviceId]
+     VALUES ($1, 0, NOW()) RETURNING id, points_balance, lifetime_points`, [deviceId]
   );
   return created.rows[0];
 }
@@ -191,7 +191,13 @@ async function mergeDeviceUser(deviceId, targetUser, idColumn) {
     await client.query('UPDATE spots SET user_id=$1 WHERE user_id=$2', [targetUser.id, deviceUser.id]);
     await client.query('UPDATE comments SET user_id=$1 WHERE user_id=$2', [targetUser.id, deviceUser.id]);
     await client.query('DELETE FROM likes WHERE user_id=$1', [deviceUser.id]); // guest likes dropped (avoid unique clash)
-    await client.query('UPDATE users SET points_balance=points_balance+$1 WHERE id=$2', [deviceUser.points_balance, targetUser.id]);
+    await client.query(
+      // Merge, not an earn: carry the lifetime total across too or the angler
+      // silently loses rank when their guest device is linked to a real account.
+      `UPDATE users SET points_balance = points_balance + $1,
+                        lifetime_points = lifetime_points + $2
+        WHERE id = $3`,
+      [deviceUser.points_balance, deviceUser.lifetime_points ?? deviceUser.points_balance, targetUser.id]);
     // Delete the guest row FIRST so its device_id is released, THEN move the
     // device onto the target. Doing it the other way makes two rows briefly hold
     // the same device_id and UNIQUE(device_id) throws (the dup-account crash).
@@ -1090,7 +1096,7 @@ async function awardNewSpeciesBonus(userId, species, hasPhoto) {
     } catch {
       return null; // already earned this season (or table rejected it) — no double pay
     }
-    await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [NEW_SPECIES_BONUS, userId]);
+    await addBones(userId, NEW_SPECIES_BONUS);
     await pool.query(
       `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'new_species',$3,NOW())`,
       [userId, NEW_SPECIES_BONUS, key]
@@ -1273,7 +1279,7 @@ async function awardMilestones(userId, currentSpecies, currentHasPhoto) {
         continue; // don't award points if we couldn't record the milestone
       }
       // Bonus points ON TOP of the daily cap.
-      await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [def.points, userId]);
+      await addBones(userId, def.points);
       await pool.query(
         `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'milestone',$3,NOW())`,
         [userId, def.points, key]
@@ -1388,7 +1394,7 @@ app.post('/api/catches', async (req, res) => {
     // Shadowbanned users' posts are created hidden — visible to them, nobody else.
     if (await isShadowbanned(user.id)) await pool.query(`UPDATE catches SET hidden=true WHERE id=$1`, [newCatch.id]).catch(() => {});
     if (ptsAwarded > 0) {
-      await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [ptsAwarded, user.id]);
+      await addBones(user.id, ptsAwarded);
       await pool.query(`INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'catch',$3,NOW())`, [user.id, ptsAwarded, newCatch.id.toString()]);
     }
 
@@ -1418,7 +1424,7 @@ app.post('/api/catches', async (req, res) => {
             pbBonus = { ...pbCommon, key: `${pbKey}_unmeasured_${newCatch.id}`, label: `New record ${String(species).replace(/_/g, ' ')}: ${lengthIn}"`, points: 0, pbUnmeasured: true };
           } else try {
             await pool.query(`INSERT INTO milestones (user_id, key) VALUES ($1,$2)`, [user.id, pbKey]);
-            await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [PB_BONUS, user.id]);
+            await addBones(user.id, PB_BONUS);
             await pool.query(
               `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'personal_best',$3,NOW())`,
               [user.id, PB_BONUS, pbKey]
@@ -2364,6 +2370,27 @@ pool.query(`
 pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS birthday_boost_at TIMESTAMPTZ`).catch(() => {});
 
+// Lifetime bones: every bone ever EARNED, never reduced by spending.
+// points_balance is the spendable wallet; lifetime_points is the rank.
+// Tiers read from lifetime so redeeming a shirt can't demote a Legend — you
+// can't un-earn the fish you caught.
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS lifetime_points INTEGER NOT NULL DEFAULT 0`)
+  .then(() =>
+    // Backfill once: sum every positive ledger entry. Falls back to the current
+    // balance for accounts that predate the ledger (a balance you hold is a
+    // floor on what you must have earned). Runs only where it's still 0, so it
+    // can't clobber live values on a later boot.
+    pool.query(`
+      UPDATE users u SET lifetime_points = GREATEST(
+        COALESCE((SELECT SUM(t.delta)::int FROM points_transactions t
+                   WHERE t.user_id = u.id AND t.delta > 0), 0),
+        COALESCE(u.points_balance, 0)
+      )
+      WHERE u.lifetime_points = 0
+    `)
+  )
+  .catch(e => console.warn('lifetime_points migration:', e.message));
+
 // ── Spot polls table ──────────────────────────────────────────────────────────
 pool.query(`
   CREATE TABLE IF NOT EXISTS spot_polls (
@@ -3131,7 +3158,7 @@ app.post('/api/daily-login', async (req, res) => {
 
     const isMilestone = STREAK_RINGS[streak] != null;
     const bones = isMilestone ? 25 : 10;
-    await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [bones, user.id]);
+    await addBones(user.id, bones);
     await pool.query(
       `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'daily_login',$3,NOW())`,
       [user.id, bones, `day_${streak}`]
@@ -4207,18 +4234,44 @@ app.get('/api/rewards/profile', async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     const { rows: todayRows } = await pool.query(`SELECT COALESCE(SUM(pts_awarded),0) AS total FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2`, [user.id, today]);
     const { rows: milestoneRows } = await pool.query(`SELECT key FROM milestones WHERE user_id=$1`, [user.id]);
-    res.json({ pointsBalance: user.points_balance, tier: getTierKey(user.points_balance), dailyPtsEarned: parseInt(todayRows[0].total), dailyPtsDate: today, completedMilestones: milestoneRows.map(r => r.key) });
+    // Rank is LIFETIME, wallet is balance. Ranking on the balance meant every
+    // redemption demoted you - buy a shirt, lose Legend.
+    res.json({
+      pointsBalance: user.points_balance,
+      lifetimePoints: user.lifetime_points ?? user.points_balance,
+      tier: getTierKey(user.lifetime_points ?? user.points_balance),
+      dailyPtsEarned: parseInt(todayRows[0].total),
+      dailyPtsDate: today,
+      completedMilestones: milestoneRows.map(r => r.key),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Six-tier bones ladder. These thresholds are PRINTED ON THE BADGE ARTWORK
-// ("1,000+ POINTS"), so the art is the contract and this must match it — and
+// Award bones. ALWAYS use this to grant — it moves the spendable wallet and the
+// lifetime total together. Updating points_balance directly is how a Legend ends
+// up demoted for buying a shirt: rank is computed from lifetime_points, so an
+// earn that skips this helper is a bone the angler never gets credit for.
+// Spending is the ONLY operation that touches points_balance alone.
+async function addBones(userId, amount, db = pool) {
+  const amt = Math.round(Number(amount) || 0);
+  if (amt <= 0 || !userId) return;
+  await db.query(
+    `UPDATE users SET points_balance = points_balance + $1,
+                      lifetime_points = lifetime_points + $1
+      WHERE id = $2`,
+    [amt, userId]
+  );
+}
+
+// Six-tier bones ladder. Thresholds are PRINTED ON THE BADGE ARTWORK
+// ("1,000+ POINTS"), so the art is the contract and this must match it —
 // tiersCatalog.js on the client mirrors it.
 //
-// Was four tiers with thresholds that contradicted the badges: cast_member at 0
-// (art says 100+), marsh_guide at 3000 (art says 1,000+), bone_tide_legend at
-// 5000 (art says 10,000+), plus a 'tide_angler' tier that has no badge at all,
-// and no deckhand/tide_tracker/coastal_captain despite art existing for each.
+// Reads LIFETIME bones, never the spendable balance. Was four tiers with
+// thresholds that contradicted the badges: cast_member at 0 (art says 100+),
+// marsh_guide at 3000 (art says 1,000+), bone_tide_legend at 5000 (art says
+// 10,000+), plus a 'tide_angler' tier with no badge at all, and no
+// deckhand/tide_tracker/coastal_captain despite art existing for each.
 function getTierKey(pts) {
   const p = pts ?? 0;
   if (p >= 10000) return 'bone_tide_legend';
@@ -5544,7 +5597,7 @@ app.post('/api/admin/appeals/:id/resolve', requireAdmin, async (req, res) => {
     let awarded = 0;
     if (decision === 'granted') {
       awarded = PTS_PER_CATCH;
-      await pool.query(`UPDATE users SET points_balance=points_balance+$1 WHERE id=$2`, [awarded, appeal.user_id]);
+      await addBones(appeal.user_id, awarded);
       await pool.query(
         `INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'appeal',$3,NOW())`,
         [appeal.user_id, awarded, String(appeal.catch_id ?? appeal.id)]
