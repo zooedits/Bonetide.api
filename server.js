@@ -3259,7 +3259,7 @@ app.get('/api/conditions', async (req, res) => {
   try {
     const [marineRes, forecastRes] = await Promise.all([
       fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=wave_height,wave_period,wave_direction&wind_speed_unit=kn&length_unit=imperial`),
-      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation_probability&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
+      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,surface_pressure&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
     ]);
     const marine = await marineRes.json();
     const forecast = await forecastRes.json();
@@ -3287,7 +3287,7 @@ app.get('/api/conditions', async (req, res) => {
 
     const data = {
       wind: { speedKts: Math.round(windKts), direction: windDir, directionDeg: cur?.wind_direction_10m ?? 0, speedCategory: windCategory(windKts), gustKts: Math.round(windKts * 1.3) },
-      pressure: { inHg: parseFloat((pressHpa * 0.02953).toFixed(2)), trend: 'stable' },
+      pressure: { inHg: parseFloat((pressHpa * 0.02953).toFixed(2)), trend: baroTrendFrom(forecast.hourly?.surface_pressure, nowIdx), absCat: baroAbsCat(pressHpa) },
       waveHeight: mari?.wave_height ?? null,
       wavePeriod: mari?.wave_period ?? null,
       waveDir: mari?.wave_direction != null ? degreesToCardinal(mari.wave_direction) + ` ${mari.wave_direction}°` : null,
@@ -3697,6 +3697,33 @@ function windCategory(kts) {
   if (kts < 5) return 'calm'; if (kts < 15) return 'light';
   if (kts < 25) return 'moderate'; if (kts < 35) return 'strong'; return 'gale';
 }
+
+// Barometric trend over the 3 hours around a given hourly index. The Good Bite
+// engine weights pressure up to 20 pts and treats falling_fast as a veto, but
+// /api/conditions used to hardcode trend:'stable', so pressure has effectively
+// never moved the score. Thresholds are in hPa over 3h: ~1 hPa/3h is a normal
+// gentle change, 3+ hPa/3h is a front moving through.
+function baroTrendFrom(pressureSeries, idx) {
+  if (!Array.isArray(pressureSeries)) return 'stable';
+  const here = pressureSeries[idx];
+  const prev = pressureSeries[Math.max(0, idx - 3)];
+  if (here == null || prev == null) return 'stable';
+  const d = here - prev;
+  if (d >= 3)   return 'rising_fast';
+  if (d >= 0.7) return 'rising_slow';
+  if (d <= -3)  return 'falling_fast';
+  if (d <= -0.7) return 'falling_slow';
+  return 'stable';
+}
+
+// Absolute pressure band. Fish respond to where pressure sits, not just where
+// it's heading: sustained low is the classic lock-jaw signal.
+function baroAbsCat(hPa) {
+  if (hPa == null) return 'normal';
+  if (hPa >= 1022) return 'high';
+  if (hPa <= 1009) return 'low';
+  return 'normal';
+}
 function computeMoonPhase(date) {
   // Known new moon reference: Jan 6, 2000 18:14 UTC
   const knownNewMoon = new Date('2000-01-06T18:14:00Z').getTime();
@@ -3827,8 +3854,11 @@ function _crossTime(t1, a1, t2, a2, target) {
   return t1 + f * (t2 - t1);
 }
 
-function computeSolunar(lat, lon) {
-  const now = new Date();
+// atDate lets this be computed for a FUTURE moment, not just now - that's what
+// makes a multi-day forecast possible. Defaults to now, so every existing caller
+// is unaffected.
+function computeSolunar(lat, lon, atDate) {
+  const now = atDate ? new Date(atDate) : new Date();
   const moon = computeMoonPhase(now);
 
   // Sample altitude from 12h before to 24h after now, every 10 minutes.
@@ -3902,6 +3932,180 @@ function computeSolunar(lat, lon) {
     majorWindows,
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/bonecast — 7-day personalized bite forecast
+//
+// Deliberately returns RAW CONDITIONS, not scores. goodBiteEngine.js on the
+// client is the only thing that turns conditions into a number; if this endpoint
+// scored them too there'd be two copies of the scoring rules and they'd drift
+// apart the first time a weight got tuned. So: server gathers the inputs, client
+// runs the same engine it already uses for the live Home score, and the forecast
+// can never disagree with it.
+//
+// Query: lat, lon, station (NOAA tide station id), days (1-7)
+// Returns: { days: [{ date, tideRangeFt, moonPhase, moonPhaseName, moonPct,
+//                     extremes: [{type,t,v}], slots: [{ at, inputs }] }] }
+// ─────────────────────────────────────────────────────────────────────────────
+const bonecastCache = new Map();
+
+app.get('/api/bonecast', async (req, res) => {
+  const { lat, lon, station } = req.query;
+  const days = Math.max(1, Math.min(7, parseInt(req.query.days ?? '7', 10) || 7));
+  if (!lat || !lon) return res.status(400).json({ error: 'lat and lon required' });
+
+  const cacheKey = `${parseFloat(lat).toFixed(2)}_${parseFloat(lon).toFixed(2)}_${station || 'none'}_${days}`;
+  const cached = bonecastCache.get(cacheKey);
+  // 3h cache: tide predictions are fixed and the weather model only refreshes
+  // every few hours, so recomputing per app-open would burn calls for nothing.
+  if (cached && (Date.now() - cached.fetchedAt) < 3 * 3600 * 1000) return res.json(cached.data);
+
+  try {
+    const latN = parseFloat(lat), lonN = parseFloat(lon);
+    const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
+    const start = new Date();
+    const end = new Date(Date.now() + days * 24 * 3600 * 1000);
+
+    const [wxRes, tideRes, hiloRes] = await Promise.all([
+      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
+        + `&hourly=wind_speed_10m,wind_direction_10m,surface_pressure`
+        + `&forecast_days=${days + 1}&wind_speed_unit=kn&timezone=GMT`,
+        { signal: AbortSignal.timeout(8000) }),
+      station
+        ? fetch(`https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(start)}&end_date=${fmt(end)}`
+            + `&station=${station}&product=predictions&datum=MLLW&time_zone=gmt&interval=h&units=english`
+            + `&application=bonetideco&format=json`, { signal: AbortSignal.timeout(8000) })
+        : Promise.resolve(null),
+      station
+        ? fetch(`https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(start)}&end_date=${fmt(end)}`
+            + `&station=${station}&product=predictions&datum=MLLW&time_zone=gmt&interval=hilo&units=english`
+            + `&application=bonetideco&format=json`, { signal: AbortSignal.timeout(8000) })
+        : Promise.resolve(null),
+    ]);
+
+    const wx = await wxRes.json();
+    const tide = tideRes ? await tideRes.json().catch(() => null) : null;
+    const hilo = hiloRes ? await hiloRes.json().catch(() => null) : null;
+
+    const wxTimes = wx.hourly?.time ?? [];
+    const wxSpeed = wx.hourly?.wind_speed_10m ?? [];
+    const wxDir   = wx.hourly?.wind_direction_10m ?? [];
+    const wxPress = wx.hourly?.surface_pressure ?? [];
+    // Open-Meteo returns "2026-07-15T06:00" with timezone=GMT and no suffix.
+    const wxMs = wxTimes.map(t => Date.parse(t.endsWith('Z') ? t : t + 'Z'));
+
+    const preds = (tide?.predictions ?? []).map(p => ({ ms: Date.parse(p.t.replace(' ', 'T') + 'Z'), v: parseFloat(p.v) }));
+    const extremes = (hilo?.predictions ?? []).map(p => ({
+      ms: Date.parse(p.t.replace(' ', 'T') + 'Z'), v: parseFloat(p.v), type: p.type === 'H' ? 'high' : 'low',
+    }));
+
+    const nearestIdx = (arr, ms) => {
+      if (!arr.length) return -1;
+      let best = 0, bestD = Infinity;
+      for (let i = 0; i < arr.length; i++) { const d = Math.abs(arr[i] - ms); if (d < bestD) { bestD = d; best = i; } }
+      return bestD <= 90 * 60 * 1000 ? best : -1;
+    };
+
+    // Tide phase at an instant, derived the same way /api/tides does it: the
+    // rate of change between the bracketing hourly predictions.
+    const tidePhaseAt = (ms) => {
+      if (preds.length < 2) return null;
+      for (let i = 0; i < preds.length - 1; i++) {
+        if (preds[i].ms <= ms && preds[i + 1].ms > ms) {
+          const rising = preds[i + 1].v > preds[i].v;
+          const slack = Math.abs(preds[i + 1].v - preds[i].v) < 0.3;
+          return slack ? (rising ? 'slack_high' : 'slack_low') : (rising ? 'incoming_fast' : 'outgoing_fast');
+        }
+      }
+      return null;
+    };
+
+    const out = [];
+    for (let d = 0; d < days; d++) {
+      const dayStart = new Date(Date.now() + d * 24 * 3600 * 1000);
+      dayStart.setUTCHours(0, 0, 0, 0);
+      const dayEnd = dayStart.getTime() + 24 * 3600 * 1000;
+
+      const dayExtremes = extremes.filter(e => e.ms >= dayStart.getTime() && e.ms < dayEnd);
+      const highs = dayExtremes.filter(e => e.type === 'high').map(e => e.v);
+      const lows  = dayExtremes.filter(e => e.type === 'low').map(e => e.v);
+      const tideRangeFt = (highs.length && lows.length)
+        ? +(Math.max(...highs) - Math.min(...lows)).toFixed(1)
+        : 6;
+
+      // Solunar is expensive (it samples moon altitude every 10 min across 36h),
+      // so compute it ONCE per day and read each slot's window off the periods
+      // it returns rather than calling it per slot.
+      const sol = computeSolunar(latN, lonN, new Date(dayStart.getTime() + 12 * 3600 * 1000));
+      const periods = sol.periods ?? [];
+      const windowAt = (ms) => {
+        if (periods.some(p => p.type === 'major' && ms >= p.start && ms <= p.end)) return 'major_peak';
+        if (periods.some(p => p.type === 'minor' && ms >= p.start && ms <= p.end)) return 'minor_peak';
+        const soon = periods.filter(p => p.start > ms && p.start - ms <= 3600 * 1000).sort((a, b) => a.start - b.start)[0];
+        if (soon) return soon.type === 'major' ? 'major_near' : 'minor_near';
+        return 'between';
+      };
+      // Local hour from longitude, matching computeSolunar's own approximation.
+      const localHour = ms => (((new Date(ms).getUTCHours() + new Date(ms).getUTCMinutes() / 60) + lonN / 15) % 24 + 24) % 24;
+
+      const slots = [];
+      // Every hour of daylight-ish. The client scores each and keeps the best,
+      // which is what turns "this day" into "fish this window".
+      for (let h = 0; h < 24; h++) {
+        const ms = dayStart.getTime() + h * 3600 * 1000;
+        if (ms < Date.now() - 3600 * 1000) continue; // don't forecast the past
+        const lh = localHour(ms);
+        if (lh < 4.5 || lh > 21) continue;
+
+        const wi = nearestIdx(wxMs, ms);
+        if (wi < 0) continue;
+        const phase = tidePhaseAt(ms);
+
+        slots.push({
+          at: ms,
+          localHour: +lh.toFixed(2),
+          inputs: {
+            tidePhase:         phase ?? 'slack_low',
+            tideRangeFt,
+            waterHeightCat:    'optimal',
+            baroTrend:         baroTrendFrom(wxPress, wi),
+            baroAbsCat:        baroAbsCat(wxPress[wi]),
+            windSpeedCategory: windCategory(wxSpeed[wi] ?? 0),
+            windDirection:     degreesToCardinal(wxDir[wi] ?? 0),
+            solunarWindow:     windowAt(ms),
+            moonPhase:         sol.moonPhase,
+            lightWindow:       lh < 7.5 ? 'dawn' : lh > 19.5 ? 'dusk' : 'other',
+          },
+          windKts: Math.round(wxSpeed[wi] ?? 0),
+          windDir: degreesToCardinal(wxDir[wi] ?? 0),
+          pressureInHg: wxPress[wi] != null ? +(wxPress[wi] * 0.02953).toFixed(2) : null,
+        });
+      }
+
+      out.push({
+        date: dayStart.toISOString().slice(0, 10),
+        dateMs: dayStart.getTime(),
+        tideRangeFt,
+        hasTide: preds.length > 0,
+        moonPhase: sol.moonPhase,
+        moonPhaseName: sol.moonPhaseName,
+        moonPhaseEmoji: sol.moonPhaseEmoji,
+        moonPct: sol.moonPct,
+        majorWindows: (periods.filter(p => p.type === 'major' && p.peak >= dayStart.getTime() && p.peak < dayEnd))
+          .map(p => ({ start: p.start, end: p.end, peak: p.peak })),
+        extremes: dayExtremes.map(e => ({ type: e.type, at: e.ms, v: +e.v.toFixed(1) })),
+        slots,
+      });
+    }
+
+    const data = { days: out, station: station ?? null, generatedAt: new Date().toISOString() };
+    bonecastCache.set(cacheKey, { data, fetchedAt: Date.now() });
+    res.json(data);
+  } catch (err) {
+    console.error('BoneCast error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.get('/api/rewards/profile', async (req, res) => {
   const { deviceId } = req.query;
