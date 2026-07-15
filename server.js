@@ -4017,7 +4017,14 @@ app.get('/api/bonecast', async (req, res) => {
     const [wxRes, tideRes, hiloRes] = await Promise.all([
       fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
         + `&hourly=wind_speed_10m,wind_direction_10m,surface_pressure`
-        + `&forecast_days=${days + 1}&wind_speed_unit=kn&timezone=GMT`,
+        + `&forecast_days=${days + 1}&wind_speed_unit=kn`
+        // timezone=auto gives us the angler's REAL clock offset (incl. DST);
+        // timeformat=unixtime keeps the timestamps unambiguous UTC epochs so we
+        // never have to parse a local-time string. Deriving local time from
+        // longitude instead (lon/15) is solar time, which is over an hour off
+        // real clock time on the Georgia coast - every window we printed was
+        // wrong, and UTC day boundaries put evening hours on the wrong weekday.
+        + `&timezone=auto&timeformat=unixtime`,
         { signal: AbortSignal.timeout(8000) }),
       station
         ? fetch(`https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(start)}&end_date=${fmt(end)}`
@@ -4039,8 +4046,16 @@ app.get('/api/bonecast', async (req, res) => {
     const wxSpeed = wx.hourly?.wind_speed_10m ?? [];
     const wxDir   = wx.hourly?.wind_direction_10m ?? [];
     const wxPress = wx.hourly?.surface_pressure ?? [];
-    // Open-Meteo returns "2026-07-15T06:00" with timezone=GMT and no suffix.
-    const wxMs = wxTimes.map(t => Date.parse(t.endsWith('Z') ? t : t + 'Z'));
+    // timeformat=unixtime → seconds since epoch, UTC, no string parsing.
+    const wxMs = wxTimes.map(t => t * 1000);
+    // Fall back to whole-hour longitude estimate only if Open-Meteo omits it.
+    const tzOffSec = Number.isFinite(wx.utc_offset_seconds)
+      ? wx.utc_offset_seconds
+      : Math.round(parseFloat(lon) / 15) * 3600;
+    const tzOffMs = tzOffSec * 1000;
+    // "Local hour" and "which day" both have to be measured in the angler's
+    // clock, not UTC. Shift into local space and read with UTC getters.
+    const localHour = ms => ((ms + tzOffMs) / 3600000) % 24;
 
     const preds = (tide?.predictions ?? []).map(p => ({ ms: Date.parse(p.t.replace(' ', 'T') + 'Z'), v: parseFloat(p.v) }));
     const extremes = (hilo?.predictions ?? []).map(p => ({
@@ -4068,13 +4083,19 @@ app.get('/api/bonecast', async (req, res) => {
       return null;
     };
 
+    // Day boundaries in the angler's LOCAL clock. UTC midnight is 8pm the
+    // previous day in Georgia, so UTC days put evening hours on the wrong
+    // weekday - which silently broke "your fishing days".
+    const localMidnightUtcMs = Math.floor((Date.now() + tzOffMs) / 86400000) * 86400000 - tzOffMs;
+
     const out = [];
     for (let d = 0; d < days; d++) {
-      const dayStart = new Date(Date.now() + d * 24 * 3600 * 1000);
-      dayStart.setUTCHours(0, 0, 0, 0);
-      const dayEnd = dayStart.getTime() + 24 * 3600 * 1000;
+      const dayStartMs = localMidnightUtcMs + d * 86400000;
+      const dayEnd = dayStartMs + 86400000;
+      // Read weekday/date in local space so the label matches the angler's calendar.
+      const localDate = new Date(dayStartMs + tzOffMs);
 
-      const dayExtremes = extremes.filter(e => e.ms >= dayStart.getTime() && e.ms < dayEnd);
+      const dayExtremes = extremes.filter(e => e.ms >= dayStartMs && e.ms < dayEnd);
       const highs = dayExtremes.filter(e => e.type === 'high').map(e => e.v);
       const lows  = dayExtremes.filter(e => e.type === 'low').map(e => e.v);
       const tideRangeFt = (highs.length && lows.length)
@@ -4084,7 +4105,7 @@ app.get('/api/bonecast', async (req, res) => {
       // Solunar is expensive (it samples moon altitude every 10 min across 36h),
       // so compute it ONCE per day and read each slot's window off the periods
       // it returns rather than calling it per slot.
-      const sol = computeSolunar(latN, lonN, new Date(dayStart.getTime() + 12 * 3600 * 1000));
+      const sol = computeSolunar(latN, lonN, new Date(dayStartMs + 12 * 3600 * 1000));
       const periods = sol.periods ?? [];
       const windowAt = (ms) => {
         if (periods.some(p => p.type === 'major' && ms >= p.start && ms <= p.end)) return 'major_peak';
@@ -4093,14 +4114,12 @@ app.get('/api/bonecast', async (req, res) => {
         if (soon) return soon.type === 'major' ? 'major_near' : 'minor_near';
         return 'between';
       };
-      // Local hour from longitude, matching computeSolunar's own approximation.
-      const localHour = ms => (((new Date(ms).getUTCHours() + new Date(ms).getUTCMinutes() / 60) + lonN / 15) % 24 + 24) % 24;
 
       const slots = [];
-      // Every hour of daylight-ish. The client scores each and keeps the best,
+      // Every fishable hour. The client scores each and keeps the best windows,
       // which is what turns "this day" into "fish this window".
       for (let h = 0; h < 24; h++) {
-        const ms = dayStart.getTime() + h * 3600 * 1000;
+        const ms = dayStartMs + h * 3600 * 1000;
         if (ms < Date.now() - 3600 * 1000) continue; // don't forecast the past
         const lh = localHour(ms);
         if (lh < 4.5 || lh > 21) continue;
@@ -4131,22 +4150,26 @@ app.get('/api/bonecast', async (req, res) => {
       }
 
       out.push({
-        date: dayStart.toISOString().slice(0, 10),
-        dateMs: dayStart.getTime(),
+        // Local calendar date + weekday, computed server-side. The client used to
+        // derive the weekday from a UTC-midnight timestamp, which lands on the
+        // previous day west of Greenwich.
+        date: localDate.toISOString().slice(0, 10),
+        dow: localDate.getUTCDay(),
+        dateMs: dayStartMs,
         tideRangeFt,
         hasTide: preds.length > 0,
         moonPhase: sol.moonPhase,
         moonPhaseName: sol.moonPhaseName,
         moonPhaseEmoji: sol.moonPhaseEmoji,
         moonPct: sol.moonPct,
-        majorWindows: (periods.filter(p => p.type === 'major' && p.peak >= dayStart.getTime() && p.peak < dayEnd))
+        majorWindows: (periods.filter(p => p.type === 'major' && p.peak >= dayStartMs && p.peak < dayEnd))
           .map(p => ({ start: p.start, end: p.end, peak: p.peak })),
         extremes: dayExtremes.map(e => ({ type: e.type, at: e.ms, v: +e.v.toFixed(1) })),
         slots,
       });
     }
 
-    const data = { days: out, station: station ?? null, generatedAt: new Date().toISOString() };
+    const data = { days: out, station: station ?? null, utcOffsetSeconds: tzOffSec, generatedAt: new Date().toISOString() };
     bonecastCache.set(cacheKey, { data, fetchedAt: Date.now() });
     res.json(data);
   } catch (err) {
