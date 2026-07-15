@@ -3607,7 +3607,23 @@ async function getNoaaWaterTemp(lat, lon) {
 const marineCache = new Map();
 
 app.get('/api/marine', async (req, res) => {
-  const { lat = '31.1234', lon = '-81.4567' } = req.query;
+  const { station } = req.query;
+  let { lat = '31.1234', lon = '-81.4567' } = req.query;
+
+  // Marine conditions describe THE WATER YOU FISH, not where you're standing.
+  // Tides already resolve against the angler's home station; marine used raw GPS,
+  // so anyone inland (Statesboro is ~50 miles from the coast) asked an open-ocean
+  // model about a spot with no ocean in it and got nulls back — currents were
+  // permanently blank, and water temp/waves silently fell through to /api/conditions.
+  // Snapping to the station's coords fixes all of it and makes the two agree.
+  if (station) {
+    try {
+      const stations = await getTideStationList();
+      const st = stations.find(s => String(s.id) === String(station));
+      if (st) { lat = String(st.lat); lon = String(st.lon); }
+    } catch { /* fall through to raw GPS */ }
+  }
+
   const cacheKey = `${parseFloat(lat).toFixed(2)}_${parseFloat(lon).toFixed(2)}`;
   const cached = marineCache.get(cacheKey);
   if (cached && (Date.now() - cached.fetchedAt) < 60 * 60 * 1000) return res.json(cached.data);
@@ -3729,6 +3745,11 @@ app.get('/api/marine', async (req, res) => {
       source: buoyData ? `open-meteo-marine+ndbc-${buoyData.buoyId}+${currentSource}` : currentSource,
     };
 
+    // Be honest about which water this reading describes - it's the station's
+    // coords, not necessarily where the angler is standing.
+    data.station = station ?? null;
+    data.atLat = parseFloat(lat);
+    data.atLon = parseFloat(lon);
     marineCache.set(cacheKey, { data, fetchedAt: Date.now() });
     res.json(data);
   } catch (err) {
