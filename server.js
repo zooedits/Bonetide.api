@@ -1722,6 +1722,47 @@ function formatCatch(row) {
 // Public angler profile — opt-in only (public_profile=true). Guest-readable like
 // the other community reads. Returns identity + shared catches with exact coords
 // omitted (so activity patterns can't be mined). 404 when not opted in.
+// GET /api/anglers/search?q=  — find anglers by name.
+// Only surfaces public_profile = true, matching /api/anglers/:id. A private
+// angler must not be discoverable OR fetchable, or the privacy toggle is just
+// decoration. Guest-readable like the other community reads.
+app.get('/api/anglers/search', async (req, res) => {
+  try {
+    const q = String(req.query.q ?? '').trim();
+    if (q.length < 2) return res.json({ anglers: [] });
+    const limit = Math.min(30, parseInt(req.query.limit ?? '20', 10) || 20);
+
+    // Prefix matches rank above contains-matches: typing "ma" should surface
+    // "Marlin Mike" before "Fisherman Joe".
+    const { rows } = await pool.query(
+      `SELECT u.id, u.name, u.avatar, u.is_club, u.club_badge, u.equipped_ring,
+              COUNT(c.id)::int AS public_catch_count
+         FROM users u
+         LEFT JOIN catches c ON c.user_id = u.id AND c.is_public = true
+        WHERE u.public_profile = true
+          AND u.name ILIKE $1
+        GROUP BY u.id
+        ORDER BY (u.name ILIKE $2) DESC, COUNT(c.id) DESC, u.name ASC
+        LIMIT $3`,
+      [`%${q}%`, `${q}%`, limit]
+    );
+
+    res.json({
+      anglers: rows.map(u => ({
+        id: u.id,
+        name: u.name ?? null,
+        avatar: u.avatar ?? null,
+        isClub: !!u.is_club,
+        clubBadge: u.club_badge ?? null,
+        ringId: u.equipped_ring ?? null,
+        publicCatchCount: u.public_catch_count ?? 0,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/anglers/:id', async (req, res) => {
   try {
     const { rows: [u] } = await pool.query(
