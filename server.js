@@ -99,6 +99,12 @@ async function getUserFromRequest(req) {
   throw new Error('No auth token or deviceId');
 }
 
+// Railway's healthcheck pings a configured path and needs a 2xx to mark the
+// deploy live. It defaults to "/", and with no route mounted there Express
+// answers 404 - the deploy then fails at the healthcheck step even though the
+// build and the app itself are fine. Answer on both paths so the deploy can't
+// fail over a path mismatch.
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'Bone Tide Co. API' }));
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Bone Tide Co. API' }));
 
 // ─────────────────────────────────────────────────────────────────────────────
