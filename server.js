@@ -1467,7 +1467,8 @@ app.get('/api/catches', async (req, res) => {
          FROM catches c
          JOIN users u ON u.id = c.user_id
          WHERE u.share_with_community = true AND c.is_public = true
-         ORDER BY c.id DESC LIMIT $1 OFFSET $2`,  -- upload order: every catch gets its moment
+         -- upload order: every catch gets its moment
+         ORDER BY c.id DESC LIMIT $1 OFFSET $2`,
         [limit, offset]
       );
       const catches = rows.map(row => {
