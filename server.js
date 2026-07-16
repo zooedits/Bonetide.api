@@ -2072,10 +2072,36 @@ app.get('/api/anglers/search', async (req, res) => {
 app.get('/api/anglers/:id', async (req, res) => {
   try {
     const { rows: [u] } = await pool.query(
-      `SELECT id, name, avatar, is_club, club_badge, equipped_ring, public_profile FROM users WHERE id=$1`,
+      `SELECT id, name, avatar, is_club, club_badge, equipped_ring, public_profile,
+              COALESCE(is_deleted, false) AS is_deleted
+         FROM users WHERE id=$1`,
       [req.params.id]
     );
     if (!u || !u.public_profile) return res.status(404).json({ error: 'Profile not available' });
+    // A tombstoned account is gone, not private. Same 404 either way so the
+    // response can't be used to tell the difference.
+    if (u.is_deleted) return res.status(404).json({ error: 'Profile not available' });
+
+    // Who's looking. Guest-readable, so an unidentified reader just gets no
+    // follow state and no block filtering.
+    let meId = null;
+    try {
+      const me = await getUserFromRequest(req);
+      const n = Number.parseInt(me?.id, 10);
+      meId = Number.isInteger(n) ? n : null;
+    } catch { /* signed out */ }
+
+    // A blocked pair can't see each other's profiles, in either direction. Same
+    // 404 as a private profile — a distinct error would confirm the block
+    // exists, which is exactly what someone blocking a harasser doesn't want.
+    if (meId && meId !== u.id) {
+      const { rows: blocked } = await pool.query(
+        `SELECT 1 FROM blocks
+          WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1) LIMIT 1`,
+        [meId, u.id]
+      );
+      if (blocked.length) return res.status(404).json({ error: 'Profile not available' });
+    }
 
     const { rows: catchRows } = await pool.query(
       `SELECT * FROM catches WHERE user_id=$1 AND is_public=true ORDER BY caught_at DESC LIMIT 60`,
@@ -2092,6 +2118,22 @@ app.get('/api/anglers/:id', async (req, res) => {
       [u.id]
     );
 
+    // Follow state travels with the profile so the button renders correctly on
+    // first paint instead of flickering from "Follow" to "Following".
+    const { rows: [fc] } = await pool.query(
+      `SELECT
+         (SELECT COUNT(*)::int FROM follows WHERE followee_id=$1) AS followers,
+         (SELECT COUNT(*)::int FROM follows WHERE follower_id=$1) AS following`,
+      [u.id]
+    );
+    let isFollowing = false;
+    if (meId && meId !== u.id) {
+      const { rows } = await pool.query(
+        `SELECT 1 FROM follows WHERE follower_id=$1 AND followee_id=$2 LIMIT 1`, [meId, u.id]
+      );
+      isFollowing = rows.length > 0;
+    }
+
     res.json({
       angler: {
         id: u.id,
@@ -2102,6 +2144,10 @@ app.get('/api/anglers/:id', async (req, res) => {
         ringId: u.equipped_ring ?? null,
         publicCatchCount: agg?.count ?? 0,
         since: agg?.since ?? null,
+        followerCount:  fc?.followers ?? 0,
+        followingCount: fc?.following ?? 0,
+        isFollowing,
+        isMe: meId != null && meId === u.id,
       },
       catches,
     });
