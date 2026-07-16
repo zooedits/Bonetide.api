@@ -1239,6 +1239,47 @@ const usedScanTokens = new Set(); // in-memory single-use tracking (resets on de
 // and expects { url } back. Without this route the upload 404s, the app
 // swallows the error, and every catch is saved with image_url=null (🐟 tiles).
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Hashtags
+// ─────────────────────────────────────────────────────────────────────────────
+// Unicode-aware so #peixe and #ボーンタイド work, not just ASCII. Requires the tag
+// to START with a letter: #1 and #100lbs are counts and measurements, not
+// topics, and indexing them buries the real tags under noise.
+//
+// Capped per catch. Without a cap a single caption stuffed with 400 tags lands
+// in every search for every term, which is the oldest spam trick there is.
+// The lookbehind requires the # to sit at a boundary. Without it, "me#example.com"
+// tagged #example and every URL fragment became a topic.
+const HASHTAG_RE = /(?<![\p{L}\p{N}_])#(\p{L}[\p{L}\p{N}_]{0,29})/gu;
+const MAX_TAGS_PER_CATCH = 10;
+
+function extractHashtags(text) {
+  if (!text || typeof text !== 'string') return [];
+  const out = new Set();
+  for (const m of text.matchAll(HASHTAG_RE)) {
+    out.add(m[1].toLowerCase());
+    if (out.size >= MAX_TAGS_PER_CATCH) break;
+  }
+  return [...out];
+}
+
+// Best-effort: a tagging failure must never lose the catch itself. The catch is
+// the record; tags are an index over it.
+async function syncCatchHashtags(catchId, note) {
+  try {
+    const tags = extractHashtags(note);
+    await pool.query(`DELETE FROM catch_hashtags WHERE catch_id=$1`, [catchId]);
+    if (!tags.length) return;
+    await pool.query(
+      `INSERT INTO catch_hashtags (catch_id, tag)
+       SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING`,
+      [catchId, tags]
+    );
+  } catch (e) {
+    console.error('[hashtags] sync failed for catch', catchId, e.message);
+  }
+}
+
 app.post('/api/upload-image', async (req, res) => {
   try {
     const { imageBase64 } = req.body ?? {};
@@ -1593,6 +1634,10 @@ app.post('/api/catches', async (req, res) => {
     );
     // Shadowbanned users' posts are created hidden — visible to them, nobody else.
     if (await isShadowbanned(user.id)) await pool.query(`UPDATE catches SET hidden=true WHERE id=$1`, [newCatch.id]).catch(() => {});
+
+    // Index the caption's hashtags. Awaited so a catch is searchable the moment
+    // it lands, but internally guarded — see syncCatchHashtags.
+    await syncCatchHashtags(newCatch.id, note);
     if (ptsAwarded > 0) {
       await addBones(user.id, ptsAwarded);
       await pool.query(`INSERT INTO points_transactions(user_id,delta,reason,reference_id,created_at) VALUES($1,$2,'catch',$3,NOW())`, [user.id, ptsAwarded, newCatch.id.toString()]);
@@ -1726,7 +1771,7 @@ app.get('/api/feed', async (req, res) => {
     // Folding friends into `type` would have made "friends, catches only"
     // unexpressible, and `type` already means content kind everywhere else.
     // `radius` is accepted and ignored — see the assembly block below.
-    const { lat, lon, limit = 25, type = 'all', scope = 'community', before = null } = req.query;
+    const { lat, lon, limit = 25, type = 'all', scope = 'community', before = null, q = null } = req.query;
     const lim = Math.min(parseInt(limit) || 25, 50);
     const haveGeo = lat != null && lon != null && !isNaN(parseFloat(lat)) && !isNaN(parseFloat(lon));
     const items = [];
@@ -1766,6 +1811,16 @@ app.get('/api/feed', async (req, res) => {
       ? `AND EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = ${meId} AND f.followee_id = u.id)`
       : '';
 
+    // Search. Two genuinely different questions, so two shapes:
+    //   "#snook" → exact match against the indexed catch_hashtags table
+    //   "snook"  → loose match on species, caption or angler name
+    // A tag search that fell back to ILIKE '%snook%' would also return
+    // "#snookered" and every caption that merely mentions snook, which is the
+    // whole point of tagging something rather than typing it.
+    const search   = String(q ?? '').trim();
+    const tagQuery = search.startsWith('#') ? search.slice(1).toLowerCase() : null;
+    const searching = !!tagQuery || search.length >= 2;
+
     if (type === 'all' || type === 'catches') {
       // ── The Bone Tide feed algorithm ─────────────────────────────────────
       // Spine: strict upload order - every catch gets the same top-of-feed
@@ -1778,8 +1833,23 @@ app.get('/api/feed', async (req, res) => {
       const OVERLOOKED_MIN_AGE_H = 12;  // old enough to have had its fresh moment
       const OVERLOOKED_MAX_VIEWS = 25;  // still basically unseen
 
+      // Bound params are built in the same pass as their placeholders, so the
+      // numbering can't drift out of sync with the array as clauses come and go.
+      const spineParams = [];
+      let beforeSql = '';
+      if (before) { spineParams.push(before); beforeSql = `AND c.id < $${spineParams.length}`; }
+      let searchSql = '';
+      if (tagQuery) {
+        spineParams.push(tagQuery);
+        searchSql = `AND EXISTS (SELECT 1 FROM catch_hashtags h WHERE h.catch_id = c.id AND h.tag = $${spineParams.length})`;
+      } else if (search.length >= 2) {
+        spineParams.push(`%${search}%`);
+        const i = spineParams.length;
+        searchSql = `AND (c.species ILIKE $${i} OR c.note ILIKE $${i} OR u.name ILIKE $${i})`;
+      }
+
       const { rows: spine } = await pool.query(
-        `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.lat, c.lon, c.caught_at AS created_at,
+        `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.note, c.lat, c.lon, c.caught_at AS created_at,
                 u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.equipped_ring, u.public_profile, u.anonymize_shared,
                 (SELECT COUNT(*) FROM likes    WHERE target_type='catch' AND target_id=c.id) AS like_count,
                 (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
@@ -1788,19 +1858,23 @@ app.get('/api/feed', async (req, res) => {
            AND COALESCE(u.is_deleted, false) = false
            ${blockSql}
            ${friendSql}
-         ${before ? 'AND c.id < $1' : ''}
+           ${searchSql}
+         ${beforeSql}
          ORDER BY c.id DESC LIMIT ${lim + 1}`,
-        before ? [before] : []
+        spineParams
       );
 
       // Overlooked candidates: oldest-unseen first, random among ties so the
       // same three catches don't haunt every refresh. Only woven into the
       // first page (no `before`) - deeper pages stay pure spine.
+      // The weave is off during a search. Its whole job is to surface catches
+      // you did NOT ask for; injecting those into a result set for "#snook" is
+      // just wrong answers with extra steps.
       let overlooked = [];
-      if (!before && spine.length >= WEAVE_EVERY) {
+      if (!before && !searching && spine.length >= WEAVE_EVERY) {
         const need = Math.floor(spine.length / WEAVE_EVERY);
         const { rows: ov } = await pool.query(
-          `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.lat, c.lon, c.caught_at AS created_at,
+          `SELECT c.id, c.species, c.length_in, c.released, c.image_url, c.note, c.lat, c.lon, c.caught_at AS created_at,
                   u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.equipped_ring, u.public_profile, u.anonymize_shared,
                   (SELECT COUNT(*) FROM likes    WHERE target_type='catch' AND target_id=c.id) AS like_count,
                   (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
@@ -1832,6 +1906,10 @@ app.get('/api/feed', async (req, res) => {
         items.push({
           type: 'catch', id: r.id, imageUrl: r.image_url ?? null,
           species: r.species, lengthIn: r.length_in, released: r.released,
+          // The caption. Anglers have been typing these into the "Quick note"
+          // box since day one and the feed never asked for the column, so none
+          // of them have ever been read by anyone.
+          note: r.note ?? null,
           overlooked: !!r._overlooked,
           lat: la, lon: lo, createdAt: r.created_at,
           likeCount: Number(r.like_count) || 0, commentCount: Number(r.comment_count) || 0,
@@ -1846,7 +1924,19 @@ app.get('/api/feed', async (req, res) => {
       }
     }
 
-    if (type === 'all' || type === 'spots') {
+    // Spots join a text search on their name/note, but never a tag search:
+    // hashtags live on catch captions, and silently widening "#snook" to
+    // include spots would answer a question nobody asked.
+    if ((type === 'all' || type === 'spots') && !tagQuery) {
+      const spotParams = [];
+      let spotBeforeSql = '';
+      if (before) { spotParams.push(before); spotBeforeSql = `AND s.created_at < $${spotParams.length}`; }
+      let spotSearchSql = '';
+      if (search.length >= 2) {
+        spotParams.push(`%${search}%`);
+        const i = spotParams.length;
+        spotSearchSql = `AND (s.name ILIKE $${i} OR s.note ILIKE $${i} OR u.name ILIKE $${i})`;
+      }
       const { rows } = await pool.query(
         `SELECT s.id, s.name, s.type AS spot_type, s.note, s.lat, s.lon, s.photo_url, s.created_at,
                 u.id AS angler_id, u.name AS angler_name, u.avatar, u.is_club, u.club_badge, u.equipped_ring, u.public_profile,
@@ -1857,9 +1947,10 @@ app.get('/api/feed', async (req, res) => {
            AND COALESCE(u.is_deleted, false) = false
            ${blockSql}
            ${friendSql}
-         ${before ? 'AND s.created_at < $1' : ''}
+           ${spotSearchSql}
+         ${spotBeforeSql}
          ORDER BY s.created_at DESC LIMIT ${lim + 1}`,
-        before ? [before] : []
+        spotParams
       );
       for (const r of rows) {
         items.push({
@@ -5272,6 +5363,25 @@ pool.query(`
 `).catch(e => console.error('[init] blocks:', e.message));
 pool.query(`CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id)`)
   .catch(e => console.error('[init] idx_blocks_blocked:', e.message));
+
+// ── Hashtags ────────────────────────────────────────────────────────────────
+// Extracted from a catch's caption on write into their own rows, rather than
+// searched out of the caption text at read time. `note ILIKE '%#snook%'` can't
+// use an index and also matches "#snookered", so it gets slower AND wronger as
+// the app grows. A tag column can be indexed and matched exactly.
+//
+// Tags are stored lowercased: #Snook, #snook and #SNOOK are one tag to a human,
+// so they have to be one row here. The display form is whatever the angler
+// typed in their caption — this table is only the index.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS catch_hashtags (
+    catch_id INTEGER NOT NULL REFERENCES catches(id) ON DELETE CASCADE,
+    tag      TEXT    NOT NULL,
+    PRIMARY KEY (catch_id, tag)
+  )
+`).catch(e => console.error('[init] catch_hashtags:', e.message));
+pool.query(`CREATE INDEX IF NOT EXISTS idx_catch_hashtags_tag ON catch_hashtags(tag)`)
+  .catch(e => console.error('[init] idx_catch_hashtags_tag:', e.message));
 pool.query(`
   CREATE TABLE IF NOT EXISTS moderation_log (
     id         SERIAL PRIMARY KEY,
