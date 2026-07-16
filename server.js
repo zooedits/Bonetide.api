@@ -1815,19 +1815,50 @@ app.get('/api/feed', async (req, res) => {
       }
     }
 
+    // ── Assemble ────────────────────────────────────────────────────────────
+    // Distance is DECORATION, not a filter. It used to be both, and the filter
+    // was wrong three ways:
+    //
+    //  1. It ran AFTER the LIMIT. The spine pulls the 26 newest catches
+    //     nationwide, then this dropped anything over 100mi — so the feed was
+    //     never "the 25 newest near you", it was "of the 26 newest anywhere,
+    //     whichever happen to be close". Fine with a handful of anglers,
+    //     progressively emptier as the app grows, and the "nationwide fallback"
+    //     masked it by silently showing the unfiltered list anyway.
+    //  2. It dropped every catch with no coordinates (distanceMi != null), so a
+    //     past catch logged without a location could never appear.
+    //  3. Both exit paths then re-sorted by createdAt, which for a catch is
+    //     caught_at. That undid the entire algorithm above: the id-DESC spine
+    //     that guarantees every catch the same top-of-feed moment, AND the
+    //     positions of the woven overlooked cards. It also meant a backdated
+    //     catch sank to wherever its catch date fell — a 2019 fish went to the
+    //     bottom of the feed forever, which is the opposite of the stated rule.
+    //
+    // So: no filter, no re-sort. The order built above IS the order shipped.
+    // Spots are woven into the catch spine at a fixed interval rather than
+    // merged by timestamp, because catches carry no posting-time column (only
+    // caught_at), and sorting mixed content by caught_at is what caused #3.
     if (haveGeo) {
-      const uLat = parseFloat(lat), uLon = parseFloat(lon), rad = parseFloat(radius) || 100;
+      const uLat = parseFloat(lat), uLon = parseFloat(lon);
       for (const it of items) {
-        it.distanceMi = (it.lat != null && it.lon != null) ? _haversineMi(uLat, uLon, it.lat, it.lon) : null;
+        it.distanceMi = (it.lat != null && it.lon != null)
+          ? _haversineMi(uLat, uLon, it.lat, it.lon)
+          : null;
       }
-      let within = items.filter(it => it.distanceMi != null && it.distanceMi <= rad);
-      if (within.length === 0) within = items; // nationwide fallback so it's never empty
-      within.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-      return res.json({ items: within.slice(0, lim) });
     }
 
-    items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    res.json({ items: items.slice(0, lim) });
+    const SPOT_WEAVE_EVERY = 4;   // a spot every N catch cards
+    const catchCards = items.filter(it => it.type !== 'spot');
+    const spotCards  = items.filter(it => it.type === 'spot');
+    const merged = [];
+    let si = 0;
+    catchCards.forEach((c, i) => {
+      merged.push(c);
+      if ((i + 1) % SPOT_WEAVE_EVERY === 0 && si < spotCards.length) merged.push(spotCards[si++]);
+    });
+    while (si < spotCards.length && merged.length < lim) merged.push(spotCards[si++]);
+
+    res.json({ items: merged.slice(0, lim) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
