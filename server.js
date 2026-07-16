@@ -4442,6 +4442,191 @@ app.get('/api/bonecast', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/conditions/at — the conditions as they WERE at a past moment
+//
+// Powers past-catch logging. A backdated catch used to be stamped with whatever
+// the tide and weather were doing at the moment it got typed in, so a 2019
+// redfish went into the logbook wearing this morning's barometer.
+//
+// Same contract as /api/conditions and /api/bonecast: RAW INPUTS ONLY, never a
+// score. goodBiteEngine.js on the client owns the scoring rules outright, and a
+// second copy here would drift apart the first time a weight got tuned.
+//
+// Why each source can answer for a date years back:
+//   • Tide — NOAA harmonic PREDICTIONS. Computed from the motion of the moon and
+//     sun rather than measured, so 2019 is exactly as available as tomorrow.
+//     Same endpoint the live tide screen uses, just a different begin_date.
+//   • Wind + pressure — Open-Meteo. Their forecast API carries ~92 days of
+//     past_days; older than that we switch to the ERA5 archive, which reaches
+//     back decades. This is the piece that makes real historical weather
+//     possible at all, and it's already the same provider /api/bonecast uses.
+//   • Moon + solunar — pure orbital math, already date-aware in this file.
+//
+// Anything unavailable returns null rather than a guess. A blank field in a
+// logbook is honest; an invented one quietly poisons every average built on it.
+//
+// Query: lat, lon, at (ISO instant, must be in the past)
+// ─────────────────────────────────────────────────────────────────────────────
+const historicalConditionsCache = new Map();
+const HISTORICAL_CACHE_MAX = 500;
+
+app.get('/api/conditions/at', async (req, res) => {
+  const { lat, lon, at } = req.query;
+  if (!lat || !lon || !at) return res.status(400).json({ error: 'lat, lon and at are required' });
+
+  const latN = parseFloat(lat), lonN = parseFloat(lon);
+  if (!Number.isFinite(latN) || !Number.isFinite(lonN)) {
+    return res.status(400).json({ error: 'lat and lon must be numbers' });
+  }
+  const when = new Date(at);
+  if (isNaN(when.getTime()))      return res.status(400).json({ error: 'at must be an ISO timestamp' });
+  if (when.getTime() > Date.now()) return res.status(400).json({ error: 'at must be in the past' });
+
+  // The past doesn't change, so this cache needs no TTL — only a cap, so a
+  // long-lived dyno can't grow it without bound. The key rounds to the hour and
+  // ~1km, both well inside the resolution of every source below.
+  const atMs = when.getTime();
+  const cacheKey = `${latN.toFixed(2)}_${lonN.toFixed(2)}_${Math.floor(atMs / 3600000)}`;
+  const hit = historicalConditionsCache.get(cacheKey);
+  if (hit) return res.json(hit);
+
+  try {
+    const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
+    const ageDays = (Date.now() - atMs) / 86400000;
+
+    // ── Tide ─────────────────────────────────────────────────────────────────
+    // Bracket the instant by a day either side so interpolation always has a
+    // point before and after, even for a catch that lands near midnight UTC.
+    let station = null;
+    try {
+      const stations = await getTideStationList();
+      station = sortByDistance(stations, latN, lonN)[0] ?? null;
+    } catch {
+      // No station list just means no tide. Moon and weather still answer.
+    }
+
+    const tideUrl = station
+      ? `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter`
+        + `?begin_date=${fmt(new Date(atMs - 24 * 3600 * 1000))}`
+        + `&end_date=${fmt(new Date(atMs + 24 * 3600 * 1000))}`
+        + `&station=${station.id}&product=predictions&datum=MLLW&time_zone=gmt`
+        + `&interval=h&units=english&application=bonetideco&format=json`
+      : null;
+
+    // ── Weather ──────────────────────────────────────────────────────────────
+    // ERA5 lags real time by ~5 days and the forecast API only reaches back 92,
+    // so 60 sits comfortably inside both and neither edge is ever the one asked.
+    const wxParams = 'wind_speed_10m,wind_direction_10m,surface_pressure,temperature_2m';
+    const wxUrl = ageDays > 60
+      ? `https://archive-api.open-meteo.com/v1/archive?latitude=${latN}&longitude=${lonN}`
+        + `&start_date=${when.toISOString().slice(0, 10)}&end_date=${when.toISOString().slice(0, 10)}`
+        + `&hourly=${wxParams}&wind_speed_unit=kn&timeformat=unixtime&timezone=UTC`
+      : `https://api.open-meteo.com/v1/forecast?latitude=${latN}&longitude=${lonN}`
+        + `&hourly=${wxParams}&past_days=${Math.min(92, Math.ceil(ageDays) + 1)}&forecast_days=1`
+        + `&wind_speed_unit=kn&timeformat=unixtime&timezone=UTC`;
+
+    const [tideRes, wxRes] = await Promise.all([
+      tideUrl ? fetch(tideUrl, { signal: AbortSignal.timeout(8000) }).catch(() => null) : Promise.resolve(null),
+      fetch(wxUrl, { signal: AbortSignal.timeout(8000) }).catch(() => null),
+    ]);
+
+    // ── Interpolate the tide at the exact instant ────────────────────────────
+    // Mirrors /api/tides: ask for GMT, convert to real ISO instants, then it's
+    // plain epoch math and immune to whatever timezone this server runs in.
+    let tideHeightFt = null, tideDirection = null;
+    try {
+      const tideData = tideRes ? await tideRes.json() : null;
+      const predictions = (tideData?.predictions ?? [])
+        .map(p => ({
+          t: new Date(String(p.t).replace(' ', 'T') + 'Z').getTime(),
+          v: parseFloat(p.v),
+        }))
+        .filter(p => Number.isFinite(p.t) && Number.isFinite(p.v));
+
+      let before = null, after = null;
+      for (let i = 0; i < predictions.length - 1; i++) {
+        if (predictions[i].t <= atMs && predictions[i + 1].t > atMs) {
+          before = predictions[i]; after = predictions[i + 1]; break;
+        }
+      }
+      if (before && after) {
+        const frac = (atMs - before.t) / (after.t - before.t);
+        tideHeightFt  = parseFloat((before.v + frac * (after.v - before.v)).toFixed(2));
+        tideDirection = after.v > before.v ? 'Incoming' : 'Outgoing';
+      }
+    } catch {
+      // Malformed NOAA payload — leave tide null rather than invent a height.
+    }
+
+    // ── Weather at the nearest hour ──────────────────────────────────────────
+    let windKts = null, windDeg = null, pressureHpa = null, airTempC = null, baroTrend = 'stable';
+    try {
+      const wx = wxRes ? await wxRes.json() : null;
+      const times = wx?.hourly?.time ?? [];
+      if (times.length) {
+        let idx = 0, bestDelta = Infinity;
+        for (let i = 0; i < times.length; i++) {
+          const d = Math.abs(times[i] * 1000 - atMs);   // unixtime is seconds
+          if (d < bestDelta) { bestDelta = d; idx = i; }
+        }
+        // Landing more than 90 minutes from the instant means the series doesn't
+        // really cover it. Report nothing rather than the wrong hour.
+        if (bestDelta <= 90 * 60 * 1000) {
+          windKts     = wx.hourly.wind_speed_10m?.[idx]      ?? null;
+          windDeg     = wx.hourly.wind_direction_10m?.[idx]   ?? null;
+          pressureHpa = wx.hourly.surface_pressure?.[idx]     ?? null;
+          airTempC    = wx.hourly.temperature_2m?.[idx]       ?? null;
+          baroTrend   = baroTrendFrom(wx.hourly.surface_pressure, idx);
+        }
+      }
+    } catch {
+      // Same principle: nulls beat guesses.
+    }
+
+    const data = {
+      at: when.toISOString(),
+      historical: true,
+      tide: {
+        heightFt:    tideHeightFt,
+        direction:   tideDirection,
+        stationId:   station?.id ?? null,
+        stationName: station?.name ?? null,
+        distKm:      station?.distKm ?? null,
+      },
+      // Shaped to match /api/conditions exactly, so the client can hand this to
+      // the same goodBiteEngine it already feeds with live data.
+      wind: windKts != null ? {
+        speedKts:      Math.round(windKts),
+        direction:     windDeg != null ? degreesToCardinal(windDeg) : null,
+        directionDeg:  windDeg,
+        speedCategory: windCategory(windKts),
+      } : null,
+      pressure: pressureHpa != null ? {
+        inHg:   parseFloat((pressureHpa * 0.02953).toFixed(2)),
+        trend:  baroTrend,
+        absCat: baroAbsCat(pressureHpa),
+      } : null,
+      airTempF: airTempC != null ? Math.round(airTempC * 9 / 5 + 32) : null,
+      solunar: computeSolunar(latN, lonN, when),
+      sources: {
+        tide:    station  ? 'NOAA harmonic predictions' : null,
+        weather: windKts != null ? (ageDays > 60 ? 'Open-Meteo ERA5 archive' : 'Open-Meteo') : null,
+        moon:    'computed',
+      },
+    };
+
+    if (historicalConditionsCache.size >= HISTORICAL_CACHE_MAX) {
+      historicalConditionsCache.delete(historicalConditionsCache.keys().next().value);
+    }
+    historicalConditionsCache.set(cacheKey, data);
+    res.json(data);
+  } catch (err) {
+    console.error('[conditions/at] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/rewards/profile', async (req, res) => {
   const { deviceId } = req.query;
   if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
