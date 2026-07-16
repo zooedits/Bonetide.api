@@ -2555,7 +2555,10 @@ async function canMessage(meId, otherId) {
 app.post('/api/messages', requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
-    const me = await resolveDbUser(req.user, 'id');
+    // `name` comes along for the push notification title. resolveDbUser only
+    // selects the columns you name, so asking for 'id' alone left me.name
+    // undefined and every notification would have read "New message".
+    const me = await resolveDbUser(req.user, 'id, name');
     if (!me) return res.status(404).json({ error: 'User not found' });
 
     const toUserId = parseInt(req.body?.toUserId, 10);
@@ -2632,6 +2635,29 @@ app.post('/api/messages', requireAuth, async (req, res) => {
       [conv.id, me.id]
     );
     await client.query('COMMIT');
+
+    // Tell the recipient, if they have a device registered. Deliberately NOT
+    // awaited: Expo's push service is a third party, and a slow or down push
+    // endpoint must never make sending a message hang or fail. The message is
+    // already committed above — the notification is a courtesy on top, so it
+    // fails silently and the recipient still sees it on next poll/open.
+    //
+    // The body is included in the notification. That's the normal expectation
+    // for DMs, and it's already on the recipient's device either way — but note
+    // it renders on a locked screen, so it's visible to anyone holding the phone.
+    notifyUser(
+      toUserId,
+      // The users table calls this `name` — there is no display_name/username.
+      // anonymize_shared deliberately isn't honoured here: it hides your name on
+      // PUBLIC catches. In a DM the recipient already knows who they're talking
+      // to, and an anonymous "New message" would be worse for them, not safer.
+      me.name || 'New message',
+      body.length > 120 ? body.slice(0, 119) + '…' : body,
+      // Deep-link straight into the thread. MessageThreadScreen takes either a
+      // conversationId or a toUserId; conversationId is right here because the
+      // conversation demonstrably exists — we just inserted into it.
+      { screen: 'MessageThread', params: { conversationId: conv.id } },
+    ).catch(() => {});
 
     res.json({
       ok: true,
@@ -6885,6 +6911,17 @@ async function sendPush(messages) {
       });
     } catch (e) { console.error('[push] send error:', e.message); }
   }
+}
+
+// Notify one angler across all their devices. Mirrors notifyAdmins, but scoped
+// to a user_id. sendPush already batches and prunes dead tokens, so a stale
+// device from an old install cleans itself up on first send.
+async function notifyUser(userId, title, body, data = {}) {
+  try {
+    const { rows } = await pool.query(`SELECT token FROM push_tokens WHERE user_id = $1`, [userId]);
+    if (!rows.length) return;   // no devices registered — nothing to do
+    await sendPush(rows.map((r) => ({ to: r.token, title, body, data, sound: 'default', priority: 'high' })));
+  } catch (e) { console.error('[push] notifyUser:', e.message); }
 }
 
 async function notifyAdmins(title, body, data = {}) {
