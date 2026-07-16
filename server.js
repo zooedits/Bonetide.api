@@ -997,6 +997,16 @@ app.delete('/api/auth/account', requireAuth, async (req, res) => {
     await client.query('BEGIN');
     await client.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $1`, [me.id]);
     await client.query(`DELETE FROM push_tokens WHERE user_id = $1`, [me.id]);
+    // The social graph goes with the person, in both directions. A tombstone
+    // shouldn't keep followers, and it shouldn't keep following anyone either.
+    // Blocks are dropped too: the account behind them no longer exists, so
+    // there's nobody left to be protected from or by.
+    await client.query(
+      `DELETE FROM follows WHERE follower_id = $1 OR followee_id = $1`, [me.id]
+    ).catch(e => console.error('[delete-account] follows:', e.message));
+    await client.query(
+      `DELETE FROM blocks WHERE blocker_id = $1 OR blocked_id = $1`, [me.id]
+    ).catch(e => console.error('[delete-account] blocks:', e.message));
     await client.query('COMMIT');
 
     // Post-commit, best-effort. The account is already gone either way.
@@ -1710,10 +1720,51 @@ app.post('/api/feed/views', async (req, res) => {
 
 app.get('/api/feed', async (req, res) => {
   try {
-    const { lat, lon, radius = 100, limit = 25, type = 'all', before = null } = req.query;
+    // Two INDEPENDENT axes, deliberately not one param:
+    //   type  = what kind of card   ('all' | 'catches' | 'spots')
+    //   scope = whose cards         ('community' | 'friends')
+    // Folding friends into `type` would have made "friends, catches only"
+    // unexpressible, and `type` already means content kind everywhere else.
+    // `radius` is accepted and ignored — see the assembly block below.
+    const { lat, lon, limit = 25, type = 'all', scope = 'community', before = null } = req.query;
     const lim = Math.min(parseInt(limit) || 25, 50);
     const haveGeo = lat != null && lon != null && !isNaN(parseFloat(lat)) && !isNaN(parseFloat(lon));
     const items = [];
+
+    // Who's asking. The feed stays readable when signed out (it's public
+    // content), but blocks and the friends tab both need an identity, so a
+    // failure to resolve one degrades to the plain community feed rather than
+    // erroring. `meId` null means: no blocks to apply, no friends to filter by.
+    let meId = null;
+    try {
+      const me = await getUserFromRequest(req);
+      // Coerced to an integer, not just trusted: it gets interpolated into SQL
+      // below rather than passed as a bound parameter (the surrounding queries
+      // build their WHERE clauses as template strings), so a non-numeric value
+      // here would be an injection point. It comes from a DB row today; this
+      // makes it impossible for that to stop being true quietly.
+      const n = Number.parseInt(me?.id, 10);
+      meId = Number.isInteger(n) ? n : null;
+    } catch { /* signed out or unresolvable — public feed */ }
+
+    // Friends = people you follow. Requesting it while signed out is a client
+    // bug, but answer honestly with an empty list rather than pretending.
+    const friendsOnly = scope === 'friends';
+    if (friendsOnly && !meId) return res.json({ items: [] });
+
+    // Block enforcement, applied to every content query below. Null-safe: a
+    // signed-out reader has no blocks, so the predicate collapses to TRUE
+    // rather than filtering everything out.
+    const blockSql = meId
+      ? `AND NOT EXISTS (
+           SELECT 1 FROM blocks b
+            WHERE (b.blocker_id = ${meId} AND b.blocked_id = u.id)
+               OR (b.blocked_id = ${meId} AND b.blocker_id = u.id)
+         )`
+      : '';
+    const friendSql = friendsOnly
+      ? `AND EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = ${meId} AND f.followee_id = u.id)`
+      : '';
 
     if (type === 'all' || type === 'catches') {
       // ── The Bone Tide feed algorithm ─────────────────────────────────────
@@ -1734,6 +1785,9 @@ app.get('/api/feed', async (req, res) => {
                 (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
          FROM catches c JOIN users u ON u.id=c.user_id
          WHERE u.share_with_community=true AND c.is_public=true AND c.hidden IS NOT TRUE
+           AND COALESCE(u.is_deleted, false) = false
+           ${blockSql}
+           ${friendSql}
          ${before ? 'AND c.id < $1' : ''}
          ORDER BY c.id DESC LIMIT ${lim + 1}`,
         before ? [before] : []
@@ -1752,6 +1806,9 @@ app.get('/api/feed', async (req, res) => {
                   (SELECT COUNT(*) FROM comments WHERE target_type='catch' AND target_id=c.id) AS comment_count
            FROM catches c JOIN users u ON u.id=c.user_id
            WHERE u.share_with_community=true AND c.is_public=true AND c.hidden IS NOT TRUE
+             AND COALESCE(u.is_deleted, false) = false
+             ${blockSql}
+             ${friendSql}
              AND c.caught_at < NOW() - INTERVAL '${OVERLOOKED_MIN_AGE_H} hours'
              AND c.views <= ${OVERLOOKED_MAX_VIEWS}
              AND c.id NOT IN (SELECT unnest($1::int[]))
@@ -1797,6 +1854,9 @@ app.get('/api/feed', async (req, res) => {
                 (SELECT COUNT(*) FROM comments WHERE target_type='spot' AND target_id=s.id) AS comment_count
          FROM spots s JOIN users u ON u.id=s.user_id
          WHERE s.is_private=false AND s.hidden IS NOT TRUE
+           AND COALESCE(u.is_deleted, false) = false
+           ${blockSql}
+           ${friendSql}
          ${before ? 'AND s.created_at < $1' : ''}
          ORDER BY s.created_at DESC LIMIT ${lim + 1}`,
         before ? [before] : []
@@ -1959,6 +2019,23 @@ app.get('/api/anglers/search', async (req, res) => {
     if (q.length < 2) return res.json({ anglers: [] });
     const limit = Math.min(30, parseInt(req.query.limit ?? '20', 10) || 20);
 
+    // Blocked pairs are mutually invisible in search, same as in the feed.
+    // Guest-readable endpoint, so a reader we can't identify simply has no
+    // blocks and the predicate drops out entirely.
+    let meId = null;
+    try {
+      const me = await getUserFromRequest(req);
+      const n = Number.parseInt(me?.id, 10);   // interpolated into SQL — see /api/feed
+      meId = Number.isInteger(n) ? n : null;
+    } catch { /* signed out — nothing to filter against */ }
+    const blockSql = meId
+      ? `AND NOT EXISTS (
+           SELECT 1 FROM blocks b
+            WHERE (b.blocker_id = ${meId} AND b.blocked_id = u.id)
+               OR (b.blocked_id = ${meId} AND b.blocker_id = u.id)
+         )`
+      : '';
+
     // Prefix matches rank above contains-matches: typing "ma" should surface
     // "Marlin Mike" before "Fisherman Joe".
     const { rows } = await pool.query(
@@ -1968,6 +2045,7 @@ app.get('/api/anglers/search', async (req, res) => {
          LEFT JOIN catches c ON c.user_id = u.id AND c.is_public = true
         WHERE u.public_profile = true
           AND COALESCE(u.is_deleted, false) = false
+          ${blockSql}
           AND u.name ILIKE $1
         GROUP BY u.id
         ORDER BY (u.name ILIKE $2) DESC, COUNT(c.id) DESC, u.name ASC
@@ -2033,6 +2111,221 @@ app.get('/api/anglers/:id', async (req, res) => {
 });
 
 // Report a user or a piece of content. Writes to moderation_log for admin review.
+// ═══ SOCIAL GRAPH: FOLLOWS + BLOCKS ══════════════════════════════════════════
+//
+// Blocking is bidirectional in EFFECT even though it's one-directional in
+// intent. If A blocks B, neither sees the other anywhere: not in the feed, not
+// in search, not on profiles. A one-way block that still lets the blocked user
+// watch is the failure mode people actually get hurt by, and Apple Guideline
+// 1.2 wants "the ability to block abusive users", not "the ability to hide from
+// users who can still see you".
+//
+// Blocking also severs follows in BOTH directions. Leaving the edge in place
+// would mean unblocking silently restores a following relationship the person
+// already rejected once.
+//
+// `blockedPairFilter` is the one place that rule lives. Every surface that
+// shows one user's content to another calls it. Written once on purpose —
+// duplicating this predicate across the feed, search and profiles is exactly
+// how a blocked user resurfaces in the one query somebody forgot.
+const blockedPairFilter = (meParam, otherCol) => `
+  NOT EXISTS (
+    SELECT 1 FROM blocks b
+     WHERE (b.blocker_id = ${meParam} AND b.blocked_id = ${otherCol})
+        OR (b.blocked_id = ${meParam} AND b.blocker_id = ${otherCol})
+  )`;
+
+// Resolve "who is this angler" from a route param, and reject the nonsense
+// cases before any write happens.
+async function resolveTargetAngler(idRaw, meId) {
+  const targetId = parseInt(idRaw, 10);
+  if (!Number.isInteger(targetId)) return { error: 'Invalid angler id', status: 400 };
+  if (targetId === meId)           return { error: "You can't do that to yourself", status: 400 };
+  const { rows } = await pool.query(
+    `SELECT id, name, COALESCE(is_deleted, false) AS is_deleted FROM users WHERE id = $1`, [targetId]
+  );
+  if (!rows.length)          return { error: 'Angler not found', status: 404 };
+  if (rows[0].is_deleted)    return { error: 'Angler not found', status: 404 };
+  return { target: rows[0] };
+}
+
+// ── Follow ───────────────────────────────────────────────────────────────────
+app.post('/api/anglers/:id/follow', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+
+    const r = await resolveTargetAngler(req.params.id, me.id);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+
+    // Can't follow someone in a block relationship with you, in either
+    // direction. Checked rather than assumed: the UI shouldn't offer the
+    // button, but the endpoint is what's actually reachable.
+    const { rows: blocked } = await pool.query(
+      `SELECT 1 FROM blocks
+        WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1) LIMIT 1`,
+      [me.id, r.target.id]
+    );
+    if (blocked.length) return res.status(403).json({ error: 'Not available' });
+
+    // ON CONFLICT DO NOTHING: following twice is a no-op, not an error. Double
+    // taps and retried requests shouldn't 500.
+    await pool.query(
+      `INSERT INTO follows (follower_id, followee_id) VALUES ($1,$2)
+       ON CONFLICT DO NOTHING`, [me.id, r.target.id]
+    );
+    const counts = await followCounts(r.target.id);
+    res.json({ ok: true, following: true, ...counts });
+  } catch (err) {
+    console.error('[follow] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/anglers/:id/follow', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const targetId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(targetId)) return res.status(400).json({ error: 'Invalid angler id' });
+
+    await pool.query(`DELETE FROM follows WHERE follower_id=$1 AND followee_id=$2`, [me.id, targetId]);
+    const counts = await followCounts(targetId);
+    res.json({ ok: true, following: false, ...counts });
+  } catch (err) {
+    console.error('[unfollow] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function followCounts(userId) {
+  const { rows } = await pool.query(
+    `SELECT
+       (SELECT COUNT(*) FROM follows WHERE followee_id=$1) AS followers,
+       (SELECT COUNT(*) FROM follows WHERE follower_id=$1) AS following`,
+    [userId]
+  );
+  return {
+    followerCount:  Number(rows[0]?.followers) || 0,
+    followingCount: Number(rows[0]?.following) || 0,
+  };
+}
+
+// Followers / following lists. Blocked pairs are filtered out both ways, and
+// tombstoned accounts never appear.
+async function followList(req, res, direction) {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const targetId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(targetId)) return res.status(400).json({ error: 'Invalid angler id' });
+
+    const joinCol = direction === 'followers' ? 'f.follower_id' : 'f.followee_id';
+    const whereCol = direction === 'followers' ? 'f.followee_id' : 'f.follower_id';
+
+    const { rows } = await pool.query(
+      `SELECT u.id, u.name, u.avatar, u.is_club, u.club_badge, u.equipped_ring, u.public_profile,
+              EXISTS (SELECT 1 FROM follows me WHERE me.follower_id=$2 AND me.followee_id=u.id) AS i_follow
+         FROM follows f
+         JOIN users u ON u.id = ${joinCol}
+        WHERE ${whereCol} = $1
+          AND COALESCE(u.is_deleted, false) = false
+          AND ${blockedPairFilter('$2', 'u.id')}
+        ORDER BY f.created_at DESC
+        LIMIT 200`,
+      [targetId, me.id]
+    );
+    res.json({
+      anglers: rows.map(r => ({
+        id: r.id, name: r.name, avatar: r.avatar,
+        isClub: !!r.is_club, badge: r.club_badge, ringId: r.equipped_ring,
+        publicProfile: !!r.public_profile, iFollow: !!r.i_follow,
+      })),
+    });
+  } catch (err) {
+    console.error(`[${direction}] failed:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+}
+app.get('/api/anglers/:id/followers', requireAuth, (req, res) => followList(req, res, 'followers'));
+app.get('/api/anglers/:id/following', requireAuth, (req, res) => followList(req, res, 'following'));
+
+// ── Block ────────────────────────────────────────────────────────────────────
+app.post('/api/anglers/:id/block', requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+
+    const r = await resolveTargetAngler(req.params.id, me.id);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO blocks (blocker_id, blocked_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [me.id, r.target.id]
+    );
+    // Sever the follow edges both ways in the same transaction. Blocking someone
+    // you follow while staying subscribed to them is incoherent, and an unblock
+    // later shouldn't quietly resurrect a relationship that was already ended.
+    await client.query(
+      `DELETE FROM follows
+        WHERE (follower_id=$1 AND followee_id=$2) OR (follower_id=$2 AND followee_id=$1)`,
+      [me.id, r.target.id]
+    );
+    await client.query('COMMIT');
+
+    console.log(`[block] user ${me.id} blocked ${r.target.id}`);
+    res.json({ ok: true, blocked: true });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('[block] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/anglers/:id/block', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const targetId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(targetId)) return res.status(400).json({ error: 'Invalid angler id' });
+
+    // Unblocking only removes the block. Follows stay severed — restoring them
+    // would re-establish a relationship the person deliberately ended.
+    await pool.query(`DELETE FROM blocks WHERE blocker_id=$1 AND blocked_id=$2`, [me.id, targetId]);
+    res.json({ ok: true, blocked: false });
+  } catch (err) {
+    console.error('[unblock] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// The angler's own block list, for a Settings screen. Apple expects blocking to
+// be reversible and visible, not a one-way trapdoor.
+app.get('/api/blocks', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const { rows } = await pool.query(
+      `SELECT u.id, u.name, u.avatar, b.created_at
+         FROM blocks b JOIN users u ON u.id = b.blocked_id
+        WHERE b.blocker_id = $1
+        ORDER BY b.created_at DESC`,
+      [me.id]
+    );
+    res.json({
+      blocked: rows.map(r => ({
+        id: r.id, name: r.name ?? 'Angler', avatar: r.avatar, blockedAt: r.created_at,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/report', requireAuth, async (req, res) => {
   try {
     const { targetType, targetId, reason } = req.body ?? {};
@@ -4896,6 +5189,43 @@ pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo         BOOLEAN D
 // Account deletion tombstone columns. See DELETE /api/auth/account above.
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_deleted:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`).catch(e => console.error('[init] deleted_at:', e.message));
+
+// ── Social graph: follows + blocks ──────────────────────────────────────────
+// Created at boot rather than by hand in psql, like the older tables were. Two
+// tables, same shape, deliberately built together: they're the two halves of
+// "who is connected to whom", and blocking has to exist before anything reads
+// the follow graph or the block gets bolted on later and missed in places.
+//
+// Composite primary keys instead of a SERIAL id: the pair IS the identity, and
+// it makes a duplicate follow physically impossible rather than something the
+// endpoint has to remember to guard. ON DELETE CASCADE so a hard-deleted user
+// can't leave dangling edges. The CHECK stops self-follows and self-blocks at
+// the database, which is the only place a constraint can't be forgotten.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS follows (
+    follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    followee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (follower_id, followee_id),
+    CHECK (follower_id <> followee_id)
+  )
+`).catch(e => console.error('[init] follows:', e.message));
+// Reverse lookup: "who follows me" and follower counts. The PK already covers
+// (follower_id, ...) so only the other direction needs its own index.
+pool.query(`CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows(followee_id)`)
+  .catch(e => console.error('[init] idx_follows_followee:', e.message));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS blocks (
+    blocker_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    blocked_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (blocker_id, blocked_id),
+    CHECK (blocker_id <> blocked_id)
+  )
+`).catch(e => console.error('[init] blocks:', e.message));
+pool.query(`CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id)`)
+  .catch(e => console.error('[init] idx_blocks_blocked:', e.message));
 pool.query(`
   CREATE TABLE IF NOT EXISTS moderation_log (
     id         SERIAL PRIMARY KEY,
