@@ -4421,7 +4421,33 @@ const conditionsCache = new Map();
 
 app.get('/api/conditions', async (req, res) => {
   const { lat = '31.1234', lon = '-81.4567' } = req.query;
-  const cacheKey = `${lat}_${lon}`;
+
+  // Scoring lives here now, so the engine's other axes arrive with the request.
+  // Region is validated rather than trusted: an unrecognised one used to fall
+  // through to southeast winds inside the engine and answer confidently anyway.
+  const regionKey = REGION_WINDS[req.query.region] ? req.query.region : 'southeast';
+  const primarySpecies = String(req.query.species ?? 'redfish');
+
+  // Tide phase and range come from the caller, who already has them from
+  // /api/tides. Fetching tide again here would mean a FIFTH copy of NOAA
+  // datagetter logic in this file — and not a cheap one: /api/tides falls back
+  // MLLW → MSL → STND because subordinate stations don't support every datum.
+  // A hardcoded-MLLW copy would return nothing for exactly those stations and
+  // silently drop their score.
+  //
+  // The tradeoff, stated plainly: accepting these two from the client means
+  // someone can vary the tide axis and watch the score move. Wind, pressure and
+  // solunar are still derived here from lat/lon and can't be forged, so it's a
+  // partial window onto one sub-table, not the whole engine. That's a smaller
+  // risk than a fifth divergent copy of tide fetching, which is a certainty.
+  const tidePhase   = TIDE_PHASE_SCORES[req.query.tidePhase] ? req.query.tidePhase : null;
+  const tideRangeFt = Number.isFinite(parseFloat(req.query.tideRangeFt))
+    ? parseFloat(req.query.tideRangeFt) : null;
+
+  // Cache key carries everything that changes the answer. Keyed on lat/lon
+  // alone, the first angler's redfish score would be served to the next angler
+  // asking about trout.
+  const cacheKey = `${lat}_${lon}_${regionKey}_${primarySpecies}_${tidePhase ?? 'x'}_${tideRangeFt ?? 'x'}`;
   const cached = conditionsCache.get(cacheKey);
   if (cached && (Date.now() - cached.fetchedAt) < 30 * 60 * 1000) return res.json(cached.data);
   try {
@@ -4468,6 +4494,23 @@ app.get('/api/conditions', async (req, res) => {
       solunar: computeSolunar(parseFloat(lat), parseFloat(lon)),
       hourly,
     };
+
+    // Scored here rather than on the phone. Null when the caller didn't send a
+    // tide phase — the score is 35% tide, and defaulting it would produce a
+    // confident number that quietly means "we guessed".
+    data.goodBite = tidePhase ? computeGoodBite({
+      tidePhase,
+      tideRangeFt:       tideRangeFt ?? 6,
+      waterHeightCat:    'optimal',
+      baroTrend:         data.pressure.trend,
+      baroAbsCat:        data.pressure.absCat,
+      windSpeedCategory: data.wind.speedCategory,
+      windDirection:     data.wind.direction,
+      solunarWindow:     data.solunar?.window      ?? 'between',
+      moonPhase:         data.solunar?.moonPhase   ?? 'other',
+      lightWindow:       data.solunar?.lightWindow ?? 'other',
+    }, regionKey, primarySpecies) : null;
+
     conditionsCache.set(cacheKey, { data, fetchedAt: Date.now() });
     res.json(data);
   } catch (err) {
@@ -5143,6 +5186,14 @@ app.get('/api/bonecast', async (req, res) => {
   const days = Math.max(1, Math.min(7, parseInt(req.query.days ?? '7', 10) || 7));
   if (!lat || !lon) return res.status(400).json({ error: 'lat and lon required' });
 
+  // Scoring moved server-side, so region and target species have to come with
+  // the request — they used to be applied on the client after the fact. Both
+  // are validated against the tables rather than passed through: an unknown
+  // region silently fell back to southeast winds inside the engine, which is
+  // the wrong answer delivered confidently.
+  const regionKey = REGION_WINDS[req.query.region] ? req.query.region : 'southeast';
+  const primarySpecies = String(req.query.species ?? 'redfish');
+
   const cacheKey = `${parseFloat(lat).toFixed(2)}_${parseFloat(lon).toFixed(2)}_${station || 'none'}_${days}`;
   const cached = bonecastCache.get(cacheKey);
   // 3h cache: tide predictions are fixed and the weather model only refreshes
@@ -5269,21 +5320,29 @@ app.get('/api/bonecast', async (req, res) => {
         if (wi < 0) continue;
         const phase = tidePhaseAt(ms);
 
+        const slotInputs = {
+          tidePhase:         phase ?? 'slack_low',
+          tideRangeFt,
+          waterHeightCat:    'optimal',
+          baroTrend:         baroTrendFrom(wxPress, wi),
+          baroAbsCat:        baroAbsCat(wxPress[wi]),
+          windSpeedCategory: windCategory(wxSpeed[wi] ?? 0),
+          windDirection:     degreesToCardinal(wxDir[wi] ?? 0),
+          solunarWindow:     windowAt(ms),
+          moonPhase:         sol.moonPhase,
+          lightWindow:       lh < 7.5 ? 'dawn' : lh > 19.5 ? 'dusk' : 'other',
+        };
+
         slots.push({
           at: ms,
           localHour: +lh.toFixed(2),
-          inputs: {
-            tidePhase:         phase ?? 'slack_low',
-            tideRangeFt,
-            waterHeightCat:    'optimal',
-            baroTrend:         baroTrendFrom(wxPress, wi),
-            baroAbsCat:        baroAbsCat(wxPress[wi]),
-            windSpeedCategory: windCategory(wxSpeed[wi] ?? 0),
-            windDirection:     degreesToCardinal(wxDir[wi] ?? 0),
-            solunarWindow:     windowAt(ms),
-            moonPhase:         sol.moonPhase,
-            lightWindow:       lh < 7.5 ? 'dawn' : lh > 19.5 ? 'dusk' : 'other',
-          },
+          // Inputs stay public: BoneCast renders "SE wind, incoming fast" from
+          // them, and that's a fact about the weather, not a secret.
+          inputs: slotInputs,
+          // Scored here rather than on the client. The client used to run the
+          // engine over these inputs itself, which meant the lookup tables had
+          // to ship to every phone and a weight change needed an app update.
+          ...computeGoodBite(slotInputs, regionKey, primarySpecies),
           windKts: Math.round(wxSpeed[wi] ?? 0),
           windDir: degreesToCardinal(wxDir[wi] ?? 0),
           pressureInHg: wxPress[wi] != null ? +(wxPress[wi] * 0.02953).toFixed(2) : null,
@@ -5318,6 +5377,177 @@ app.get('/api/bonecast', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ═══ GOOD BITE ENGINE ════════════════════════════════════════════════════════
+//
+// Ported verbatim from goodBiteEngine.js on the client. Every lookup table below
+// is byte-for-byte what shipped in the app — this was a MOVE, not a rewrite, so
+// scores before and after are identical. Retuning is a separate decision.
+//
+// Why it lives here now:
+//
+//   1. TUNING. These numbers are hand-tuned judgement, and real catch data will
+//      say they're wrong somewhere. On the client, changing an 18 to a 19 means
+//      an eas update and waiting for every angler to relaunch twice. Here it's
+//      a deploy, live for everyone at once. That's the actual reason.
+//   2. PAST CATCHES. /api/conditions/at can now score a 2019 fish with the same
+//      rules a live one gets, which is what the "Good Bite —" dash was waiting
+//      for. Scoring it client-side would have meant a second copy of this engine.
+//   3. It stops shipping the lookup tables to every phone. Real, but modest: the
+//      breakdown (tide 35 / baro 20 / wind 20 / solunar 25) is rendered in the
+//      UI, so the structure is public regardless. Only the table values are hidden.
+//
+// The categorical INPUTS stay public — BoneCast renders "SE wind, incoming fast"
+// and that's a fact about the weather, not a secret.
+//
+// THIS IS THE ONLY COPY. The client no longer scores anything. If a second one
+// ever appears, the live score and the forecast will disagree and nobody will
+// know which is right.
+
+const TIDE_PHASE_SCORES = {
+  incoming_fast: { redfish: 18, speckled_trout: 15, default: 16 },
+  incoming_slow: { redfish: 13, speckled_trout: 14, default: 12 },
+  outgoing_fast: { redfish: 16, speckled_trout: 13, default: 14 },
+  outgoing_slow: { redfish: 10, speckled_trout: 9,  default: 9  },
+  slack_high:    { redfish: 4,  speckled_trout: 6,  default: 5  },
+  slack_low:     { redfish: 3,  speckled_trout: 4,  default: 3  },
+};
+
+function tidePhaseScore(phase, primarySpecies) {
+  const row = TIDE_PHASE_SCORES[phase] ?? TIDE_PHASE_SCORES.slack_low;
+  return row[primarySpecies] ?? row.default;
+}
+
+function tideRangeScore(rangeFt) {
+  if (rangeFt >= 7) return 12;
+  if (rangeFt >= 5) return 10;
+  return 5;
+}
+
+function waterHeightScore(heightCategory, primarySpecies) {
+  if (primarySpecies === 'redfish') {
+    return { optimal: 5, too_high: 1, too_low: 2 }[heightCategory] ?? 2;
+  }
+  return { optimal: 4, too_high: 2, too_low: 1 }[heightCategory] ?? 2;
+}
+
+const BARO_TREND_SCORES = {
+  rising_slow:  17,
+  rising_fast:  12,
+  stable:       14,
+  falling_slow: 10,
+  falling_fast:  3,
+};
+
+const BARO_ABS_MODIFIER = { normal: 0, high: 2, low: -5 };
+
+const WIND_SPEED_SCORES = {
+  redfish:        { calm: 6,  light: 9, moderate: 7, strong: 3, gale: 0 },
+  speckled_trout: { calm: 10, light: 9, moderate: 5, strong: 2, gale: 0 },
+  default:        { calm: 7,  light: 8, moderate: 6, strong: 3, gale: 0 },
+};
+
+function windSpeedScore(speedCategory, primarySpecies) {
+  const map = WIND_SPEED_SCORES[primarySpecies] ?? WIND_SPEED_SCORES.default;
+  return map[speedCategory] ?? 0;
+}
+
+// Note: regionSpecies.js also carries a `biteWeights` block with preferred/veto
+// winds. Nothing has ever read it — getBiteWeights() was exported and never
+// called, and the engine always inlined its own table. This is the live one.
+const REGION_WINDS = {
+  southeast:  { preferred: ['SW', 'W', 'SE'], veto: ['N', 'NW'] },
+  gulf:       { preferred: ['S', 'SE', 'E'],  veto: ['N', 'NW'] },
+  midatlantic:{ preferred: ['SW', 'W', 'NW'], veto: ['NE'] },
+  northeast:  { preferred: ['SW', 'W'],       veto: ['NE', 'E'] },
+  westcoast:  { preferred: ['NW', 'N'],       veto: ['S', 'SW'] },
+};
+
+function windDirScore(direction, regionKey) {
+  const winds = REGION_WINDS[regionKey] ?? REGION_WINDS.southeast;
+  if (winds.preferred.includes(direction)) return 7;
+  if (winds.veto.includes(direction))      return 1;
+  return 4;
+}
+
+const SOLUNAR_WINDOW_SCORES = {
+  major_peak: 15, major_near: 10, minor_peak: 8, minor_near: 5, between: 2,
+};
+const MOON_PHASE_BONUS   = { full: 7, new: 7, quarter: 4, other: 0 };
+const LIGHT_WINDOW_BONUS = { dawn: 3, dusk: 3, other: 0 };
+
+function getVetoReason(inputs, regionKey) {
+  const winds = REGION_WINDS[regionKey] ?? REGION_WINDS.southeast;
+  if (inputs.windSpeedCategory === 'gale') {
+    return { type: 'danger', text: 'Gale conditions — stay off the water. Score hard-capped at 15.', cap: 15 };
+  }
+  if (inputs.baroTrend === 'falling_fast') {
+    return { type: 'warning', text: 'Rapidly falling pressure — fish in lock-jaw mode. Score capped at 45.', cap: 45 };
+  }
+  if (winds.veto.includes(inputs.windDirection) && inputs.windSpeedCategory === 'strong') {
+    return { type: 'warning', text: `${inputs.windDirection} wind at strong speed — tough conditions for this region.`, cap: 50 };
+  }
+  return null;
+}
+
+function scoreLabel(score) {
+  if (score >= 90) return 'Elite bite';
+  if (score >= 75) return 'Good bite';
+  if (score >= 60) return 'Fair bite';
+  if (score >= 40) return 'Slow fishing';
+  return 'Stay dockside';
+}
+
+function computeGoodBite(inputs, regionKey = 'southeast', primarySpecies = 'redfish') {
+  // Tide (max 35)
+  const phasePts  = tidePhaseScore(inputs.tidePhase, primarySpecies);
+  const rangePts  = tideRangeScore(inputs.tideRangeFt ?? 6);
+  const heightPts = waterHeightScore(inputs.waterHeightCat ?? 'optimal', primarySpecies);
+  const tidePts   = Math.min(35, phasePts + rangePts + heightPts);
+
+  // Pressure (max 20)
+  const baroBase = BARO_TREND_SCORES[inputs.baroTrend]  ?? 10;
+  const baroMod  = BARO_ABS_MODIFIER[inputs.baroAbsCat] ?? 0;
+  const baroPts  = Math.max(0, Math.min(20, baroBase + baroMod));
+
+  // Wind (max 20)
+  const wSpeedPts = windSpeedScore(inputs.windSpeedCategory, primarySpecies);
+  const wDirPts   = windDirScore(inputs.windDirection, regionKey);
+  const windPts   = Math.min(20, wSpeedPts + wDirPts);
+
+  // Solunar (max 25)
+  const solPts     = SOLUNAR_WINDOW_SCORES[inputs.solunarWindow] ?? 2;
+  const moonBonus  = MOON_PHASE_BONUS[inputs.moonPhase]          ?? 0;
+  const lightPts   = LIGHT_WINDOW_BONUS[inputs.lightWindow]      ?? 0;
+  const solunarPts = Math.min(25, solPts + moonBonus + lightPts);
+
+  let rawScore = tidePts + baroPts + windPts + solunarPts;
+
+  // Convergence: fast tide + major solunar = x1.1
+  const tideStrong    = ['incoming_fast', 'outgoing_fast'].includes(inputs.tidePhase)
+                        && (inputs.tideRangeFt ?? 6) >= 5;
+  const solunarStrong = ['major_peak', 'major_near'].includes(inputs.solunarWindow);
+  const convergence   = tideStrong && solunarStrong;
+  if (convergence) rawScore = Math.round(rawScore * 1.1);
+
+  const veto = getVetoReason(inputs, regionKey);
+  let finalScore = rawScore;
+  if (veto) finalScore = Math.min(rawScore, veto.cap);
+  finalScore = Math.max(0, Math.min(100, finalScore));
+
+  return {
+    score: finalScore,
+    label: scoreLabel(finalScore),
+    breakdown: {
+      tide:    { pts: tidePts,    max: 35 },
+      baro:    { pts: baroPts,    max: 20 },
+      wind:    { pts: windPts,    max: 20 },
+      solunar: { pts: solunarPts, max: 25 },
+    },
+    veto,
+    convergenceBonus: convergence,
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/conditions/at — the conditions as they WERE at a past moment
@@ -5412,6 +5642,12 @@ app.get('/api/conditions/at', async (req, res) => {
     // Mirrors /api/tides: ask for GMT, convert to real ISO instants, then it's
     // plain epoch math and immune to whatever timezone this server runs in.
     let tideHeightFt = null, tideDirection = null;
+    // The engine needs the 6-value phase and the day's range, not just a height
+    // and a direction. Derived with the SAME expressions /api/tides uses (the
+    // 0.3ft slack threshold, the 24h max-min range) — a second, subtly different
+    // definition of "incoming_fast" here would mean a past catch and a live one
+    // could disagree about identical water.
+    let tidePhase = null, tideRangeFt = null;
     try {
       const tideData = tideRes ? await tideRes.json() : null;
       const predictions = (tideData?.predictions ?? [])
@@ -5430,8 +5666,18 @@ app.get('/api/conditions/at', async (req, res) => {
       if (before && after) {
         const frac = (atMs - before.t) / (after.t - before.t);
         tideHeightFt  = parseFloat((before.v + frac * (after.v - before.v)).toFixed(2));
-        tideDirection = after.v > before.v ? 'Incoming' : 'Outgoing';
+        const rising  = after.v > before.v;
+        tideDirection = rising ? 'Incoming' : 'Outgoing';
+        tidePhase = Math.abs(after.v - before.v) < 0.3
+          ? (rising ? 'slack_high' : 'slack_low')
+          : (rising ? 'incoming_fast' : 'outgoing_fast');
       }
+      // Range across the 24h containing the catch, not "the next 24h from now" —
+      // for a past instant, "now" is meaningless.
+      const dayVals = predictions
+        .filter(p => Math.abs(p.t - atMs) <= 12 * 3600 * 1000)
+        .map(p => p.v);
+      if (dayVals.length) tideRangeFt = Math.max(...dayVals) - Math.min(...dayVals);
     } catch {
       // Malformed NOAA payload — leave tide null rather than invent a height.
     }
@@ -5471,8 +5717,7 @@ app.get('/api/conditions/at', async (req, res) => {
         stationName: station?.name ?? null,
         distKm:      station?.distKm ?? null,
       },
-      // Shaped to match /api/conditions exactly, so the client can hand this to
-      // the same goodBiteEngine it already feeds with live data.
+      // Shaped to match /api/conditions exactly.
       wind: windKts != null ? {
         speedKts:      Math.round(windKts),
         direction:     windDeg != null ? degreesToCardinal(windDeg) : null,
@@ -5486,12 +5731,43 @@ app.get('/api/conditions/at', async (req, res) => {
       } : null,
       airTempF: airTempC != null ? Math.round(airTempC * 9 / 5 + 32) : null,
       solunar: computeSolunar(latN, lonN, when),
+      tidePhase,
+      tideRangeFt: tideRangeFt != null ? +tideRangeFt.toFixed(2) : null,
       sources: {
         tide:    station  ? 'NOAA harmonic predictions' : null,
         weather: windKts != null ? (ageDays > 60 ? 'Open-Meteo ERA5 archive' : 'Open-Meteo') : null,
         moon:    'computed',
       },
     };
+
+    // Score the past instant with the same engine a live catch gets. This is
+    // what the "Good Bite —" dash on past catches was waiting for: the engine
+    // used to live on the client, so the only way to score a backdated catch
+    // was to reimplement the rules here and hope they matched. Now there's one
+    // engine and one answer.
+    //
+    // Only scored when the inputs are actually there. A missing tide station or
+    // a gap in the weather archive means we genuinely don't know what the bite
+    // was — and a confident 34/100 built on defaults is worse than the dash,
+    // because the dash is honest.
+    const region  = REGION_WINDS[req.query.region] ? req.query.region : 'southeast';
+    const species = String(req.query.species ?? 'redfish');
+    if (tidePhase && data.wind && data.pressure) {
+      data.goodBite = computeGoodBite({
+        tidePhase,
+        tideRangeFt:       tideRangeFt ?? 6,
+        waterHeightCat:    'optimal',
+        baroTrend:         data.pressure.trend,
+        baroAbsCat:        data.pressure.absCat,
+        windSpeedCategory: data.wind.speedCategory,
+        windDirection:     data.wind.direction,
+        solunarWindow:     data.solunar?.window     ?? 'between',
+        moonPhase:         data.solunar?.moonPhase  ?? 'other',
+        lightWindow:       data.solunar?.lightWindow ?? 'other',
+      }, region, species);
+    } else {
+      data.goodBite = null;
+    }
 
     if (historicalConditionsCache.size >= HISTORICAL_CACHE_MAX) {
       historicalConditionsCache.delete(historicalConditionsCache.keys().next().value);
