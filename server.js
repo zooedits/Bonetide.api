@@ -719,6 +719,23 @@ app.put('/api/auth/name', requireAuth, async (req, res) => {
 // implementation in case that helper isn't visible in this version of the file.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Incoming transformation applied to EVERY upload before the asset is stored.
+//
+// This is a privacy control, not a cosmetic one. Cloudinary retains the original
+// EXIF/IPTC/GPS on upload and only strips metadata once a transformation is
+// applied — and a transformation baked into the delivery URL does NOT count,
+// because the untransformed original still sits there and is served the moment
+// anyone edits the transform segment out of the URL. Catch photos were the worst
+// case: they store a plain secure_url with no transform at all, so the exact GPS
+// coordinates of where somebody fishes were public to anyone with the link.
+//
+// An INCOMING transformation runs before storage, so the stored original is the
+// scrubbed one and there is no clean copy left behind. `a_exif` is Cloudinary's
+// own recommendation for this: it rotates the image per its EXIF orientation
+// tag FIRST, so photos stay right-side-up after the tag that described their
+// rotation is thrown away.
+const CLOUDINARY_STRIP_METADATA = 'a_exif';
+
 async function uploadImageToCloudinary(base64, { folder, transformation }) {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   const apiKey    = process.env.CLOUDINARY_API_KEY;
@@ -728,9 +745,10 @@ async function uploadImageToCloudinary(base64, { folder, transformation }) {
   // Signed upload: sign the param set (everything except file/api_key/signature
   // itself) with the API secret, per Cloudinary's signature algorithm —
   // alphabetically sorted "key=value" pairs joined with '&', SHA1 hashed with
-  // the secret appended.
+  // the secret appended. `transformation` is a signed param, so it has to go in
+  // here as well as in the form body or Cloudinary rejects the upload.
   const timestamp = Math.floor(Date.now() / 1000);
-  const paramsToSign = { folder, timestamp };
+  const paramsToSign = { folder, timestamp, transformation: CLOUDINARY_STRIP_METADATA };
   const signatureBase = Object.keys(paramsToSign)
     .sort()
     .map(k => `${k}=${paramsToSign[k]}`)
@@ -743,6 +761,7 @@ async function uploadImageToCloudinary(base64, { folder, transformation }) {
   form.append('timestamp', String(timestamp));
   form.append('signature', signature);
   form.append('folder', folder);
+  form.append('transformation', CLOUDINARY_STRIP_METADATA);
 
   const res = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
     method: 'POST',
