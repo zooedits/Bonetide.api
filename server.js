@@ -1007,6 +1007,15 @@ app.delete('/api/auth/account', requireAuth, async (req, res) => {
     await client.query(
       `DELETE FROM blocks WHERE blocker_id = $1 OR blocked_id = $1`, [me.id]
     ).catch(e => console.error('[delete-account] blocks:', e.message));
+    // Private conversations die with the account, both sides. Unlike public
+    // catches — which stay under the tombstone because they were published on
+    // purpose — a DM was never public, and leaving one person's half of a
+    // private thread readable by the other after they deleted their account is
+    // the opposite of what "delete my account" means. CASCADE takes the
+    // messages and both state rows.
+    await client.query(
+      `DELETE FROM conversations WHERE user_a = $1 OR user_b = $1`, [me.id]
+    ).catch(e => console.error('[delete-account] conversations:', e.message));
     await client.query('COMMIT');
 
     // Post-commit, best-effort. The account is already gone either way.
@@ -2463,17 +2472,424 @@ app.get('/api/blocks', requireAuth, async (req, res) => {
   }
 });
 
+// ═══ DIRECT MESSAGES ═════════════════════════════════════════════════════════
+//
+// Guideline 1.2 makes a DM inbox the highest-risk surface in the app: it's the
+// one place a stranger can put text in front of someone who never asked for it.
+// Four gates, all server-side, none of them optional:
+//
+//   1. BLOCKS       — a blocked pair can't reach each other, either direction.
+//   2. REQUESTS     — a message from someone you don't follow lands in Requests,
+//                     not your inbox, and the sender gets ONE message until you
+//                     accept. One, not "a few": the cap is the entire defence
+//                     against someone typing at you until you engage.
+//   3. CONTENT      — same hate/threat/profanity filter as spots and comments.
+//   4. BANS         — suspended accounts can't send.
+//
+// "Following them" is the accept signal because it's the one already-existing
+// piece of evidence that you want to hear from someone.
+//
+// No push notifications yet (APNs isn't wired), so the client polls. That's why
+// the list endpoint is cheap and returns unread counts rather than bodies.
+
+const MAX_MESSAGE_LEN = 2000;
+const PENDING_MESSAGE_CAP = 1;
+
+// Canonical pair ordering — see the CHECK on conversations.
+const pairOrder = (x, y) => (x < y ? [x, y] : [y, x]);
+
+// One conversation per pair, created on demand. ON CONFLICT rather than
+// SELECT-then-INSERT: two people tapping "message" at the same instant would
+// otherwise both see no row and both insert.
+async function getOrCreateConversation(client, meId, otherId) {
+  const [a, b] = pairOrder(meId, otherId);
+  const { rows } = await client.query(
+    `INSERT INTO conversations (user_a, user_b) VALUES ($1,$2)
+     ON CONFLICT (user_a, user_b) DO UPDATE SET user_a = EXCLUDED.user_a
+     RETURNING id, user_a, user_b, created_at`,
+    [a, b]
+  );
+  const conv = rows[0];
+  // State rows for both sides. The sender has implicitly accepted by writing;
+  // the recipient's `accepted` is what the request gate reads.
+  await client.query(
+    `INSERT INTO conversation_state (conversation_id, user_id, accepted)
+     VALUES ($1,$2,true) ON CONFLICT DO NOTHING`, [conv.id, meId]
+  );
+  await client.query(
+    `INSERT INTO conversation_state (conversation_id, user_id, accepted)
+     VALUES ($1,$2,false) ON CONFLICT DO NOTHING`, [conv.id, otherId]
+  );
+  return conv;
+}
+
+// Shared preflight for anything that puts a message in front of someone.
+async function canMessage(meId, otherId) {
+  if (meId === otherId) return { error: "You can't message yourself", status: 400 };
+
+  const { rows: [u] } = await pool.query(
+    `SELECT id, COALESCE(is_deleted,false) AS is_deleted, COALESCE(is_banned,false) AS is_banned
+       FROM users WHERE id=$1`, [otherId]
+  );
+  if (!u || u.is_deleted) return { error: 'Angler not found', status: 404 };
+
+  const { rows: [me] } = await pool.query(
+    `SELECT COALESCE(is_banned,false) AS is_banned FROM users WHERE id=$1`, [meId]
+  );
+  if (me?.is_banned) return { error: 'Your account is suspended.', status: 403 };
+
+  // Same 404 as "not found", deliberately. A distinct "you are blocked" reply
+  // tells a harasser their target is still there and has blocked them, which is
+  // information they can act on.
+  const { rows: blocked } = await pool.query(
+    `SELECT 1 FROM blocks
+      WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1) LIMIT 1`,
+    [meId, otherId]
+  );
+  if (blocked.length) return { error: 'Angler not found', status: 404 };
+
+  return { ok: true };
+}
+
+// POST /api/messages { toUserId, body } — start or continue a thread.
+app.post('/api/messages', requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+
+    const toUserId = parseInt(req.body?.toUserId, 10);
+    const body = String(req.body?.body ?? '').trim();
+    if (!Number.isInteger(toUserId)) return res.status(400).json({ error: 'toUserId is required' });
+    if (!body)                       return res.status(400).json({ error: 'Message cannot be empty' });
+    if (body.length > MAX_MESSAGE_LEN) {
+      return res.status(400).json({ error: `Messages are limited to ${MAX_MESSAGE_LEN} characters.` });
+    }
+
+    const gate = await canMessage(me.id, toUserId);
+    if (gate.error) return res.status(gate.status).json({ error: gate.error });
+
+    const cat = blockedCategory(body);
+    if (cat) {
+      logModeration(req, 'message', cat, body);
+      return res.status(422).json({
+        error: "That message contains language that isn't allowed on Bone Tide Co. Please keep it respectful.",
+        blocked: true, category: cat,
+      });
+    }
+
+    await client.query('BEGIN');
+    const conv = await getOrCreateConversation(client, me.id, toUserId);
+
+    // The request gate. If the recipient hasn't accepted, the sender gets
+    // PENDING_MESSAGE_CAP messages and no more. Checked inside the transaction
+    // so two rapid sends can't both read "0 so far" and both insert.
+    const { rows: [state] } = await client.query(
+      `SELECT accepted FROM conversation_state WHERE conversation_id=$1 AND user_id=$2 FOR UPDATE`,
+      [conv.id, toUserId]
+    );
+    let pending = !state?.accepted;
+
+    if (pending) {
+      // Following someone is the one existing signal that you want to hear from
+      // them, so it auto-accepts and skips the request queue entirely.
+      const { rows: follows } = await client.query(
+        `SELECT 1 FROM follows WHERE follower_id=$1 AND followee_id=$2 LIMIT 1`,
+        [toUserId, me.id]
+      );
+      if (follows.length) {
+        await client.query(
+          `UPDATE conversation_state SET accepted=true WHERE conversation_id=$1 AND user_id=$2`,
+          [conv.id, toUserId]
+        );
+        pending = false;
+      }
+    }
+
+    if (pending) {
+      const { rows: [{ count }] } = await client.query(
+        `SELECT COUNT(*)::int AS count FROM messages WHERE conversation_id=$1 AND sender_id=$2`,
+        [conv.id, me.id]
+      );
+      if (count >= PENDING_MESSAGE_CAP) {
+        await client.query('ROLLBACK');
+        return res.status(429).json({
+          error: 'Your message request is waiting. You can send more once they accept it.',
+          pending: true,
+        });
+      }
+    }
+
+    const { rows: [msg] } = await client.query(
+      `INSERT INTO messages (conversation_id, sender_id, body) VALUES ($1,$2,$3)
+       RETURNING id, conversation_id, sender_id, body, created_at`,
+      [conv.id, me.id, body]
+    );
+    await client.query(`UPDATE conversations SET last_message_at=NOW() WHERE id=$1`, [conv.id]);
+    // Sending is reading: your own message shouldn't come back as unread.
+    await client.query(
+      `UPDATE conversation_state SET last_read_at=NOW() WHERE conversation_id=$1 AND user_id=$2`,
+      [conv.id, me.id]
+    );
+    await client.query('COMMIT');
+
+    res.json({
+      ok: true,
+      pending,
+      conversationId: conv.id,
+      message: {
+        id: msg.id, conversationId: msg.conversation_id, senderId: msg.sender_id,
+        body: msg.body, createdAt: msg.created_at, mine: true,
+      },
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('[messages:send] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/conversations?box=inbox|requests
+app.get('/api/conversations', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const box = req.query.box === 'requests' ? 'requests' : 'inbox';
+
+    // A thread is a REQUEST until you accept it. Your own outgoing threads are
+    // always inbox — you started them, they aren't requests to you.
+    const acceptedSql = box === 'requests' ? 'AND ms.accepted = false' : 'AND ms.accepted = true';
+
+    const { rows } = await pool.query(
+      `SELECT c.id, c.last_message_at,
+              other.id AS other_id, other.name AS other_name, other.avatar AS other_avatar,
+              other.is_club, other.club_badge, other.equipped_ring,
+              ms.last_read_at,
+              (SELECT body FROM messages m WHERE m.conversation_id=c.id AND m.hidden IS NOT TRUE
+                ORDER BY m.id DESC LIMIT 1) AS last_body,
+              (SELECT sender_id FROM messages m WHERE m.conversation_id=c.id AND m.hidden IS NOT TRUE
+                ORDER BY m.id DESC LIMIT 1) AS last_sender,
+              (SELECT COUNT(*)::int FROM messages m
+                WHERE m.conversation_id=c.id AND m.hidden IS NOT TRUE AND m.sender_id <> $1
+                  AND (ms.last_read_at IS NULL OR m.created_at > ms.last_read_at)) AS unread
+         FROM conversations c
+         JOIN conversation_state ms ON ms.conversation_id=c.id AND ms.user_id=$1
+         JOIN users other ON other.id = CASE WHEN c.user_a=$1 THEN c.user_b ELSE c.user_a END
+        WHERE ($1 = c.user_a OR $1 = c.user_b)
+          AND COALESCE(other.is_deleted,false) = false
+          AND NOT EXISTS (
+            SELECT 1 FROM blocks b
+             WHERE (b.blocker_id=$1 AND b.blocked_id=other.id)
+                OR (b.blocked_id=$1 AND b.blocker_id=other.id)
+          )
+          AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id AND m.hidden IS NOT TRUE)
+          ${acceptedSql}
+        ORDER BY c.last_message_at DESC
+        LIMIT 100`,
+      [me.id]
+    );
+
+    res.json({
+      conversations: rows.map(r => ({
+        id: r.id,
+        lastMessageAt: r.last_message_at,
+        lastMessage: r.last_body ?? null,
+        lastFromMe: r.last_sender === me.id,
+        unread: r.unread ?? 0,
+        angler: {
+          id: r.other_id, name: r.other_name ?? 'Angler', avatar: r.other_avatar ?? null,
+          isClub: !!r.is_club, badge: r.club_badge ?? null, ringId: r.equipped_ring ?? null,
+        },
+      })),
+    });
+  } catch (err) {
+    console.error('[conversations] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Badge counts for the tab bar. Deliberately separate and tiny — the client
+// polls this, and polling the full list to render one number is wasteful.
+app.get('/api/conversations/unread-count', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const { rows: [r] } = await pool.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN ms.accepted THEN sub.unread ELSE 0 END), 0)::int AS unread,
+         COUNT(*) FILTER (WHERE NOT ms.accepted AND sub.total > 0)::int AS requests
+       FROM conversations c
+       JOIN conversation_state ms ON ms.conversation_id=c.id AND ms.user_id=$1
+       JOIN users other ON other.id = CASE WHEN c.user_a=$1 THEN c.user_b ELSE c.user_a END
+       JOIN LATERAL (
+         SELECT COUNT(*) FILTER (
+                  WHERE m.sender_id <> $1
+                    AND (ms.last_read_at IS NULL OR m.created_at > ms.last_read_at)
+                )::int AS unread,
+                COUNT(*)::int AS total
+           FROM messages m WHERE m.conversation_id=c.id AND m.hidden IS NOT TRUE
+       ) sub ON true
+      WHERE COALESCE(other.is_deleted,false) = false
+        AND NOT EXISTS (
+          SELECT 1 FROM blocks b
+           WHERE (b.blocker_id=$1 AND b.blocked_id=other.id)
+              OR (b.blocked_id=$1 AND b.blocker_id=other.id)
+        )`,
+      [me.id]
+    );
+    res.json({ unread: r?.unread ?? 0, requests: r?.requests ?? 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Resolve a conversation the caller is actually part of, or 404.
+async function loadConversationFor(meId, convId) {
+  const id = parseInt(convId, 10);
+  if (!Number.isInteger(id)) return { error: 'Invalid conversation', status: 400 };
+  const { rows: [c] } = await pool.query(
+    `SELECT id, user_a, user_b FROM conversations WHERE id=$1 AND ($2 = user_a OR $2 = user_b)`,
+    [id, meId]
+  );
+  if (!c) return { error: 'Conversation not found', status: 404 };
+  const otherId = c.user_a === meId ? c.user_b : c.user_a;
+  return { conv: c, otherId };
+}
+
+// GET /api/conversations/:id/messages?before=<id>
+app.get('/api/conversations/:id/messages', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+
+    const r = await loadConversationFor(me.id, req.params.id);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+
+    // Blocked mid-thread: the history goes away for both sides.
+    const gateBlocked = await pool.query(
+      `SELECT 1 FROM blocks
+        WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1) LIMIT 1`,
+      [me.id, r.otherId]
+    );
+    if (gateBlocked.rows.length) return res.status(404).json({ error: 'Conversation not found' });
+
+    const before = parseInt(req.query.before, 10);
+    const params = [r.conv.id];
+    let beforeSql = '';
+    if (Number.isInteger(before)) { params.push(before); beforeSql = `AND m.id < $${params.length}`; }
+
+    const { rows } = await pool.query(
+      `SELECT m.id, m.sender_id, m.body, m.created_at
+         FROM messages m
+        WHERE m.conversation_id=$1 AND m.hidden IS NOT TRUE ${beforeSql}
+        ORDER BY m.id DESC LIMIT 50`,
+      params
+    );
+
+    const { rows: [st] } = await pool.query(
+      `SELECT accepted FROM conversation_state WHERE conversation_id=$1 AND user_id=$2`,
+      [r.conv.id, me.id]
+    );
+    const { rows: [other] } = await pool.query(
+      `SELECT id, name, avatar, is_club, club_badge, equipped_ring, public_profile
+         FROM users WHERE id=$1`, [r.otherId]
+    );
+
+    res.json({
+      conversationId: r.conv.id,
+      accepted: !!st?.accepted,
+      angler: {
+        id: other?.id, name: other?.name ?? 'Angler', avatar: other?.avatar ?? null,
+        isClub: !!other?.is_club, badge: other?.club_badge ?? null,
+        ringId: other?.equipped_ring ?? null, publicProfile: !!other?.public_profile,
+      },
+      // Reversed: the query pages backwards from newest, the UI reads forwards.
+      messages: rows.reverse().map(m => ({
+        id: m.id, body: m.body, createdAt: m.created_at, mine: m.sender_id === me.id,
+      })),
+    });
+  } catch (err) {
+    console.error('[messages:list] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Accept a request — moves it from Requests to the inbox and lifts the cap.
+app.post('/api/conversations/:id/accept', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const r = await loadConversationFor(me.id, req.params.id);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+    await pool.query(
+      `UPDATE conversation_state SET accepted=true WHERE conversation_id=$1 AND user_id=$2`,
+      [r.conv.id, me.id]
+    );
+    res.json({ ok: true, accepted: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a conversation for BOTH sides.
+//
+// Deliberate: a "delete for me only" on a 1:1 thread means the person who
+// declined a request still has their words sitting in the other person's app,
+// and the decliner has no way to make that stop. Declining should end the
+// thread. If they message again it's a fresh request, subject to the cap again.
+app.delete('/api/conversations/:id', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const r = await loadConversationFor(me.id, req.params.id);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+    // ON DELETE CASCADE takes the messages and both state rows with it.
+    await pool.query(`DELETE FROM conversations WHERE id=$1`, [r.conv.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Mark read. Separate from fetching so opening a thread to page history doesn't
+// silently clear a badge the angler hasn't actually looked at yet.
+app.post('/api/conversations/:id/read', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const r = await loadConversationFor(me.id, req.params.id);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+    await pool.query(
+      `UPDATE conversation_state SET last_read_at=NOW() WHERE conversation_id=$1 AND user_id=$2`,
+      [r.conv.id, me.id]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/report', requireAuth, async (req, res) => {
   try {
     const { targetType, targetId, reason } = req.body ?? {};
     if (!targetType || targetId == null) {
       return res.status(400).json({ error: 'targetType and targetId are required' });
     }
+    // req.user.id is the PROVIDER id from the JWT — a Google `sub` is a 21-digit
+    // string and an Apple `sub` isn't numeric at all. moderation_log.user_id is
+    // INTEGER, so this used to throw "value out of range for type integer" and
+    // every single report 500'd. Resolve the real DB user first, the way
+    // logModeration() already does.
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+
     await pool.query(
       `INSERT INTO moderation_log (user_id, surface, category, content)
        VALUES ($1, $2, $3, $4)`,
-      [req.user.id, `report:${targetType}`, 'user_report',
-       JSON.stringify({ targetType, targetId, reason: reason ?? null, reporterId: req.user.id })]
+      [me.id, `report:${targetType}`, 'user_report',
+       JSON.stringify({ targetType, targetId, reason: reason ?? null, reporterId: me.id })]
     );
     res.json({ ok: true });
   } catch (err) {
@@ -5382,6 +5798,57 @@ pool.query(`
 `).catch(e => console.error('[init] catch_hashtags:', e.message));
 pool.query(`CREATE INDEX IF NOT EXISTS idx_catch_hashtags_tag ON catch_hashtags(tag)`)
   .catch(e => console.error('[init] idx_catch_hashtags_tag:', e.message));
+
+// ── Direct messages ─────────────────────────────────────────────────────────
+// 1:1 only. No groups: they need their own membership model, admin roles and
+// leave semantics, and none of that should be improvised underneath a schema
+// built for pairs.
+//
+// The CHECK (user_a < user_b) is doing real work. Storing the pair in canonical
+// order means (5,9) and (9,5) are the same row by construction, so the UNIQUE
+// constraint makes duplicate conversations impossible instead of something two
+// people tapping "message" simultaneously can race into existence.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS conversations (
+    id              SERIAL PRIMARY KEY,
+    user_a          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_b          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    last_message_at TIMESTAMPTZ DEFAULT NOW(),
+    CHECK (user_a < user_b),
+    UNIQUE (user_a, user_b)
+  )
+`).catch(e => console.error('[init] conversations:', e.message));
+
+// Per-user, per-conversation state. Split out from `conversations` because the
+// two people in a thread disagree: you accepted it, they haven't; you've read
+// it, they haven't. One row per side is the only shape that can express that.
+//
+// `accepted` is the message-request gate. `last_read_at` drives unread counts.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS conversation_state (
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    accepted        BOOLEAN DEFAULT false,
+    last_read_at    TIMESTAMPTZ,
+    PRIMARY KEY (conversation_id, user_id)
+  )
+`).catch(e => console.error('[init] conversation_state:', e.message));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS messages (
+    id              SERIAL PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    sender_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    body            TEXT NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    hidden          BOOLEAN DEFAULT false
+  )
+`).catch(e => console.error('[init] messages:', e.message));
+// Threads are always read newest-first within one conversation, so the index
+// matches that exactly rather than making Postgres sort every open.
+pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id DESC)`)
+  .catch(e => console.error('[init] idx_messages_conv:', e.message));
 pool.query(`
   CREATE TABLE IF NOT EXISTS moderation_log (
     id         SERIAL PRIMARY KEY,
