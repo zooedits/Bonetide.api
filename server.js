@@ -2413,6 +2413,23 @@ app.post('/api/anglers/:id/follow', requireAuth, async (req, res) => {
       `INSERT INTO follows (follower_id, followee_id) VALUES ($1,$2)
        ON CONFLICT DO NOTHING`, [me.id, r.target.id]
     );
+    // A new follower is a real event and worth a buzz. Deliberately NOT doing
+    // this for likes: they're the highest-volume, lowest-information thing here,
+    // and an app that buzzes on every like gets its notifications switched off
+    // wholesale — which takes DMs and comments down with it, because iOS has one
+    // permission for all of it. Reddit batches them ("5 upvotes!") for a reason.
+    const { rows: [meRow] } = await pool.query(`SELECT name FROM users WHERE id=$1`, [me.id]);
+    notifyActivity({
+      actorId: me.id,
+      recipientId: r.target.id,
+      title: 'New follower',
+      body: `${meRow?.name || 'Someone'} started following you`,
+      // AnglerProfile is a real registered route and reads route.params.anglerId
+      // — verified, not assumed. Opens the new follower's profile so you can
+      // follow back.
+      data: { screen: 'AnglerProfile', params: { anglerId: me.id } },
+    }).catch(() => {});
+
     const counts = await followCounts(r.target.id);
     res.json({ ok: true, following: true, ...counts });
   } catch (err) {
@@ -3988,6 +4005,30 @@ app.post('/api/comments', async (req, res) => {
     const { rows: [userRow] } = await pool.query(
       `SELECT name, avatar, anonymize_shared, is_club, club_badge, equipped_ring FROM users WHERE id=$1`, [user.id]
     );
+    // Tell whoever owns the catch/spot. This is the notification people actually
+    // care about — someone said something to them — and it fired nowhere until
+    // now, so a comment on your photo was completely silent.
+    //
+    // Replies notify the CONTENT OWNER, not the parent commenter. That's a known
+    // gap: reply to someone else's comment on my catch and they hear nothing.
+    // Doing it properly means looking up parentCommentId's author and notifying
+    // both without double-buzzing the owner — worth doing, not tonight.
+    const ownerId = await ownerOfTarget(targetType, tId);
+    notifyActivity({
+      actorId: user.id,
+      recipientId: ownerId,
+      title: `${userRow?.name || 'Someone'} commented`,
+      body: body.trim().length > 120 ? body.trim().slice(0, 119) + '…' : body.trim(),
+      // NO deep link. There is no route that opens a single catch — MyCatches
+      // and Feed don't take params, so there's nothing to navigate TO. App.js
+      // only navigates when data.screen is set, so this opens the app and stops,
+      // which beats dumping someone on the wrong screen.
+      //
+      // When a catch-detail route exists, add { screen, params } here and the
+      // tap handler picks it up with no other changes.
+      data: {},
+    }).catch(() => {});
+
     res.json({ comment: {
       ...formatComment(newComment, userRow),
       authorAvatar: userRow?.anonymize_shared ? null : (userRow?.avatar ?? null),
@@ -7009,6 +7050,46 @@ async function sendPush(messages) {
         }
       });
     } catch (e) { console.error('[push] send error:', e.message); }
+  }
+}
+
+// Who should hear about activity on a catch or a spot.
+async function ownerOfTarget(targetType, targetId) {
+  const table = targetType === 'catch' ? 'catches' : targetType === 'spot' ? 'spots' : null;
+  if (!table) return null;
+  try {
+    const { rows } = await pool.query(`SELECT user_id FROM ${table} WHERE id=$1`, [targetId]);
+    return rows[0]?.user_id ?? null;
+  } catch { return null; }
+}
+
+// Notify about activity on someone's content: a comment, a new follower.
+// Everything worth suppressing is suppressed HERE rather than at each call site,
+// so a new notification type can't quietly skip a check:
+//
+//   - your own activity (commenting on your own catch shouldn't buzz you)
+//   - either direction of a block
+//   - shadowbanned actors (their comment is hidden; the buzz would give it away)
+//
+// Never awaited by callers: Expo is a third party and a slow push must not make
+// commenting hang or fail.
+async function notifyActivity({ actorId, recipientId, title, body, data }) {
+  try {
+    if (!recipientId || !actorId) return;
+    if (recipientId === actorId) return;
+
+    const { rows: blocked } = await pool.query(
+      `SELECT 1 FROM blocks
+        WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1) LIMIT 1`,
+      [actorId, recipientId]
+    );
+    if (blocked.length) return;
+
+    if (await isShadowbanned(actorId)) return;
+
+    await notifyUser(recipientId, title, body, data);
+  } catch (e) {
+    console.error('[push] notifyActivity:', e.message);
   }
 }
 
