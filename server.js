@@ -7181,6 +7181,19 @@ async function sendPush(messages) {
   }
 }
 
+// The notification sound, bundled via app.json -> expo-notifications -> sounds.
+// One constant so the filename can't drift between here and app.json.
+//
+// Kept short (1.1s) and mono on purpose: you hear this EVERY time, and the thing
+// that delights on day one is what gets an app muted by day thirty. If you ever
+// want per-event sounds, notifyActivity already knows the `type` — branch here,
+// but add each file to app.json and rebuild, or iOS silently falls back.
+// Named reeldrag.wav, not drag.wav, purely to dodge a Windows problem: the
+// original recording is drag.WAV, Windows is case-insensitive, and it won't let
+// a drag.wav sit next to it. A distinct name avoids the collision entirely.
+// The case still matters — iOS looks this name up literally.
+const NOTIFICATION_SOUND = 'reeldrag.wav';
+
 // Who should hear about activity on a catch or a spot.
 async function ownerOfTarget(targetType, targetId) {
   const table = targetType === 'catch' ? 'catches' : targetType === 'spot' ? 'spots' : null;
@@ -7237,7 +7250,13 @@ async function notifyUser(userId, title, body, data = {}) {
   try {
     const { rows } = await pool.query(`SELECT token FROM push_tokens WHERE user_id = $1`, [userId]);
     if (!rows.length) return;   // no devices registered — nothing to do
-    await sendPush(rows.map((r) => ({ to: r.token, title, body, data, sound: 'default', priority: 'high' })));
+    // 'drag.wav' is a real recording of a reel, bundled into the binary by the
+    // expo-notifications plugin in app.json. iOS CANNOT play a sound from a URL
+    // — it has to ship in the build — so this name is meaningless until a build
+    // that includes it is installed. On anything older it falls back to the
+    // system default rather than going silent, which is why this is safe to
+    // deploy before the build lands.
+    await sendPush(rows.map((r) => ({ to: r.token, title, body, data, sound: NOTIFICATION_SOUND, priority: 'high' })));
   } catch (e) { console.error('[push] notifyUser:', e.message); }
 }
 
