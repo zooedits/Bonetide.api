@@ -506,7 +506,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
     let { rows } = await pool.query(
-      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.equipped_ring, u.public_profile,
+      `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.equipped_ring, u.public_profile, u.bio, u.social_platform, u.social_handle,
               COALESCE((
                 SELECT SUM(pt.delta) FROM points_transactions pt
                 WHERE pt.user_id = u.id AND pt.reason = 'catch'
@@ -519,7 +519,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     // Fall back to email match for merged/Apple accounts where provider column is null
     if (!rows.length && req.user.email) {
       ({ rows } = await pool.query(
-        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.equipped_ring, u.public_profile,
+        `SELECT u.name, u.avatar, u.email, u.points_balance, u.birthday_month, u.birthday_boost_at, u.is_admin, u.is_club, u.club_badge, u.equipped_ring, u.public_profile, u.bio, u.social_platform, u.social_handle,
                 COALESCE((
                   SELECT SUM(pt.delta) FROM points_transactions pt
                   WHERE pt.user_id = u.id AND pt.reason = 'catch'
@@ -704,6 +704,91 @@ app.put('/api/auth/name', requireAuth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({ name: rows[0].name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Profile bio + social link
+//
+// The link is a PLATFORM + HANDLE, not a URL, and that's deliberate.
+//
+// A free-text URL field on a public profile is the most reliably abused feature
+// in a small social app: it's where the porn links, the crypto scams and the
+// affiliate spam go. Apple holds the app responsible for it under the same 1.2
+// UGC rules that require reporting and blocking, and there is one person here to
+// review any of it. Storing a handle and building the URL ourselves means nobody
+// can point a profile at an arbitrary domain. A bad HANDLE is still possible;
+// a bad DOMAIN isn't. Sponsor and socials use-cases still work.
+//
+// Adding a platform later is one line here plus one in the client picker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SOCIAL_PLATFORMS = {
+  instagram: { label: 'Instagram', url: h => `https://instagram.com/${h}` },
+  tiktok:    { label: 'TikTok',    url: h => `https://tiktok.com/@${h}` },
+  youtube:   { label: 'YouTube',   url: h => `https://youtube.com/@${h}` },
+  facebook:  { label: 'Facebook',  url: h => `https://facebook.com/${h}` },
+  x:         { label: 'X',         url: h => `https://x.com/${h}` },
+};
+
+const MAX_BIO_LEN = 160;
+
+// Handles only: letters, numbers, dot, underscore, hyphen. No slashes (which
+// would let someone escape the path we build), no protocol, no dots-into-domains.
+const HANDLE_RE = /^[A-Za-z0-9._-]{1,30}$/;
+
+function socialUrlFor(platform, handle) {
+  const p = SOCIAL_PLATFORMS[platform];
+  if (!p || !handle) return null;
+  return p.url(encodeURIComponent(handle));
+}
+
+// Sets bio and social link together — they're edited on one screen, so one call.
+// Send null/'' for either to clear it.
+app.put('/api/auth/profile', requireAuth, async (req, res) => {
+  try {
+    const rawBio = req.body?.bio;
+    const bio = rawBio == null ? null : String(rawBio).trim().slice(0, MAX_BIO_LEN);
+
+    // Public text, so it runs the same filter as captions and DMs. Note the
+    // display-name endpoint above does NOT do this yet — separate gap.
+    if (bio) {
+      const cat = blockedCategory(bio);
+      if (cat) return res.status(400).json({ error: 'That bio contains content we do not allow.', category: cat });
+    }
+
+    let platform = req.body?.socialPlatform ?? null;
+    let handle   = req.body?.socialHandle ?? null;
+    if (platform) {
+      platform = String(platform).toLowerCase();
+      if (!SOCIAL_PLATFORMS[platform]) return res.status(400).json({ error: 'Unknown platform' });
+      // A leading @ is what people type; strip it rather than reject them for it.
+      handle = String(handle ?? '').trim().replace(/^@+/, '');
+      if (!HANDLE_RE.test(handle)) {
+        return res.status(400).json({ error: 'Handle can only use letters, numbers, dots, underscores and hyphens.' });
+      }
+      if (blockedCategory(handle)) return res.status(400).json({ error: 'That handle contains content we do not allow.' });
+    } else {
+      platform = null; handle = null;   // clearing one clears both
+    }
+
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    const { rows } = await pool.query(
+      `UPDATE users SET bio=$1, social_platform=$2, social_handle=$3
+        WHERE ${column}=$4
+        RETURNING bio, social_platform, social_handle`,
+      [bio || null, platform, handle, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    res.json({
+      bio: rows[0].bio,
+      socialPlatform: rows[0].social_platform,
+      socialHandle: rows[0].social_handle,
+      socialUrl: socialUrlFor(rows[0].social_platform, rows[0].social_handle),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2173,6 +2258,7 @@ app.get('/api/anglers/:id', async (req, res) => {
   try {
     const { rows: [u] } = await pool.query(
       `SELECT id, name, avatar, is_club, club_badge, equipped_ring, public_profile,
+              bio, social_platform, social_handle,
               COALESCE(is_deleted, false) AS is_deleted
          FROM users WHERE id=$1`,
       [req.params.id]
@@ -2242,6 +2328,13 @@ app.get('/api/anglers/:id', async (req, res) => {
         isClub: !!u.is_club,
         clubBadge: u.club_badge ?? null,
         ringId: u.equipped_ring ?? null,
+        bio: u.bio ?? null,
+        // Handle is returned for display ("@ericthahooker"); the URL is built
+        // here so the client never constructs one and can't be tricked into
+        // opening something that isn't the platform we intended.
+        socialPlatform: u.social_platform ?? null,
+        socialHandle: u.social_handle ?? null,
+        socialUrl: socialUrlFor(u.social_platform, u.social_handle),
         publicCatchCount: agg?.count ?? 0,
         since: agg?.since ?? null,
         followerCount:  fc?.followers ?? 0,
@@ -6040,6 +6133,12 @@ pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_expires_at TIMESTAMP
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_badge      TEXT`).catch(e => console.error('[init] club_badge:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS public_profile  BOOLEAN DEFAULT false`).catch(e => console.error('[init] public_profile:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo         BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_demo:', e.message));
+
+// Profile bio + ONE social link. The link is stored as platform + handle, never
+// as a URL — see SOCIAL_PLATFORMS below for why that distinction matters.
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio             TEXT`).catch(e => console.error('[init] bio:', e.message));
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS social_platform TEXT`).catch(e => console.error('[init] social_platform:', e.message));
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS social_handle   TEXT`).catch(e => console.error('[init] social_handle:', e.message));
 
 // Account deletion tombstone columns. See DELETE /api/auth/account above.
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_deleted:', e.message));
