@@ -1101,6 +1101,16 @@ app.delete('/api/auth/account', requireAuth, async (req, res) => {
     await client.query(
       `DELETE FROM conversations WHERE user_a = $1 OR user_b = $1`, [me.id]
     ).catch(e => console.error('[delete-account] conversations:', e.message));
+
+    // Notifications, both directions. Deleted EXPLICITLY even though the table
+    // declares ON DELETE CASCADE on both columns — deleting an account here
+    // tombstones it (is_deleted) rather than removing the row, so the cascade
+    // never fires. Without this, "someone commented" entries would sit in other
+    // people's inboxes forever, pointing at a person who asked to be gone.
+    await client.query(
+      `DELETE FROM notifications WHERE user_id = $1 OR actor_id = $1`, [me.id]
+    ).catch(e => console.error('[delete-account] notifications:', e.message));
+
     await client.query('COMMIT');
 
     // Post-commit, best-effort. The account is already gone either way.
@@ -2422,6 +2432,7 @@ app.post('/api/anglers/:id/follow', requireAuth, async (req, res) => {
     notifyActivity({
       actorId: me.id,
       recipientId: r.target.id,
+      type: 'follow',
       title: 'New follower',
       body: `${meRow?.name || 'Someone'} started following you`,
       // AnglerProfile is a real registered route and reads route.params.anglerId
@@ -2875,7 +2886,28 @@ app.get('/api/conversations/unread-count', requireAuth, async (req, res) => {
         )`,
       [me.id]
     );
-    res.json({ unread: r?.unread ?? 0, requests: r?.requests ?? 0 });
+    // Unread activity rides along on the SAME call rather than getting its own
+    // poll. MessagesButton ticks every 30s on two screens; a second endpoint
+    // would double that traffic to show one number. Blocks re-checked here for
+    // the same reason as in /api/notifications — a row written before a block
+    // must stop counting after it.
+    const { rows: [n] } = await pool.query(
+      `SELECT COUNT(*)::int AS notifications
+         FROM notifications n
+        WHERE n.user_id = $1 AND n.read_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM blocks b
+             WHERE (b.blocker_id = $1 AND b.blocked_id = n.actor_id)
+                OR (b.blocker_id = n.actor_id AND b.blocked_id = $1)
+          )`,
+      [me.id]
+    );
+
+    res.json({
+      unread: r?.unread ?? 0,
+      requests: r?.requests ?? 0,
+      notifications: n?.notifications ?? 0,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -4017,6 +4049,9 @@ app.post('/api/comments', async (req, res) => {
     notifyActivity({
       actorId: user.id,
       recipientId: ownerId,
+      type: 'comment',
+      targetType,
+      targetId: tId,
       title: `${userRow?.name || 'Someone'} commented`,
       body: body.trim().length > 120 ? body.trim().slice(0, 119) + '…' : body.trim(),
       // NO deep link. There is no route that opens a single catch — MyCatches
@@ -5538,6 +5573,79 @@ app.get('/api/bonecast', async (req, res) => {
   }
 });
 
+// ═══ ACTIVITY NOTIFICATIONS ══════════════════════════════════════════════════
+//
+// The Notifications half of the inbox. Chat (DMs) lives in /api/conversations —
+// deliberately separate, the way Reddit splits them: a comment on your fish and
+// someone messaging you are different kinds of attention.
+//
+// Rows are written by notifyActivity() only, so every suppression rule (blocks,
+// self-activity, shadowbans) is applied in ONE place and this list can't
+// disagree with what got pushed.
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit ?? '50', 10) || 50));
+
+    // Blocks are re-checked at READ time, not just at write time. Someone can
+    // block a person after their comment landed, and the old row would otherwise
+    // keep showing them a name they've chosen never to see again.
+    const { rows } = await pool.query(
+      `SELECT n.id, n.type, n.target_type, n.target_id, n.body, n.created_at, n.read_at,
+              u.id AS actor_id, u.name AS actor_name, u.avatar AS actor_avatar,
+              u.is_club, u.club_badge, u.equipped_ring
+         FROM notifications n
+         LEFT JOIN users u ON u.id = n.actor_id
+        WHERE n.user_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM blocks b
+             WHERE (b.blocker_id = $1 AND b.blocked_id = n.actor_id)
+                OR (b.blocker_id = n.actor_id AND b.blocked_id = $1)
+          )
+          AND COALESCE(u.is_deleted, false) = false
+        ORDER BY n.created_at DESC
+        LIMIT $2`,
+      [me.id, limit]
+    );
+
+    res.json({
+      notifications: rows.map(r => ({
+        id: r.id,
+        type: r.type,
+        targetType: r.target_type,
+        targetId: r.target_id,
+        body: r.body,
+        createdAt: r.created_at,
+        read: !!r.read_at,
+        actor: r.actor_id ? {
+          id: r.actor_id, name: r.actor_name, avatar: r.actor_avatar,
+          isClub: !!r.is_club, clubBadge: r.club_badge, ringId: r.equipped_ring,
+        } : null,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Mark everything read. Whole-list rather than per-row: nobody taps each one,
+// and "seen the list" is what read actually means here.
+app.post('/api/notifications/read', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    await pool.query(
+      `UPDATE notifications SET read_at = NOW() WHERE user_id = $1 AND read_at IS NULL`,
+      [me.id]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══ GOOD BITE ENGINE ════════════════════════════════════════════════════════
 //
 // Ported verbatim from goodBiteEngine.js on the client. Every lookup table below
@@ -6174,6 +6282,26 @@ pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_expires_at TIMESTAMP
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS club_badge      TEXT`).catch(e => console.error('[init] club_badge:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS public_profile  BOOLEAN DEFAULT false`).catch(e => console.error('[init] public_profile:', e.message));
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo         BOOLEAN DEFAULT false`).catch(e => console.error('[init] is_demo:', e.message));
+
+// Activity inbox. Rows are written by notifyActivity() alongside the push, so
+// the banner and this list can never disagree about who should see what.
+//
+// actor_id CASCADEs: if someone deletes their account, notifications about them
+// go too, rather than leaving "someone commented" ghosts pointing at nobody.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS notifications (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    actor_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    type        TEXT NOT NULL,
+    target_type TEXT,
+    target_id   INTEGER,
+    body        TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    read_at     TIMESTAMPTZ,
+    CHECK (user_id <> actor_id)
+  )`).catch(e => console.error('[init] notifications:', e.message));
+pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications (user_id, created_at DESC)`).catch(() => {});
 
 // Profile bio + ONE social link. The link is stored as platform + handle, never
 // as a URL — see SOCIAL_PLATFORMS below for why that distinction matters.
@@ -7073,7 +7201,7 @@ async function ownerOfTarget(targetType, targetId) {
 //
 // Never awaited by callers: Expo is a third party and a slow push must not make
 // commenting hang or fail.
-async function notifyActivity({ actorId, recipientId, title, body, data }) {
+async function notifyActivity({ actorId, recipientId, title, body, data, type, targetType, targetId }) {
   try {
     if (!recipientId || !actorId) return;
     if (recipientId === actorId) return;
@@ -7086,6 +7214,15 @@ async function notifyActivity({ actorId, recipientId, title, body, data }) {
     if (blocked.length) return;
 
     if (await isShadowbanned(actorId)) return;
+
+    // The durable record. Written BEFORE the push and awaited, unlike the push:
+    // a banner you miss is gone forever, so the inbox row is the thing that has
+    // to survive. If Expo is down, you still see it next time you open the app.
+    await pool.query(
+      `INSERT INTO notifications (user_id, actor_id, type, target_type, target_id, body)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [recipientId, actorId, type ?? 'activity', targetType ?? null, targetId ?? null, body ?? null]
+    ).catch(e => console.error('[notif] insert:', e.message));
 
     await notifyUser(recipientId, title, body, data);
   } catch (e) {
