@@ -5585,6 +5585,172 @@ app.get('/api/bonecast', async (req, res) => {
   }
 });
 
+// ═══ EXIF BACKFILL ═══════════════════════════════════════════════════════════
+//
+// Scrubs metadata from photos uploaded BEFORE CLOUDINARY_STRIP_METADATA existed.
+//
+// The problem this fixes is live, not theoretical. Cloudinary keeps the original
+// EXIF on upload and only drops it when a transformation is applied. Catch photos
+// were stored as a plain secure_url with no transform, so the exact GPS
+// coordinates of where somebody fishes are sitting in every old photo, and the
+// Cloudinary URLs are public. Anyone with a link can read them.
+//
+// New uploads are safe — uploadImageToCloudinary applies an INCOMING transform,
+// so the stored original is already scrubbed. Everything older is not.
+//
+// How it works: re-upload each asset to its OWN public_id with overwrite=true and
+// the same incoming transform. Cloudinary fetches the URL, applies a_exif (which
+// strips metadata as a side effect of any transformation), and replaces the
+// stored original. The URL never changes, so nothing in the database needs
+// touching and existing links keep working — they just stop leaking.
+//
+// Safe to re-run: media_scrub_log means a second pass skips what's done.
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS media_scrub_log (
+    url         TEXT PRIMARY KEY,
+    scrubbed_at TIMESTAMPTZ DEFAULT NOW(),
+    ok          BOOLEAN,
+    error       TEXT
+  )`).catch(e => console.error('[init] media_scrub_log:', e.message));
+
+// https://res.cloudinary.com/<cloud>/image/upload/v123/folder/abc.jpg -> folder/abc
+// Returns null for anything that isn't one of our upload URLs, so a hand-edited
+// or foreign URL is skipped rather than guessed at.
+function cloudinaryPublicId(url) {
+  if (typeof url !== 'string') return null;
+  const m = url.match(/\/image\/upload\/(?:[^/]+\/)*?v\d+\/(.+)$/);
+  if (!m) return null;
+  return m[1].replace(/\.[a-z0-9]+$/i, '');   // drop the extension
+}
+
+// Re-upload one asset over itself with the stripping transform.
+async function scrubCloudinaryAsset(url) {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const apiKey    = process.env.CLOUDINARY_API_KEY;
+  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+  if (!cloudName || !apiKey || !apiSecret) throw new Error('Cloudinary not configured');
+
+  const publicId = cloudinaryPublicId(url);
+  if (!publicId) throw new Error('not a recognisable Cloudinary upload URL');
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  // invalidate purges the CDN — without it the old, EXIF-bearing copy keeps
+  // being served from cache for as long as it lives there, which would make this
+  // whole exercise look like it worked while changing nothing.
+  const paramsToSign = {
+    invalidate: 'true',
+    overwrite: 'true',
+    public_id: publicId,
+    timestamp,
+    transformation: CLOUDINARY_STRIP_METADATA,
+  };
+  const signatureBase = Object.keys(paramsToSign).sort().map(k => `${k}=${paramsToSign[k]}`).join('&');
+  const signature = crypto.createHash('sha1').update(signatureBase + apiSecret).digest('hex');
+
+  const form = new URLSearchParams();
+  form.append('file', url);              // Cloudinary fetches the existing asset itself
+  form.append('api_key', apiKey);
+  form.append('timestamp', String(timestamp));
+  form.append('signature', signature);
+  form.append('public_id', publicId);
+  form.append('overwrite', 'true');
+  form.append('invalidate', 'true');
+  form.append('transformation', CLOUDINARY_STRIP_METADATA);
+
+  const res = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form,
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error?.message ?? `HTTP ${res.status}`);
+  return data.secure_url;
+}
+
+// GET  /api/admin/backfill-exif           → how many are left, changes nothing
+// POST /api/admin/backfill-exif?limit=25  → scrub up to `limit` assets
+//
+// Batched on purpose. A few thousand photos in one request would time out on
+// Railway and leave you with no idea how far it got. Run it repeatedly until
+// `remaining` hits 0.
+async function pendingScrubUrls(limit = 25) {
+  const { rows } = await pool.query(
+    `SELECT url FROM (
+       SELECT image_url AS url FROM catches   WHERE image_url IS NOT NULL
+       UNION
+       SELECT avatar    AS url FROM users     WHERE avatar    IS NOT NULL
+       UNION
+       SELECT photo_url AS url FROM comments  WHERE photo_url IS NOT NULL
+     ) all_media
+      WHERE url LIKE 'https://res.cloudinary.com/%'
+        AND url NOT IN (SELECT url FROM media_scrub_log WHERE ok = true)
+      LIMIT $1`,
+    [limit]
+  );
+  return rows.map(r => r.url);
+}
+
+app.get('/api/admin/backfill-exif', requireAdmin, async (req, res) => {
+  try {
+    const { rows: [c] } = await pool.query(
+      `SELECT COUNT(*)::int AS remaining FROM (
+         SELECT image_url AS url FROM catches  WHERE image_url IS NOT NULL
+         UNION
+         SELECT avatar    AS url FROM users    WHERE avatar    IS NOT NULL
+         UNION
+         SELECT photo_url AS url FROM comments WHERE photo_url IS NOT NULL
+       ) m
+        WHERE url LIKE 'https://res.cloudinary.com/%'
+          AND url NOT IN (SELECT url FROM media_scrub_log WHERE ok = true)`
+    );
+    const { rows: [d] } = await pool.query(
+      `SELECT COUNT(*)::int AS done, COUNT(*) FILTER (WHERE ok = false)::int AS failed
+         FROM media_scrub_log`
+    );
+    res.json({ remaining: c?.remaining ?? 0, done: d?.done ?? 0, failed: d?.failed ?? 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/backfill-exif', requireAdmin, async (req, res) => {
+  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit ?? '25', 10) || 25));
+  try {
+    const urls = await pendingScrubUrls(limit);
+    let ok = 0, failed = 0;
+
+    // Sequential, not Promise.all. Cloudinary rate-limits, and a burst of 50
+    // parallel re-uploads is how you get a wall of 420s and a half-done job.
+    for (const url of urls) {
+      try {
+        await scrubCloudinaryAsset(url);
+        await pool.query(
+          `INSERT INTO media_scrub_log (url, ok) VALUES ($1, true)
+           ON CONFLICT (url) DO UPDATE SET ok = true, error = NULL, scrubbed_at = NOW()`,
+          [url]
+        );
+        ok++;
+      } catch (e) {
+        // Logged, not thrown: one dead asset must not stop the batch. Failures
+        // are re-tried on the next run because only ok=true counts as done.
+        await pool.query(
+          `INSERT INTO media_scrub_log (url, ok, error) VALUES ($1, false, $2)
+           ON CONFLICT (url) DO UPDATE SET ok = false, error = $2, scrubbed_at = NOW()`,
+          [url, String(e.message).slice(0, 300)]
+        ).catch(() => {});
+        console.error('[exif-backfill]', url, e.message);
+        failed++;
+      }
+    }
+
+    const remaining = (await pendingScrubUrls(1000)).length;
+    res.json({ processed: urls.length, ok, failed, remaining });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══ ACTIVITY NOTIFICATIONS ══════════════════════════════════════════════════
 //
 // The Notifications half of the inbox. Chat (DMs) lives in /api/conversations —
