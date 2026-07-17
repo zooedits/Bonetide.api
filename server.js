@@ -2273,19 +2273,30 @@ app.get('/api/anglers/:id', async (req, res) => {
          FROM users WHERE id=$1`,
       [req.params.id]
     );
-    if (!u || !u.public_profile) return res.status(404).json({ error: 'Profile not available' });
+    if (!u) return res.status(404).json({ error: 'Profile not available' });
     // A tombstoned account is gone, not private. Same 404 either way so the
     // response can't be used to tell the difference.
     if (u.is_deleted) return res.status(404).json({ error: 'Profile not available' });
 
     // Who's looking. Guest-readable, so an unidentified reader just gets no
     // follow state and no block filtering.
+    //
+    // Resolved BEFORE the privacy gate below — it used to run after, which meant
+    // the gate couldn't tell you from a stranger and you got a 404 on your OWN
+    // profile whenever public_profile was false. Your own catches, invisible to
+    // you, because you'd asked other people not to see them.
     let meId = null;
     try {
       const me = await getUserFromRequest(req);
       const n = Number.parseInt(me?.id, 10);
       meId = Number.isInteger(n) ? n : null;
     } catch { /* signed out */ }
+
+    // Private profiles are still visible to their owner. Everyone else gets the
+    // same 404 as a nonexistent account.
+    if (!u.public_profile && meId !== u.id) {
+      return res.status(404).json({ error: 'Profile not available' });
+    }
 
     // A blocked pair can't see each other's profiles, in either direction. Same
     // 404 as a private profile — a distinct error would confirm the block
@@ -4054,14 +4065,15 @@ app.post('/api/comments', async (req, res) => {
       targetId: tId,
       title: `${userRow?.name || 'Someone'} commented`,
       body: body.trim().length > 120 ? body.trim().slice(0, 119) + '…' : body.trim(),
-      // NO deep link. There is no route that opens a single catch — MyCatches
-      // and Feed don't take params, so there's nothing to navigate TO. App.js
-      // only navigates when data.screen is set, so this opens the app and stops,
-      // which beats dumping someone on the wrong screen.
+      // Opens the OWNER's profile with the viewer already scrolled to the catch
+      // that was commented on — recipientId, not actorId: "Eric commented on
+      // YOUR catch" should show you your fish, not Eric's profile.
       //
-      // When a catch-detail route exists, add { screen, params } here and the
-      // tap handler picks it up with no other changes.
-      data: {},
+      // Only for catches. A comment on a spot has no viewer to open, so it lands
+      // on the profile and stops rather than pointing at nothing.
+      data: targetType === 'catch'
+        ? { screen: 'AnglerProfile', params: { anglerId: ownerId, openCatchId: tId } }
+        : {},
     }).catch(() => {});
 
     res.json({ comment: {
@@ -5611,6 +5623,11 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
     );
 
     res.json({
+      // The caller's DB id. The client can't work this out for itself: the `id`
+      // on the user object in the store is the PROVIDER SUB (a 21-digit Apple or
+      // Google string), not this integer. A comment notification opens the
+      // recipient's own profile, so the screen needs this to navigate.
+      meId: me.id,
       notifications: rows.map(r => ({
         id: r.id,
         type: r.type,
