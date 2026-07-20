@@ -4660,7 +4660,7 @@ app.get('/api/conditions', async (req, res) => {
   try {
     const [marineRes, forecastRes] = await Promise.all([
       fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=wave_height,wave_period,wave_direction&wind_speed_unit=kn&length_unit=imperial`),
-      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,surface_pressure&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
+      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,surface_pressure,visibility&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
     ]);
     const marine = await marineRes.json();
     const forecast = await forecastRes.json();
@@ -4693,7 +4693,14 @@ app.get('/api/conditions', async (req, res) => {
       wavePeriod: mari?.wave_period ?? null,
       waveDir: mari?.wave_direction != null ? degreesToCardinal(mari.wave_direction) + ` ${mari.wave_direction}°` : null,
       waterTemp: null,
-      visibility: 8,
+      // Real visibility from Open-Meteo's hourly `visibility` (meters at the
+      // current hour), converted to miles. Was hardcoded to 8 — which is why it
+      // never moved no matter the weather. null when the field is missing, so
+      // the tile shows a dash rather than a fake number.
+      visibility: (() => {
+        const vm = forecast.hourly?.visibility?.[nowIdx];
+        return vm != null ? Math.round((vm / 1609.34) * 10) / 10 : null;
+      })(),
       uvIndex: cur?.uv_index ?? 5,
       airTempF: Math.round(cur?.temperature_2m ?? 80),
       sunrise: forecast.daily?.sunrise?.[0] ? new Date(forecast.daily.sunrise[0]).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '6:30 AM',
