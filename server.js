@@ -5665,7 +5665,10 @@ app.get('/api/admin/broadcast/count', requireAdmin, async (req, res) => {
 // POST /api/admin/broadcast  { audience, title, body }
 app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
   try {
-    const me = await resolveDbUser(req.user, 'id');
+    // requireAdmin already looked the admin up and put the row on req.adminUser.
+    // The original code read req.user (which requireAdmin never sets) and crashed
+    // on undefined.provider inside resolveDbUser.
+    const me = req.adminUser;
     const audience = BROADCAST_AUDIENCES.includes(req.body?.audience) ? req.body.audience : 'all';
     const title = String(req.body?.title ?? '').trim();
     const body  = String(req.body?.body ?? '').trim();
