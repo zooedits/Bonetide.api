@@ -5700,11 +5700,14 @@ app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
       return res.json({ ok: true, recipients: 0, note: 'No one in that audience has notifications on.' });
     }
 
-    // Home is the deep link — safe default, no param needed, can't land wrong.
+    // Tap opens Home and pops the FULL announcement in a modal. The lock-screen
+    // banner truncates hard — title plus a sliver of body — so the body text has
+    // to travel in the payload and get shown properly once the app opens, or
+    // most of the message is effectively invisible.
     await sendPush(tokens.map(t => ({
       to: t, title, body,
       sound: NOTIFICATION_SOUND, priority: 'high',
-      data: { screen: 'Home' },
+      data: { screen: 'Home', params: { announceTitle: title, announceBody: body } },
     })));
 
     await pool.query(
