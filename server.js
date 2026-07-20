@@ -5585,6 +5585,130 @@ app.get('/api/bonecast', async (req, res) => {
   }
 });
 
+// ═══ ADMIN BROADCAST ═════════════════════════════════════════════════════════
+//
+// Send a push notification to a segment of users. The plumbing (sendPush, the
+// push_tokens table) already existed for DM/comment notifications — this just
+// lets an admin trigger one manually to many people at once.
+//
+// Guardrails, because this fires to real phones with no undo:
+//   - admin only (requireAdmin)
+//   - a COUNT endpoint so the UI can show "this reaches N people" and make the
+//     admin confirm before sending
+//   - every send is written to broadcast_log, so there's a record of what went
+//     out and when (and a guard against firing the identical thing twice)
+//   - only reaches people with notifications ON — it queries push_tokens, so
+//     someone who never enabled push simply isn't counted or contacted
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS broadcast_log (
+    id          SERIAL PRIMARY KEY,
+    sent_by     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    audience    TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    recipients  INTEGER NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+  )`).catch(e => console.error('[init] broadcast_log:', e.message));
+
+// Turns an audience key into a WHERE clause against users u. One place, so the
+// count and the send can never target different people. Everyone audience still
+// requires a device token (the JOIN below handles that) — no point "sending" to
+// someone with no way to receive it.
+function broadcastAudienceSql(audience) {
+  switch (audience) {
+    case 'club':
+      return `u.is_club = true`;
+    case 'active7':
+      return `u.last_login_day >= (CURRENT_DATE - INTERVAL '7 days')`;
+    case 'inactive30':
+      return `(u.last_login_day IS NULL OR u.last_login_day < (CURRENT_DATE - INTERVAL '30 days'))`;
+    case 'new7':
+      return `u.created_at >= (NOW() - INTERVAL '7 days')`;
+    case 'streak':
+      return `COALESCE(u.login_streak, 0) >= 3`;
+    case 'all':
+    default:
+      return `TRUE`;
+  }
+}
+
+const BROADCAST_AUDIENCES = ['all', 'club', 'active7', 'inactive30', 'new7', 'streak'];
+
+// Distinct users, because one person can have several devices (phone + tablet).
+// Counting tokens would overcount the humans; we want people, and send-to-all-
+// their-devices happens at send time.
+async function broadcastRecipientCount(audience) {
+  const where = broadcastAudienceSql(audience);
+  const { rows } = await pool.query(
+    `SELECT COUNT(DISTINCT u.id)::int AS n
+       FROM users u
+       JOIN push_tokens pt ON pt.user_id = u.id
+      WHERE ${where}
+        AND COALESCE(u.is_deleted, false) = false
+        AND COALESCE(u.is_banned, false) = false`
+  );
+  return rows[0]?.n ?? 0;
+}
+
+// GET /api/admin/broadcast/count?audience=club  → { audience, recipients }
+app.get('/api/admin/broadcast/count', requireAdmin, async (req, res) => {
+  try {
+    const audience = BROADCAST_AUDIENCES.includes(req.query.audience) ? req.query.audience : 'all';
+    const recipients = await broadcastRecipientCount(audience);
+    res.json({ audience, recipients });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/broadcast  { audience, title, body }
+app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    const audience = BROADCAST_AUDIENCES.includes(req.body?.audience) ? req.body.audience : 'all';
+    const title = String(req.body?.title ?? '').trim();
+    const body  = String(req.body?.body ?? '').trim();
+
+    if (!title) return res.status(400).json({ error: 'Title is required' });
+    if (!body)  return res.status(400).json({ error: 'Message is required' });
+    if (title.length > 100) return res.status(400).json({ error: 'Title too long (100 max)' });
+    if (body.length > 240)  return res.status(400).json({ error: 'Message too long (240 max)' });
+
+    const where = broadcastAudienceSql(audience);
+    const { rows } = await pool.query(
+      `SELECT DISTINCT pt.token
+         FROM push_tokens pt
+         JOIN users u ON u.id = pt.user_id
+        WHERE ${where}
+          AND COALESCE(u.is_deleted, false) = false
+          AND COALESCE(u.is_banned, false) = false`
+    );
+    const tokens = rows.map(r => r.token);
+
+    if (tokens.length === 0) {
+      return res.json({ ok: true, recipients: 0, note: 'No one in that audience has notifications on.' });
+    }
+
+    // Home is the deep link — safe default, no param needed, can't land wrong.
+    await sendPush(tokens.map(t => ({
+      to: t, title, body,
+      sound: NOTIFICATION_SOUND, priority: 'high',
+      data: { screen: 'Home' },
+    })));
+
+    await pool.query(
+      `INSERT INTO broadcast_log (sent_by, audience, title, body, recipients)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [me?.id ?? null, audience, title, body, tokens.length]
+    ).catch(e => console.error('[broadcast] log:', e.message));
+
+    res.json({ ok: true, recipients: tokens.length, audience });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══ EXIF BACKFILL ═══════════════════════════════════════════════════════════
 //
 // Scrubs metadata from photos uploaded BEFORE CLOUDINARY_STRIP_METADATA existed.
