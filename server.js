@@ -8038,6 +8038,163 @@ app.get('/api/admin/actions', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ═══ ADMIN DASHBOARD + USER MANAGEMENT ═══════════════════════════════════════
+//
+// Read-only reporting (stats), plus user search / detail / role controls. All
+// numbers come straight from the tables we already keep — nothing is estimated.
+// "Human" counts exclude deleted accounts and the seeded demo anglers
+// (is_demo) so the dashboard shows real people, not test data.
+//
+// The audience definitions here (active this week / new this week) match the
+// broadcast audiences on purpose, so a number on the dashboard and the reach of
+// a broadcast to the same group always agree.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Reusable predicate: a real human account (not soft-deleted, not a demo seed).
+const HUMAN_USER = `NOT COALESCE(is_deleted, false) AND NOT COALESCE(is_demo, false)`;
+
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const q = (sql, params = []) => pool.query(sql, params).then(r => r.rows[0]?.n ?? 0);
+    const [
+      totalUsers, newThisWeek, activeThisWeek, clubMembers,
+      bannedUsers, shadowbanned, demoUsers,
+      totalCatches, catchesThisWeek,
+      totalComments, totalDms, dmsThisWeek,
+      openAppeals, flaggedThisWeek, broadcastsSent,
+    ] = await Promise.all([
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${HUMAN_USER}`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${HUMAN_USER} AND created_at >= (NOW() - INTERVAL '7 days')`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${HUMAN_USER} AND last_login_day >= (CURRENT_DATE - INTERVAL '7 days')`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${HUMAN_USER} AND is_club = true`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE is_banned = true`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE shadowbanned_until IS NOT NULL AND shadowbanned_until > NOW()`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE is_demo = true`),
+      q(`SELECT COUNT(*)::int AS n FROM catches`),
+      q(`SELECT COUNT(*)::int AS n FROM catches WHERE caught_at >= (NOW() - INTERVAL '7 days')`),
+      q(`SELECT COUNT(*)::int AS n FROM comments`),
+      q(`SELECT COUNT(*)::int AS n FROM messages`),
+      q(`SELECT COUNT(*)::int AS n FROM messages WHERE created_at >= (NOW() - INTERVAL '7 days')`),
+      q(`SELECT COUNT(*)::int AS n FROM appeals WHERE status = 'open'`),
+      q(`SELECT COUNT(*)::int AS n FROM moderation_log WHERE created_at >= (NOW() - INTERVAL '7 days')`),
+      q(`SELECT COUNT(*)::int AS n FROM broadcast_log`),
+    ]);
+
+    const clubConversion = totalUsers > 0 ? Math.round((clubMembers / totalUsers) * 1000) / 10 : 0;
+
+    res.json({
+      users:   { total: totalUsers, newThisWeek, activeThisWeek, banned: bannedUsers, shadowbanned, demo: demoUsers },
+      club:    { members: clubMembers, conversionPct: clubConversion },
+      content: { catches: totalCatches, catchesThisWeek, comments: totalComments, dms: totalDms, dmsThisWeek },
+      queue:   { openAppeals, flaggedThisWeek, broadcastsSent },
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// User search / recent-signups feed.
+//   ?q=<name|email|id>  — search; blank q returns the newest signups.
+//   ?limit=<n>          — cap (default 30, max 100).
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit ?? 30) || 30, 1), 100);
+    const term  = String(req.query.q ?? '').trim();
+
+    let rows;
+    if (term) {
+      const like = `%${term}%`;
+      const idMatch = /^\d+$/.test(term) ? parseInt(term) : -1;
+      ({ rows } = await pool.query(
+        `SELECT id, name, email, avatar, created_at, last_login_day, login_streak,
+                is_club, is_banned, is_admin, is_demo, shadowbanned_until, points_balance
+           FROM users
+          WHERE ${HUMAN_USER}
+            AND (name ILIKE $1 OR email ILIKE $1 OR id = $2)
+          ORDER BY (id = $2) DESC, last_login_day DESC NULLS LAST, id DESC
+          LIMIT $3`,
+        [like, idMatch, limit]
+      ));
+    } else {
+      ({ rows } = await pool.query(
+        `SELECT id, name, email, avatar, created_at, last_login_day, login_streak,
+                is_club, is_banned, is_admin, is_demo, shadowbanned_until, points_balance
+           FROM users
+          WHERE ${HUMAN_USER}
+          ORDER BY created_at DESC NULLS LAST, id DESC
+          LIMIT $1`,
+        [limit]
+      ));
+    }
+    res.json({ users: rows, query: term });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Full profile + activity counts for one user.
+app.get('/api/admin/users/:id', requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Bad user id' });
+
+    const { rows: [u] } = await pool.query(
+      `SELECT id, name, email, phone, avatar, bio, created_at, last_login_day, login_streak,
+              is_club, club_badge, club_expires_at, is_banned, is_admin, is_demo, public_profile,
+              shadowbanned_until, points_balance, lifetime_points
+         FROM users WHERE id = $1`, [id]
+    );
+    if (!u) return res.status(404).json({ error: 'User not found' });
+
+    const q = (sql) => pool.query(sql, [id]).then(r => r.rows[0]?.n ?? 0);
+    const [catches, spots, comments, followers, following, dmsSent, lastCatchAt] = await Promise.all([
+      q(`SELECT COUNT(*)::int AS n FROM catches  WHERE user_id = $1`),
+      q(`SELECT COUNT(*)::int AS n FROM spots    WHERE user_id = $1`),
+      q(`SELECT COUNT(*)::int AS n FROM comments WHERE user_id = $1`),
+      q(`SELECT COUNT(*)::int AS n FROM follows  WHERE followee_id = $1`),
+      q(`SELECT COUNT(*)::int AS n FROM follows  WHERE follower_id = $1`),
+      q(`SELECT COUNT(*)::int AS n FROM messages WHERE sender_id = $1`),
+      pool.query(`SELECT MAX(caught_at) AS m FROM catches WHERE user_id = $1`, [id]).then(r => r.rows[0]?.m ?? null),
+    ]);
+
+    res.json({
+      user: u,
+      counts: { catches, spots, comments, followers, following, dmsSent, lastCatchAt },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Grant or revoke admin. Admins are otherwise made by hand in SQL; this puts it
+// behind the same requireAdmin gate as everything else. You cannot remove your
+// own admin here — that's a guaranteed way to lock the whole team out.
+app.post('/api/admin/users/:id/admin', requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Bad user id' });
+    const makeAdmin = req.body?.admin !== false; // default true; { admin:false } to revoke
+    if (!makeAdmin && id === req.adminUser.id) {
+      return res.status(400).json({ error: "You can't remove your own admin access." });
+    }
+    const { rows } = await pool.query(
+      `UPDATE users SET is_admin = $1 WHERE id = $2 RETURNING id, is_admin`, [makeAdmin, id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await logAdminAction(req.adminUser.id, makeAdmin ? 'grant_admin' : 'revoke_admin', 'user', id);
+    res.json({ user: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Broadcast history — every push announcement that went out, newest first.
+app.get('/api/admin/broadcasts', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit ?? 50) || 50, 1), 200);
+    const { rows } = await pool.query(
+      `SELECT b.id, b.audience, b.title, b.body, b.recipients, b.created_at,
+              b.sent_by, u.name AS sent_by_name
+         FROM broadcast_log b LEFT JOIN users u ON u.id = b.sent_by
+        ORDER BY b.created_at DESC LIMIT $1`, [limit]
+    );
+    res.json({ broadcasts: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => console.log(`Bone Tide Co. API running on port ${PORT}`));
 // ── User Media Library ────────────────────────────────────────────────────────
 
