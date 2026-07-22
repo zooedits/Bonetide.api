@@ -8050,26 +8050,38 @@ app.get('/api/admin/actions', requireAdmin, async (req, res) => {
 // a broadcast to the same group always agree.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Reusable predicate: a real human account (not soft-deleted, not a demo seed).
-const HUMAN_USER = `NOT COALESCE(is_deleted, false) AND NOT COALESCE(is_demo, false)`;
+// Reusable predicates.
+//   HUMAN_USER  — not soft-deleted, not a demo seed.
+//   REGISTERED  — actually signed in (has a real login). This is the app's own
+//                 definition of a non-device account (see mergeDeviceUser: a row
+//                 with all three provider ids NULL is a device-only account —
+//                 an anonymous install or an old bulk-seed row, NOT a real angler).
+//   REAL_ANGLER — a registered human. This is what "Total anglers" should count;
+//                 the thousands of device-only seed rows are deliberately excluded.
+const HUMAN_USER  = `NOT COALESCE(is_deleted, false) AND NOT COALESCE(is_demo, false)`;
+const REGISTERED  = `(google_id IS NOT NULL OR apple_id IS NOT NULL OR auth_id IS NOT NULL)`;
+const REAL_ANGLER = `${HUMAN_USER} AND ${REGISTERED}`;
 
 app.get('/api/admin/stats', requireAdmin, async (req, res) => {
   try {
     const q = (sql, params = []) => pool.query(sql, params).then(r => r.rows[0]?.n ?? 0);
     const [
       totalUsers, newThisWeek, activeThisWeek, clubMembers,
-      bannedUsers, shadowbanned, demoUsers,
+      bannedUsers, shadowbanned, demoUsers, unregistered,
       totalCatches, catchesThisWeek,
       totalComments, totalDms, dmsThisWeek,
       openAppeals, flaggedThisWeek, broadcastsSent,
     ] = await Promise.all([
-      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${HUMAN_USER}`),
-      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${HUMAN_USER} AND created_at >= (NOW() - INTERVAL '7 days')`),
-      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${HUMAN_USER} AND last_login_day >= (CURRENT_DATE - INTERVAL '7 days')`),
-      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${HUMAN_USER} AND is_club = true`),
+      // "Total anglers" = registered humans only. Device-only seed rows are excluded.
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${REAL_ANGLER}`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${REAL_ANGLER} AND created_at >= (NOW() - INTERVAL '7 days')`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${REAL_ANGLER} AND last_login_day >= (CURRENT_DATE - INTERVAL '7 days')`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${REAL_ANGLER} AND is_club = true`),
       q(`SELECT COUNT(*)::int AS n FROM users WHERE is_banned = true`),
       q(`SELECT COUNT(*)::int AS n FROM users WHERE shadowbanned_until IS NOT NULL AND shadowbanned_until > NOW()`),
       q(`SELECT COUNT(*)::int AS n FROM users WHERE is_demo = true`),
+      // Device-only rows (no login): anonymous installs + leftover bulk-seed accounts.
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${HUMAN_USER} AND NOT ${REGISTERED}`),
       q(`SELECT COUNT(*)::int AS n FROM catches`),
       q(`SELECT COUNT(*)::int AS n FROM catches WHERE caught_at >= (NOW() - INTERVAL '7 days')`),
       q(`SELECT COUNT(*)::int AS n FROM comments`),
@@ -8083,7 +8095,7 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     const clubConversion = totalUsers > 0 ? Math.round((clubMembers / totalUsers) * 1000) / 10 : 0;
 
     res.json({
-      users:   { total: totalUsers, newThisWeek, activeThisWeek, banned: bannedUsers, shadowbanned, demo: demoUsers },
+      users:   { total: totalUsers, newThisWeek, activeThisWeek, banned: bannedUsers, shadowbanned, demo: demoUsers, unregistered },
       club:    { members: clubMembers, conversionPct: clubConversion },
       content: { catches: totalCatches, catchesThisWeek, comments: totalComments, dms: totalDms, dmsThisWeek },
       queue:   { openAppeals, flaggedThisWeek, broadcastsSent },
@@ -8102,24 +8114,28 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
 
     let rows;
     if (term) {
+      // Name / email search hits registered anglers only (otherwise a term like
+      // "angler" floods with seed rows). An exact numeric id still finds ANY row,
+      // so you can always pull up a specific account by id.
       const like = `%${term}%`;
       const idMatch = /^\d+$/.test(term) ? parseInt(term) : -1;
       ({ rows } = await pool.query(
         `SELECT id, name, email, avatar, created_at, last_login_day, login_streak,
                 is_club, is_banned, is_admin, is_demo, shadowbanned_until, points_balance
            FROM users
-          WHERE ${HUMAN_USER}
-            AND (name ILIKE $1 OR email ILIKE $1 OR id = $2)
+          WHERE ((${REAL_ANGLER}) AND (name ILIKE $1 OR email ILIKE $1))
+             OR (${HUMAN_USER} AND id = $2)
           ORDER BY (id = $2) DESC, last_login_day DESC NULLS LAST, id DESC
           LIMIT $3`,
         [like, idMatch, limit]
       ));
     } else {
+      // Recent-signups feed: registered anglers only, so it's real people.
       ({ rows } = await pool.query(
         `SELECT id, name, email, avatar, created_at, last_login_day, login_streak,
                 is_club, is_banned, is_admin, is_demo, shadowbanned_until, points_balance
            FROM users
-          WHERE ${HUMAN_USER}
+          WHERE ${REAL_ANGLER}
           ORDER BY created_at DESC NULLS LAST, id DESC
           LIMIT $1`,
         [limit]
