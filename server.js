@@ -1241,6 +1241,51 @@ const REGION_SPECIES = {
   ],
 };
 
+// Fish-ID models, in priority order. NOT hardcoded to one version: set the
+// IDENTIFY_MODELS env var (comma-separated) on Railway to change or reorder them
+// without a code deploy. If the first model is ever retired, the request falls
+// through to the next one automatically, so a deprecation can't kill the scanner.
+const IDENTIFY_MODELS = (process.env.IDENTIFY_MODELS
+  || 'claude-opus-4-6,claude-sonnet-4-6,claude-haiku-4-5')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+// Calls Claude vision, trying each model in order. It ONLY falls through to the
+// next model when the failure is "this model isn't available" (retired / not
+// found). Auth, credit-balance and rate-limit errors are shared by every model,
+// so those throw right away instead of pointlessly retrying the whole list.
+async function identifyWithFallback(image, prompt) {
+  let lastErr;
+  for (const model of IDENTIFY_MODELS) {
+    let data;
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model, max_tokens: 500,
+          messages: [{ role: 'user', content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
+            { type: 'text', text: prompt },
+          ] }],
+        }),
+      });
+      data = await response.json();
+    } catch (netErr) {
+      lastErr = netErr; continue; // network blip on this attempt — try the next model
+    }
+    if (data && data.error) {
+      const msg  = data.error.message || '';
+      const type = data.error.type || '';
+      lastErr = new Error(`${model}: ${msg}`);
+      const modelUnavailable = type === 'not_found_error' || /\bmodel\b/i.test(msg);
+      if (modelUnavailable) continue;    // retired/unknown model — fall to the next
+      throw lastErr;                     // real problem (auth/credits/rate) — stop
+    }
+    return { data, model }; // success
+  }
+  throw lastErr || new Error('No fish-ID model available');
+}
+
 app.post('/api/identify', async (req, res) => {
   const { deviceId, image, region = 'southeast' } = req.body;
   if (!image) return res.status(400).json({ error: 'image (base64) required' });
@@ -1281,14 +1326,17 @@ Respond ONLY with a valid JSON object, no markdown, no explanation:
 If you cannot identify the fish with reasonable confidence, return confidence below 0.5.
 If multiple species are plausible, pick the most likely one for the region and note the alternatives in the notes field.`;
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 300, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } }, { type: 'text', text: prompt }] }] }),
-    });
-    const data = await response.json();
-    if (data.error) throw new Error(data.error.message);
-    const result = JSON.parse(data.content[0].text.replace(/```json|```/g, '').trim());
+    const { data, model: usedModel } = await identifyWithFallback(image, prompt);
+    // Newer models can emit a "thinking" block before the answer, so grab the
+    // TEXT block specifically instead of assuming it's content[0] (which was
+    // the old bug — a thinking block first would crash the parse).
+    const textBlock = Array.isArray(data.content)
+      ? (data.content.find(b => b.type === 'text') || data.content[0])
+      : null;
+    if (!textBlock || typeof textBlock.text !== 'string') {
+      throw new Error(`No text in response from ${usedModel}`);
+    }
+    const result = JSON.parse(textBlock.text.replace(/```json|```/g, '').trim());
     result.fallbackImageUrl = null;
 
     // Issue a short-lived signed scan token tied to this identify result.
