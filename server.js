@@ -2579,6 +2579,42 @@ async function followList(req, res, direction) {
 app.get('/api/anglers/:id/followers', requireAuth, (req, res) => followList(req, res, 'followers'));
 app.get('/api/anglers/:id/following', requireAuth, (req, res) => followList(req, res, 'following'));
 
+// ── Friends = mutual follows ─────────────────────────────────────────────────
+// The signed-in angler's friends: people they follow who follow them back.
+// Resolved from req.user (the client never receives its own numeric id, so it
+// can't hit /anglers/:id/* for itself). Read-only; blocked pairs are excluded.
+app.get('/api/friends', requireAuth, async (req, res) => {
+  try {
+    const me = await resolveDbUser(req.user, 'id');
+    if (!me) return res.status(404).json({ error: 'User not found' });
+
+    // a = the edge where I follow X; b = the edge where X follows me back.
+    // Joining both directions on the same pair leaves only mutual follows.
+    const { rows } = await pool.query(
+      `SELECT u.id, u.name, u.avatar, u.is_club, u.club_badge, u.equipped_ring, u.public_profile
+         FROM follows a
+         JOIN follows b ON b.follower_id = a.followee_id AND b.followee_id = a.follower_id
+         JOIN users u   ON u.id = a.followee_id
+        WHERE a.follower_id = $1
+          AND COALESCE(u.is_deleted, false) = false
+          AND ${blockedPairFilter('$1', 'u.id')}
+        ORDER BY GREATEST(a.created_at, b.created_at) DESC
+        LIMIT 200`,
+      [me.id]
+    );
+    res.json({
+      friends: rows.map(r => ({
+        id: r.id, name: r.name, avatar: r.avatar,
+        isClub: !!r.is_club, badge: r.club_badge, ringId: r.equipped_ring,
+        publicProfile: !!r.public_profile,
+      })),
+    });
+  } catch (err) {
+    console.error('[friends] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Block ────────────────────────────────────────────────────────────────────
 app.post('/api/anglers/:id/block', requireAuth, async (req, res) => {
   const client = await pool.connect();
