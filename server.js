@@ -1245,8 +1245,11 @@ const REGION_SPECIES = {
 // IDENTIFY_MODELS env var (comma-separated) on Railway to change or reorder them
 // without a code deploy. If the first model is ever retired, the request falls
 // through to the next one automatically, so a deprecation can't kill the scanner.
+// Default order = Sonnet first: ~1¢/scan and very accurate at fish ID, vs ~5¢ on
+// Opus. To go rock-bottom (~0.4¢/scan) set IDENTIFY_MODELS=claude-haiku-4-5,... on
+// Railway; to prioritize max accuracy, put claude-opus-4-6 first.
 const IDENTIFY_MODELS = (process.env.IDENTIFY_MODELS
-  || 'claude-opus-4-6,claude-sonnet-4-6,claude-haiku-4-5')
+  || 'claude-sonnet-4-6,claude-haiku-4-5,claude-opus-4-6')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 // Calls Claude vision, trying each model in order. It ONLY falls through to the
@@ -7037,7 +7040,9 @@ ${pageText.slice(0, 60000)}`;
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] }),
+    // Regs extraction is structured text reading — Sonnet handles it accurately at
+    // ~1/5 the cost of Opus. Override with REGS_MODEL on Railway if ever needed.
+    body: JSON.stringify({ model: (process.env.REGS_MODEL || 'claude-sonnet-4-6'), max_tokens: 4000, messages: [{ role: 'user', content: prompt }] }),
   });
   const data = await resp.json();
   const text = (data?.content || []).map(b => b.text || '').join('').trim();
