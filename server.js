@@ -6177,8 +6177,9 @@ function getVetoReason(inputs, regionKey) {
 }
 
 function scoreLabel(score) {
-  if (score >= 90) return 'Elite bite';
-  if (score >= 75) return 'Good bite';
+  if (score >= 94) return 'Elite bite';
+  if (score >= 86) return 'Great bite';
+  if (score >= 74) return 'Good bite';
   if (score >= 60) return 'Fair bite';
   if (score >= 40) return 'Slow fishing';
   return 'Stay dockside';
