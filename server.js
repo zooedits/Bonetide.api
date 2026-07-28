@@ -6,6 +6,7 @@ import pg         from 'pg';
 import fetch      from 'node-fetch';
 import { OAuth2Client } from 'google-auth-library';
 import jwt           from 'jsonwebtoken';
+import { runBoneCastPush, startBoneCastScheduler } from './bonecastNotify.js';
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const JWT_SECRET       = process.env.JWT_SECRET;
@@ -3703,6 +3704,16 @@ pool.query(`
 
 pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
 pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS birthday_boost_at TIMESTAMPTZ`).catch(() => {});
+
+// Favorite fishing spot — the anchor BoneCast and the daily bite push work off.
+// Live GPS lives only on the client, so nothing here knew where anyone fished;
+// these give each angler a saved home water the server can forecast against.
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fav_lat        DOUBLE PRECISION`).catch(() => {});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fav_lon        DOUBLE PRECISION`).catch(() => {});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fav_spot_name  TEXT`).catch(() => {});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fav_region     TEXT`).catch(() => {});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fav_station_id TEXT`).catch(() => {});
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fav_species    TEXT`).catch(() => {});
 
 // Lifetime bones: every bone ever EARNED, never reduced by spending.
 // points_balance is the spendable wallet; lifetime_points is the rank.
@@ -8299,6 +8310,72 @@ app.get('/api/admin/broadcasts', requireAdmin, async (req, res) => {
     res.json({ broadcasts: rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// ── Favorite fishing spot (the anchor for BoneCast + the daily push) ──────────
+app.get('/api/auth/favorite-spot', requireAuth, async (req, res) => {
+  try {
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    let { rows } = await pool.query(
+      `SELECT fav_lat, fav_lon, fav_spot_name, fav_region, fav_station_id, fav_species
+         FROM users WHERE ${column}=$1`, [req.user.id]);
+    if (!rows.length && req.user.email) {
+      ({ rows } = await pool.query(
+        `SELECT fav_lat, fav_lon, fav_spot_name, fav_region, fav_station_id, fav_species
+           FROM users WHERE email=$1`, [req.user.email]));
+    }
+    const r = rows[0] || {};
+    res.json({
+      lat: r.fav_lat ?? null, lon: r.fav_lon ?? null, name: r.fav_spot_name ?? null,
+      region: r.fav_region ?? null, stationId: r.fav_station_id ?? null, species: r.fav_species ?? null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/auth/favorite-spot', requireAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    // Sending lat/lon null clears the spot — a valid "forget my home water".
+    const lat = b.lat == null ? null : Number(b.lat);
+    const lon = b.lon == null ? null : Number(b.lon);
+    if (lat != null && (Number.isNaN(lat) || lat < -90  || lat > 90))  return res.status(400).json({ error: 'Invalid latitude' });
+    if (lon != null && (Number.isNaN(lon) || lon < -180 || lon > 180)) return res.status(400).json({ error: 'Invalid longitude' });
+    const name    = b.name      != null ? String(b.name).slice(0, 80)      : null;
+    const region  = b.region    != null ? String(b.region).slice(0, 40)    : null;
+    const station = b.stationId != null ? String(b.stationId).slice(0, 40) : null;
+    const species = b.species   != null ? String(b.species).slice(0, 40)   : null;
+    const vals = [lat, lon, name, region, station, species];
+    const column = PROVIDER_COLUMN[req.user.provider] ?? 'google_id';
+    let r = await pool.query(
+      `UPDATE users SET fav_lat=$1, fav_lon=$2, fav_spot_name=$3, fav_region=$4, fav_station_id=$5, fav_species=$6
+        WHERE ${column}=$7 RETURNING id`, [...vals, req.user.id]);
+    if (!r.rowCount && req.user.email) {
+      r = await pool.query(
+        `UPDATE users SET fav_lat=$1, fav_lon=$2, fav_spot_name=$3, fav_region=$4, fav_station_id=$5, fav_species=$6
+          WHERE email=$7 RETURNING id`, [...vals, req.user.email]);
+    }
+    res.json({ ok: true, lat, lon, name, region, stationId: station, species });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Daily BoneCast push (Club = AI line, free = lighter nudge) ────────────────
+// Admin trigger for testing: POST /api/admin/bonecast-push/run
+//   ?dry=1 (default) previews copy without sending; ?dry=0 actually sends.
+//   ?limit=5 caps how many users are processed (cheap preview — Club copy is
+//   AI-generated, so limit keeps the Claude spend to pennies while you test).
+app.post('/api/admin/bonecast-push/run', requireAdmin, async (req, res) => {
+  try {
+    const dryRun = req.query.dry !== '0';
+    const limit  = req.query.limit ? parseInt(req.query.limit, 10) : null;
+    const out = await runBoneCastPush({ pool, sendPush, anthropicKey: process.env.ANTHROPIC_API_KEY, dryRun, limit });
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Off unless explicitly enabled, so deploying this file changes nothing until
+// you flip BONECAST_PUSH_ENABLED=true on Railway.
+if (process.env.BONECAST_PUSH_ENABLED === 'true') {
+  startBoneCastScheduler({ pool, sendPush, anthropicKey: process.env.ANTHROPIC_API_KEY });
+}
 
 app.listen(PORT, () => console.log(`Bone Tide Co. API running on port ${PORT}`));
 // ── User Media Library ────────────────────────────────────────────────────────
