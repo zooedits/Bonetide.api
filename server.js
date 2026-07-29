@@ -4758,7 +4758,7 @@ app.get('/api/conditions', async (req, res) => {
   try {
     const [marineRes, forecastRes] = await Promise.all([
       fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=wave_height,wave_period,wave_direction&wind_speed_unit=kn&length_unit=imperial`),
-      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,surface_pressure,visibility&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
+      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index,weather_code&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,surface_pressure,visibility,weather_code&daily=sunrise,sunset&wind_speed_unit=kn&temperature_unit=fahrenheit&timezone=auto`),
     ]);
     const marine = await marineRes.json();
     const forecast = await forecastRes.json();
@@ -4781,6 +4781,9 @@ app.get('/api/conditions', async (req, res) => {
         windKts:      Math.round(forecast.hourly.wind_speed_10m?.[i] ?? 0),
         windDirection: degreesToCardinal(forecast.hourly.wind_direction_10m?.[i] ?? 0),
         precipChance: forecast.hourly.precipitation_probability?.[i] ?? null,
+        // WMO weather code (Open-Meteo) — drives the sky/rain icon on the
+        // home-screen widget and anywhere else that wants a condition glyph.
+        weatherCode: forecast.hourly.weather_code?.[i] ?? null,
       });
     }
 
@@ -4801,6 +4804,8 @@ app.get('/api/conditions', async (req, res) => {
       })(),
       uvIndex: cur?.uv_index ?? 5,
       airTempF: Math.round(cur?.temperature_2m ?? 80),
+      // Current WMO weather code (clear/cloud/rain/storm) for condition icons.
+      weatherCode: cur?.weather_code ?? forecast.hourly?.weather_code?.[nowIdx] ?? null,
       sunrise: forecast.daily?.sunrise?.[0] ? new Date(forecast.daily.sunrise[0]).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '6:30 AM',
       sunset:  forecast.daily?.sunset?.[0]  ? new Date(forecast.daily.sunset[0]).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '8:00 PM',
       solunar: computeSolunar(parseFloat(lat), parseFloat(lon)),
