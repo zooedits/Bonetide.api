@@ -7996,8 +7996,13 @@ app.get('/api/admin/comments', requireAdmin, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit ?? 100), 300);
     const { rows } = await pool.query(
       `SELECT cm.id, cm.body, cm.target_type, cm.target_id, cm.created_at,
-              u.id AS user_id, u.name AS user_name
-       FROM comments cm JOIN users u ON u.id=cm.user_id
+              u.id AS user_id, u.name AS user_name,
+              COALESCE(cat.user_id, sp.user_id) AS target_owner_id,
+              cat.image_url AS target_image
+       FROM comments cm
+       JOIN users u ON u.id = cm.user_id
+       LEFT JOIN catches cat ON cm.target_type = 'catch' AND cat.id = cm.target_id
+       LEFT JOIN spots   sp  ON cm.target_type = 'spot'  AND sp.id  = cm.target_id
        ORDER BY cm.created_at DESC LIMIT $1`, [limit]
     );
     res.json({ comments: rows });
