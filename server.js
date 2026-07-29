@@ -6473,10 +6473,15 @@ app.get('/api/conditions/at', async (req, res) => {
 });
 
 app.get('/api/rewards/profile', async (req, res) => {
-  const { deviceId } = req.query;
-  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
   try {
-    const user = await getOrCreateUser(deviceId);
+    // Auth-first: a logged-in angler sees THEIR OWN account wallet; a guest with
+    // no token falls back to the device record. Earnings (addBones) always credit
+    // the logged-in account, so reading the device record here is exactly what
+    // hid earned bones — and demoted real Legends to deckhand — for signed-in users.
+    const base = await getUserFromRequest(req);
+    const { rows: [u] } = await pool.query(
+      'SELECT points_balance, lifetime_points FROM users WHERE id=$1', [base.id]);
+    const user = { id: base.id, points_balance: u?.points_balance ?? 0, lifetime_points: u?.lifetime_points ?? 0 };
     const today = new Date().toISOString().slice(0, 10);
     const { rows: todayRows } = await pool.query(`SELECT COALESCE(SUM(pts_awarded),0) AS total FROM catches WHERE user_id=$1 AND DATE(caught_at)=$2`, [user.id, today]);
     const { rows: milestoneRows } = await pool.query(`SELECT key FROM milestones WHERE user_id=$1`, [user.id]);
