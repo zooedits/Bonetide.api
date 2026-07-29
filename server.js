@@ -8177,6 +8177,7 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
       totalCatches, catchesThisWeek,
       totalComments, totalDms, dmsThisWeek,
       openAppeals, flaggedThisWeek, broadcastsSent,
+      activeToday, optInUsers,
     ] = await Promise.all([
       // "Total anglers" = registered humans only. Device-only seed rows are excluded.
       q(`SELECT COUNT(*)::int AS n FROM users WHERE ${REAL_ANGLER}`),
@@ -8196,13 +8197,16 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
       q(`SELECT COUNT(*)::int AS n FROM appeals WHERE status = 'open'`),
       q(`SELECT COUNT(*)::int AS n FROM moderation_log WHERE created_at >= (NOW() - INTERVAL '7 days')`),
       q(`SELECT COUNT(*)::int AS n FROM broadcast_log`),
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE ${REAL_ANGLER} AND last_login_day = CURRENT_DATE`),
+      q(`SELECT COUNT(*)::int AS n FROM users u WHERE ${REAL_ANGLER} AND EXISTS (SELECT 1 FROM push_tokens pt WHERE pt.user_id = u.id)`),
     ]);
 
     const clubConversion = totalUsers > 0 ? Math.round((clubMembers / totalUsers) * 1000) / 10 : 0;
 
     res.json({
-      users:   { total: totalUsers, newThisWeek, activeThisWeek, banned: bannedUsers, shadowbanned, demo: demoUsers, unregistered },
+      users:   { total: totalUsers, newThisWeek, activeThisWeek, activeToday, banned: bannedUsers, shadowbanned, demo: demoUsers, unregistered },
       club:    { members: clubMembers, conversionPct: clubConversion },
+      push:    { optInUsers, optInPct: totalUsers > 0 ? Math.round((optInUsers / totalUsers) * 1000) / 10 : 0 },
       content: { catches: totalCatches, catchesThisWeek, comments: totalComments, dms: totalDms, dmsThisWeek },
       queue:   { openAppeals, flaggedThisWeek, broadcastsSent },
       generatedAt: new Date().toISOString(),
@@ -8363,7 +8367,68 @@ app.put('/api/auth/favorite-spot', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Growth trend — daily signups / catches / active for the last N days ──────
+app.get('/api/admin/stats/trend', requireAdmin, async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days ?? 30) || 30, 7), 90);
+    const { rows } = await pool.query(`
+      WITH spine AS (
+        SELECT generate_series((CURRENT_DATE - ($1::int - 1))::timestamp,
+                               CURRENT_DATE::timestamp, '1 day'::interval)::date AS d
+      )
+      SELECT to_char(spine.d, 'YYYY-MM-DD') AS date,
+             COALESCE(su.n, 0)::int AS signups,
+             COALESCE(ca.n, 0)::int AS catches,
+             COALESCE(ac.n, 0)::int AS active
+        FROM spine
+        LEFT JOIN (SELECT created_at::date AS d, COUNT(*) n FROM users WHERE ${REAL_ANGLER} GROUP BY 1) su ON su.d = spine.d
+        LEFT JOIN (SELECT caught_at::date  AS d, COUNT(*) n FROM catches GROUP BY 1) ca ON ca.d = spine.d
+        LEFT JOIN (SELECT last_login_day    AS d, COUNT(*) n FROM users WHERE ${REAL_ANGLER} GROUP BY 1) ac ON ac.d = spine.d
+       ORDER BY spine.d`, [days]);
+    res.json({ days: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Server / pipeline health at a glance ─────────────────────────────────────
+app.get('/api/admin/health', requireAdmin, async (req, res) => {
+  let db = false, dau = 0, lastPush = { at: null, sentToday: 0 };
+  try { await pool.query('SELECT 1'); db = true; } catch {}
+  try {
+    dau = (await pool.query(
+      `SELECT COUNT(*)::int AS n FROM users WHERE ${REAL_ANGLER} AND last_login_day = CURRENT_DATE`)).rows[0]?.n ?? 0;
+  } catch {}
+  try {
+    const r = await pool.query(
+      `SELECT MAX(created_at) AS at, COUNT(*) FILTER (WHERE sent_on = CURRENT_DATE)::int AS today FROM bonecast_push_log`);
+    lastPush = { at: r.rows[0]?.at ?? null, sentToday: r.rows[0]?.today ?? 0 };
+  } catch {}
+  res.json({
+    ok: true, uptimeSec: Math.round(process.uptime()), db, dau, lastPush,
+    pushEnabled: process.env.BONECAST_PUSH_ENABLED === 'true',
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── Daily BoneCast push (Club = AI line, free = lighter nudge) ────────────────
+// Recent send log + today's counts (empty if the push has never run).
+app.get('/api/admin/bonecast-push/log', requireAdmin, async (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit ?? 20) || 20, 1), 100);
+  const today = { club: 0, free: 0, total: 0 };
+  let recent = [];
+  try {
+    const [{ rows: recentRows }, { rows: todayRows }] = await Promise.all([
+      pool.query(
+        `SELECT l.tier, l.score, to_char(l.sent_on,'YYYY-MM-DD') AS sent_on, l.created_at, u.name
+           FROM bonecast_push_log l LEFT JOIN users u ON u.id = l.user_id
+          ORDER BY l.created_at DESC LIMIT $1`, [limit]),
+      pool.query(`SELECT tier, COUNT(*)::int AS n FROM bonecast_push_log WHERE sent_on = CURRENT_DATE GROUP BY tier`),
+    ]);
+    recent = recentRows;
+    for (const r of todayRows) { today[r.tier] = r.n; today.total += r.n; }
+  } catch { /* table not created until the push first runs — return empty */ }
+  res.json({ today, recent });
+});
+
 // Admin trigger for testing: POST /api/admin/bonecast-push/run
 //   ?dry=1 (default) previews copy without sending; ?dry=0 actually sends.
 //   ?limit=5 caps how many users are processed (cheap preview — Club copy is
