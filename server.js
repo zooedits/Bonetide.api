@@ -1977,6 +1977,9 @@ app.get('/api/feed', async (req, res) => {
     const tagQuery = search.startsWith('#') ? search.slice(1).toLowerCase() : null;
     const searching = !!tagQuery || search.length >= 2;
 
+    // Whether the underlying queries hit their (lim+1) peek — drives nextCursor below.
+    let spineHasMore = false, spotHasMore = false;
+
     if (type === 'all' || type === 'catches') {
       // ── The Bone Tide feed algorithm ─────────────────────────────────────
       // Spine: strict upload order - every catch gets the same top-of-feed
@@ -1993,7 +1996,11 @@ app.get('/api/feed', async (req, res) => {
       // numbering can't drift out of sync with the array as clauses come and go.
       const spineParams = [];
       let beforeSql = '';
-      if (before) { spineParams.push(before); beforeSql = `AND c.id < $${spineParams.length}`; }
+      // `before` on the ALL/CATCHES feed is the last catch id from the prior page's
+      // nextCursor (the spine is id-ordered). Parse to int so a non-numeric cursor
+      // can't throw a Postgres type error against the integer id column.
+      const beforeId = before != null ? parseInt(before, 10) : null;
+      if (Number.isInteger(beforeId)) { spineParams.push(beforeId); beforeSql = `AND c.id < $${spineParams.length}`; }
       let searchSql = '';
       if (tagQuery) {
         spineParams.push(tagQuery);
@@ -2019,6 +2026,7 @@ app.get('/api/feed', async (req, res) => {
          ORDER BY c.id DESC LIMIT ${lim + 1}`,
         spineParams
       );
+      spineHasMore = spine.length > lim;
 
       // Overlooked candidates: oldest-unseen first, random among ties so the
       // same three catches don't haunt every refresh. Only woven into the
@@ -2083,10 +2091,15 @@ app.get('/api/feed', async (req, res) => {
     // Spots join a text search on their name/note, but never a tag search:
     // hashtags live on catch captions, and silently widening "#snook" to
     // include spots would answer a question nobody asked.
-    if ((type === 'all' || type === 'spots') && !tagQuery) {
+    // Spots are woven decoration on the ALL feed (first page only — the id-ordered
+    // spine cursor doesn't apply to them), or the full time-ordered list on the
+    // Spots tab (cursored by created_at). That split is why nextCursor is a catch id
+    // for all/catches but a timestamp for spots.
+    const includeSpots = !tagQuery && (type === 'spots' || (type === 'all' && !before));
+    if (includeSpots) {
       const spotParams = [];
       let spotBeforeSql = '';
-      if (before) { spotParams.push(before); spotBeforeSql = `AND s.created_at < $${spotParams.length}`; }
+      if (type === 'spots' && before) { spotParams.push(before); spotBeforeSql = `AND s.created_at < $${spotParams.length}`; }
       let spotSearchSql = '';
       if (search.length >= 2) {
         spotParams.push(`%${search}%`);
@@ -2108,6 +2121,7 @@ app.get('/api/feed', async (req, res) => {
          ORDER BY s.created_at DESC LIMIT ${lim + 1}`,
         spotParams
       );
+      spotHasMore = rows.length > lim;
       for (const r of rows) {
         items.push({
           type: 'spot', id: r.id, imageUrl: r.photo_url ?? null,
@@ -2165,7 +2179,19 @@ app.get('/api/feed', async (req, res) => {
     });
     while (si < spotCards.length && merged.length < lim) merged.push(spotCards[si++]);
 
-    res.json({ items: merged.slice(0, lim) });
+    const page = merged.slice(0, lim);
+    // Next-page cursor: the last catch id on the id-ordered all/catches feed, or the
+    // last spot's timestamp on the time-ordered spots tab. Only emitted when the
+    // underlying query still has more rows, so the client stops cleanly at the end.
+    let nextCursor = null;
+    if (type === 'spots') {
+      const lastSpot = [...page].reverse().find(it => it.type === 'spot');
+      if (lastSpot && spotHasMore) nextCursor = new Date(lastSpot.createdAt).toISOString();
+    } else {
+      const lastCatch = [...page].reverse().find(it => it.type === 'catch');
+      if (lastCatch && spineHasMore) nextCursor = String(lastCatch.id);
+    }
+    res.json({ items: page, nextCursor });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3267,11 +3293,24 @@ app.get('/api/spots', async (req, res) => {
 app.get('/api/spots/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, name, type, note, lat, lon, photo_url AS "photoUri", is_private, created_at
+      `SELECT id, name, type, note, lat, lon, photo_url AS "photoUri", is_private, user_id, created_at
        FROM spots WHERE id=$1`, [req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Spot not found' });
-    res.json(rows[0]);
+    const spot = rows[0];
+    // A private spot is only visible to its owner — otherwise anyone could read its
+    // exact coordinates by walking the id sequence. Resolve the requester best-effort
+    // (an anonymous caller is never the owner) and 404 rather than 403 so we don't
+    // even confirm a private spot exists.
+    if (spot.is_private) {
+      let requester = null;
+      try { requester = await getUserFromRequest(req); } catch {}
+      if (!requester || requester.id !== spot.user_id) {
+        return res.status(404).json({ error: 'Spot not found' });
+      }
+    }
+    delete spot.user_id;
+    res.json(spot);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
