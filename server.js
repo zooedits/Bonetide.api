@@ -6541,8 +6541,14 @@ app.post('/api/redeem', async (req, res) => {
   if (!deviceId || !requested) return res.status(400).json({ error: 'deviceId and bones amount required' });
   const client = await pool.connect();
   try {
+    // Resolve the SAME account the wallet was read from: the logged-in account via
+    // JWT (getUserFromRequest), device fallback only for a true guest. Looking up by
+    // device_id alone redeemed against the wrong (or empty) wallet for a signed-in
+    // angler on a second device or after a re-link — bones are earned on the ACCOUNT,
+    // not the device. This mirrors /api/rewards/profile so what you see is what you spend.
+    const acct = await getUserFromRequest(req);
     await client.query('BEGIN');
-    const { rows: [user] } = await client.query('SELECT id, points_balance FROM users WHERE device_id=$1 FOR UPDATE', [deviceId]);
+    const { rows: [user] } = await client.query('SELECT id, points_balance FROM users WHERE id=$1 FOR UPDATE', [acct.id]);
     if (!user) throw new Error('User not found');
 
     // Snap to clean 500-bone ($4) steps.
